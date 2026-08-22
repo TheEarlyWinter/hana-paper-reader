@@ -1,40 +1,209 @@
-# Hana Paper Reader 0.4.2
+# Hana Paper Reader
 
-Hana 插件 ID：`hana-paper-reader`
+面向 **HanaAgent** 的可引用双语论文精读工作台。
 
-Hana Paper Reader 是一个面向学术 PDF 的双语精读工作台。PDF 统一通过 MinerU 精准解析 API 获取正文结构、图片、图表、表格和公式，再以连续单栏阅读流同时呈现在英文原文侧与中文翻译侧。
+它不只是把 PDF 翻译成中文，而是把论文转换为一个可以搜索、定位、引用、提问、批注和导出的研究工作区：**MinerU 提取语义结构，PDF.js 保留原始页面证据，Hana 助手负责翻译与解释，稳定的 `Page X / block Y` 锚点把每个结论带回原文。**
 
-> **0.4.0 是破坏性升级，0.4.1 修复二进制传输，0.4.2 修复升级兼容并加入 OCR 自动回退。** 0.4.0 已删除后端本地 PDF 结构解析器；0.4.1 把新 WebView 的 PDF 传输从 Base64 JSON 改为原始 `application/pdf` 二进制，消除了超长 Base64 正则的栈溢出。0.4.2 为安装升级时仍在运行的 0.4.0 卡片提供有界 Base64 兼容接收、强制刷新前端资源版本，并参考 PaperQuay 的单篇流程，在普通 MinerU 解析失败或返回空结构后自动以 OCR 模式重试。浏览器侧 PDF.js 仍只负责显示本地原页和定位裁剪，不参与结构解析。
+- 当前版本：`0.5.0`
+- 插件 ID：`hana-paper-reader`
+- 最低 Hana 版本：`0.358.0`
+- 许可证：MIT
+- 运行方式：无构建步骤、无 npm 依赖的 direct WebView 插件
+
+![Hana Paper Reader 0.5.0 工作区界面](assets/hana-paper-reader-workspace.png)
+
+## 为什么是 Paper Reader
+
+普通 PDF 阅读器解决“把页面显示出来”，Hana Paper Reader 解决的是另一组问题：
+
+- 这段译文对应原文哪一页、哪一个结构块？
+- 助手给出的结论能不能回到论文证据？
+- 图、表、公式和正文能否在双语阅读中保持一致？
+- 笔记、术语、书签和阅读进度能否在下次打开时继续使用？
+- 同一份 PDF 能否避免重复上传和重复解析？
+- 阅读结果能否离开插件，沉淀为带证据锚点的 Markdown？
+
+0.5.0 围绕这些问题建立了一套本地优先、证据优先的研究工作流。
 
 ## 核心能力
 
-- 支持选择或拖拽导入 PDF、TXT、Markdown；插件侧 PDF 上限为 50 MB。
-- PDF 只使用 MinerU 精准解析，不再提供本地解析分支。
-- TXT / Markdown 仍在阅读器本地读取，不发送到 MinerU。
-- 无论源 PDF 是单栏还是多栏，阅读正文始终重排为连续单栏。
-- 图片、图表、表格和公式在原文侧与译文侧共用同一视觉资源：
-  - 优先展示 MinerU 结果 ZIP 中被结构块引用的图片；
-  - 没有独立资源但有坐标时，可从当前本地 PDF 原页生成视觉裁剪；
-  - 表格 HTML 经标签、属性、节点数量和体积限制后再渲染，并支持横向滚动；
-  - 公式保留 LaTeX / 公式文本以及可用的原页视觉定位。
-- 支持逐段翻译与全文批量翻译；纯图片、空视觉块及没有说明文字的公式不会被送入翻译模型，图注、表题和公式说明仍可翻译。
-- 点击段落的 `译` / `重新翻译` 会将另一侧对齐到同一结构块；顶部 `⌖ 对齐` 可按当前活动面板手动对齐。
-- 两个阅读面板独立滚动，不进行持续镜像滚动。
-- 助手名称、头像、模型和描述从当前 Hana 安装读取，不内置供应商目录、API Key 或机器相关模型配置。
-- `思考` 支持 `无 / 低 / 中 / 高 / 最高`；`最高` 使用 Hana 可移植值 `max`。
-- 支持划词后调用当前 Hana 助手进行概念解释、公式拆解、复制或发送到助手会话。
-- 顶部工具栏会随窗口宽度自动换行；窄窗口下双侧阅读区改为上下分屏，避免控件和正文被挤压。
+### 连续双语精读
 
-## MinerU 导入流程
+- 支持 PDF、TXT 和 Markdown。
+- PDF 由 MinerU 提取标题、段落、图片、图表、表格和公式结构。
+- 正文统一重排为连续单栏，不把原 PDF 的多栏版面硬塞进阅读流。
+- 英文原文与中文译文分栏呈现；窄窗口自动切换为上下布局。
+- 支持单段翻译、全文批量翻译和按结构块对齐。
+- 纯图片、空视觉块和无说明公式不会被无意义地送入翻译模型。
 
-1. 新 WebView 将用户选择的 `File` 以原始 `application/pdf` 二进制请求体发送给插件路由；不生成 Base64，不嵌入 JSON。
-2. 插件后端流式读取请求并执行 50 MB 硬上限；升级时尚未关闭的 0.4.0 卡片仍可通过有界、逐字符校验的兼容层提交旧 Base64 JSON，但关闭并重新打开后会自动回到二进制协议。
-3. 后端向 `POST /api/v4/file-urls/batch` 申请签名上传地址，再把 PDF `Buffer` 直接 `PUT` 到签名地址；按 MinerU 要求不额外设置 `Content-Type`。
-4. 后端轮询 `/api/v4/extract-results/batch/{batch_id}`。
-5. MinerU 任务明确进入 `failed`，或结果结构缺失、无法解析、没有可用结构块时，自动以 `is_ocr=true` 重新提交一次；Token、401/403、申请地址、上传、轮询网络、下载、ZIP 安全校验和超时错误不重试，用户已开启强制 OCR 时也不重复提交。
-6. 任务完成后下载结果 ZIP。
+### 可核验的引用锚点
+
+每个论文结构块都维护稳定的来源信息：
+
+```text
+paperHash
+blockId
+page
+bbox
+blockType
+```
+
+正文可直接复制带来源引用，例如：
+
+```text
+【论文引用】
+论文：Attention Is All You Need
+来源：Page 5 / block mineru_p5_b12
+锚点：#paper-p5-b-mineru_p5_b12
+原文：...
+```
+
+证据助手只能引用当前工作区中真实存在的 `Page X / block Y`，客户端提供的页码和 block 只作为线索，最终由插件后端重新核验。
+
+### 研究工作区
+
+点击顶部 **研究工具** 可以使用：
+
+| 工具 | 能力 |
+|---|---|
+| 全文搜索 | 搜索原文与译文，按页码和结构块定位 |
+| 自动大纲 | 根据标题块生成论文目录并跳转正文 |
+| 笔记 / 书签 / 进度 | 将研究标记绑定到真实论文块，支持单条删除 |
+| 解析任务状态 | 查看解析阶段、进度、失败原因并取消运行中任务 |
+| 证据助手 | 使用当前论文上下文提问，返回可定位的真实证据 |
+| 术语表 / 翻译缓存 | 固定专业译法，并按术语版本隔离旧译文 |
+| 图表 / 公式 / 图片实验室 | 按视觉结构类型筛选并跳回正文位置 |
+| 双语 Markdown | 导出原文、译文、引用、笔记、书签、进度和术语 |
+
+### 工作区自动恢复
+
+重新打开插件时，会恢复最近论文的：
+
+- 结构块和大纲；
+- 已生成译文；
+- 笔记与书签；
+- 阅读进度；
+- 术语版本和有效翻译缓存。
+
+浏览器不会永久保留本地 PDF 文件句柄，因此结构内容可以自动恢复，但 PDF.js 原页预览需要用户重新选择同一 PDF。重新选择后会通过 SHA-256 命中解析缓存，不必再次完整上传解析。
+
+### 标准 SHA-256 解析缓存
+
+- 浏览器对 PDF 计算标准 SHA-256 文件指纹。
+- 插件后端按文件指纹复用 MinerU 解析结果。
+- 再次选择完全相同的 PDF 时，可直接恢复结构块和资源。
+- 浏览器原生 Web Crypto 与内置 fallback 使用同一组标准测试向量验证。
+
+### 术语版本化翻译
+
+术语表不是只在界面上展示，它会参与翻译请求和缓存键：
+
+```text
+paperHash + blockId + glossaryVersion
+```
+
+新增、修改或删除术语后，术语版本增加，旧版本译文立即失效，避免旧译法从缓存重新出现。
+
+### 图、表、公式与原页证据
+
+- 优先展示 MinerU 结果 ZIP 中被正文实际引用的图片资源。
+- 只有坐标而没有独立资源时，可从当前本地 PDF 原页生成视觉裁剪。
+- 表格 HTML 经过标签、属性、节点数量和体积限制后再渲染。
+- 公式保留 LaTeX、公式文本和可用的原页定位。
+- 两侧阅读区复用同一视觉资源，翻译只改变说明文本。
+- PDF.js 仅负责本地原页预览和定位，不参与正文结构解析。
+
+## 工作原理
+
+```text
+本地 PDF
+  ├─ 浏览器计算 SHA-256 ──> 查询插件私有解析缓存
+  ├─ 原始 application/pdf ─> 插件后端 ─> MinerU 官方 API
+  └─ 本地文件字节 ─────────> PDF.js 原页视觉预览
+
+MinerU 结果 ZIP
+  └─ 结构 JSON + 受支持图片
+       └─ 连续单栏结构块
+            ├─ 原文 / 译文
+            ├─ Page / block 引用
+            ├─ 搜索 / 大纲 / 证据助手
+            ├─ 笔记 / 书签 / 进度 / 术语
+            └─ 双语 Markdown 导出
+```
+
+组件职责保持明确：
+
+| 组件 | 职责 | 不负责 |
+|---|---|---|
+| MinerU | PDF 语义结构、公式、表格和视觉资源提取 | 本地离线解析 |
+| PDF.js | 当前本地 PDF 的原页显示和视觉定位 | 生成正文结构 |
+| Hana 模型 | 翻译、解释、证据问答 | 伪造页码或结构块 |
+| 插件工作区 | 缓存、引用、笔记、书签、进度、术语和导出 | 存储 MinerU Token 明文到页面 |
+
+## 安装
+
+### 环境要求
+
+- HanaAgent `0.358.0` 或更高版本；
+- 如需解析 PDF，需要有效的 MinerU API Token；
+- 如需翻译和证据问答，需要 Hana 中存在可用的聊天或实用模型。
+
+本插件没有构建步骤，无需安装 Node.js 包、Python 依赖或浏览器扩展。
+
+### 安装发布 ZIP
+
+1. 打开 **Hana 设置 → 插件**。
+2. 将发布包 `hana-paper-reader-x.y.z.zip` 拖入插件区域，或使用手动安装入口选择 ZIP。
+3. 核对插件 ID 为 `hana-paper-reader`。
+4. 确认 `full-access` 权限并安装。
+5. 启用插件，从卡片中心打开 **Hana Paper Reader**。
+
+发布 ZIP 的根目录应直接包含：
+
+```text
+manifest.json
+index.js
+README.md
+ROADMAP.md
+assets/
+lib/
+licenses/
+routes/
+tests/
+```
+
+### 从源码目录安装
+
+```powershell
+git clone https://github.com/TheEarlyWinter/hana-paper-reader.git
+```
+
+随后把整个 `hana-paper-reader` 文件夹交给 Hana 的插件安装入口。开发调试时，也可以在 **设置 → 插件** 中启用 Agent 插件开发工具，再通过 Hana 的开发插件流程加载源码目录。
+
+## 快速开始
+
+1. 打开 **Hana Paper Reader**。
+2. 想先体验界面，可点击 `🧪 示例论文`，无需 MinerU。
+3. 正式解析 PDF 前，点击顶部 `MinerU 未配置`。
+4. 填写 Token，选择模型、语言、公式、表格和 OCR 设置并保存。
+5. 拖入或选择 PDF，等待解析完成。
+6. 点击单段 `译`，或使用顶部 `⚡ 翻译全文`。
+7. 使用 `⌖ 对齐` 将另一侧定位到当前活动段落。
+8. 点击正文 `引用` 复制带页码和结构块的来源。
+9. 打开 `研究工具`，继续搜索、记笔记、提问或导出 Markdown。
+
+TXT 和 Markdown 在页面本地读取，不会发送到 MinerU。
+
+## MinerU 解析流程
+
+1. 新版 WebView 以原始 `application/pdf` 二进制请求体上传 PDF，不生成 Base64 JSON。
+2. 插件后端流式接收，并执行 50 MB 不可绕过的硬上限。
+3. 后端向 `POST /api/v4/file-urls/batch` 申请签名上传地址。
+4. PDF `Buffer` 直接 `PUT` 到签名地址，不额外设置 `Content-Type`。
+5. 后端轮询 `/api/v4/extract-results/batch/{batch_id}`。
+6. 完成后下载并安全解包 MinerU 结果 ZIP。
 7. 从 `content_list_v2.json`、`content_list.json` 或 `middle.json` 归一化结构块。
-8. 只把正文实际引用的受支持图片写入插件私有缓存，并通过私有资源路由提供给 WebView。
+8. 仅把正文实际引用的受支持图片写入插件私有缓存。
 
 批量申请请求遵循 MinerU 官方字段位置：
 
@@ -43,11 +212,19 @@ Hana Paper Reader 是一个面向学术 PDF 的双语精读工作台。PDF 统�
 
 MinerU 官方 API 文档：<https://mineru.net/apiManage/docs>
 
-## MinerU 设置
+### 旧版兼容与 OCR fallback
+
+- 新卡片只使用原始二进制上传。
+- 为升级后仍存活的 0.4.0 卡片保留了有界、逐字符校验的 Base64 JSON 接收兼容层；关闭并重新打开卡片后会自动回到二进制协议。
+- 普通 MinerU 任务明确失败，或返回缺失、不可解析、没有可用结构块的结果时，会自动以 `is_ocr=true` 重新提交一次。
+- Token、401/403、申请地址、上传、轮询网络、下载、ZIP 安全校验和超时错误不会盲目 OCR 重试。
+- 用户已经开启强制 OCR 时，不会重复提交第二次 OCR。
+
+## MinerU 设置与 Token 安全
 
 ### 阅读器内设置
 
-点击顶部的 `MinerU 未配置` / `MinerU · VLM` 按钮即可设置：
+点击顶部 `MinerU 未配置` 或 `MinerU · VLM`，可以设置：
 
 - API Token；
 - 解析模型：`vlm` 或 `pipeline`；
@@ -56,114 +233,111 @@ MinerU 官方 API 文档：<https://mineru.net/apiManage/docs>
 - 表格识别；
 - 强制 OCR。
 
-首次导入 PDF 且尚未配置 Token 时，阅读器会先打开设置窗口；保存成功后自动继续刚才的 PDF 导入。
-
-### Token 安全边界
-
-- Token 通过插件后端写入 Hana 的 `sensitive` 全局插件配置。
-- 页面只会获得“已配置 / 未配置”状态，读取接口永远不返回 Token。
-- 已保存 Token 不会预填或回显；输入框留空表示保留原值。
-- 发布 ZIP、README、测试夹具和日志中不包含真实 Token。
-- 可以在页内设置中清除 Token。
+首次导入 PDF 且尚未配置 Token 时，插件会先打开设置窗口；保存成功后继续刚才的导入。
 
 ### Hana 高级设置
 
-以下参数仍可在 **Hana 设置 → 插件 → Hana Paper Reader** 中调整：
+在 **Hana 设置 → 插件 → Hana Paper Reader** 中还可调整：
 
-- MinerU API 地址：默认 `https://mineru.net/api/v4`，代码只接受 `mineru.net` 官方 HTTPS 域名；
-- 解析超时：默认 900 秒，范围 60–3600 秒；
-- 轮询间隔：默认 5 秒，范围 2–30 秒。
+- MinerU API 地址：默认 `https://mineru.net/api/v4`，只接受 `mineru.net` 官方 HTTPS 域名；
+- 解析超时：默认 900 秒，范围 60～3600 秒；
+- 轮询间隔：默认 5 秒，范围 2～30 秒。
 
-## 使用方法
+### Token 边界
 
-1. 手动安装并启用插件。
-2. 打开 **Hana Paper Reader** 页面卡片。
-3. 点击顶部 MinerU 设置，填写 Token 并保存。
-4. 拖入或选择 PDF；等待上传、轮询和结构化解析完成。
-5. 阅读连续单栏正文；需要核对版面时展开每页上方的本地原页参考。
-6. 点击单段 `译`，或使用顶部 `⚡ 翻译全文`。
-7. 两侧位置不一致时，在作为基准的一侧滚动或点击，再用 `⌖ 对齐`。
-8. 划选文字后，可让当前 Hana 助手解释、拆解公式、复制或发送到助手会话。
-
-点击 `↻ MinerU 重解析` 会重新上传当前 PDF 并创建新的 MinerU 解析任务。
+- Token 通过插件后端写入 Hana 的 `sensitive` 全局配置。
+- WebView 只能获得“已配置 / 未配置”状态，读取接口永远不返回 Token。
+- 已保存 Token 不会预填或回显；输入框留空表示保留原值。
+- Token 不会写进发布 ZIP、README、测试夹具或插件日志。
+- 可以在阅读器设置中明确清除 Token。
 
 ## 隐私与数据边界
 
-1. **PDF 会上传到 MinerU。** 选择或拖入 PDF、点击重解析，都会把 PDF 发送到用户配置的 MinerU 官方 API。插件不再提供离线 PDF 结构解析。
-2. **TXT / Markdown 不上传到 MinerU。** 这两种文本文件由页面本地读取。
-3. **Token 只在服务端使用。** WebView 不会读取到明文 Token。
-4. **翻译和助手问答使用当前 Hana 配置。** 被翻译的文本或被提问的选中文字会交给用户当前选择的 Hana 模型 / 供应商；是否远程处理取决于用户自己的 Hana 配置。
-5. **原页参考使用当前本地 `File`。** 浏览器侧 PDF.js 从本次文件选择得到的字节渲染原页，不访问第三方 PDF URL。
-6. **MinerU 结果图片存入插件私有缓存。** 最多保留 8 份缓存、合计约 1 GiB，并按新旧自动淘汰；单个结果 ZIP、条目和总解压体积均有限制。
-7. **视觉块双侧复用。** 翻译只改变说明文本，不重新上传或重新生成图片。
+1. **PDF 会上传到 MinerU。** 选择 PDF 或点击重解析会将文件发送到用户配置的 MinerU 官方 API；本插件没有离线 PDF 结构解析分支。
+2. **TXT / Markdown 不上传到 MinerU。** 两种文本格式由 WebView 本地读取。
+3. **Token 只在插件服务端使用。** 页面无法读取明文 Token。
+4. **翻译和助手问答使用当前 Hana 配置。** 文本是否由远程模型处理，取决于用户自己的供应商和模型设置。
+5. **原页预览只使用本地文件。** PDF.js 不访问第三方 PDF URL。
+6. **研究数据写入插件私有目录。** 论文结构、任务、笔记、书签、进度、术语和翻译缓存不会混入用户原 PDF。
+7. **MinerU 视觉资源写入插件私有缓存。** 最多保留 8 份缓存，总量约 1 GiB，并按新旧自动淘汰。
 
-在使用前，请同时遵守 MinerU 的服务条款、隐私政策、额度限制和文档处理要求。
+使用前请同时遵守 MinerU 的服务条款、隐私政策、额度限制和文档处理要求。
 
 ## 安全限制
 
-- 插件接收的 PDF 最大 50 MB；前端先检查 `File.size`，后端再按二进制流累计字节数执行不可绕过的硬上限。MinerU 官方服务当前另有不超过 200 MB、200 页等限制，以其最新文档为准。
-- MinerU 结果 ZIP 最大 250 MB；单条目最大 120 MB；实际总解压体积最大 500 MB；最多 10,000 个条目。
-- 单份结构化 JSON 最大 64 MB；最多归一化 20,000 个结构块；单个表格 HTML 最大 1,000,000 字符。
-- ZIP 路径必须是相对安全路径；绝对路径、盘符路径、`.` / `..` 路径会被拒绝或忽略。
-- 缓存资源只允许 PNG、JPEG、WebP、GIF 和 BMP，并通过 cache ID 与规范化相对路径读取。
+- PDF 最大 50 MB；前端先检查，后端按二进制流累计字节再次执行硬上限。
+- MinerU 官方服务可能另有不超过 200 MB、200 页等限制，以其最新规则为准。
+- MinerU 结果 ZIP 最大 250 MB。
+- 单个 ZIP 条目最大 120 MB，实际总解压体积最大 500 MB，最多 10,000 个条目。
+- 单份结构化 JSON 最大 64 MB，最多归一化 20,000 个结构块。
+- 单个表格 HTML 最大 1,000,000 字符，并在渲染前执行标签、属性和节点限制。
+- ZIP 路径必须是安全相对路径；绝对路径、盘符路径及 `.` / `..` 路径会被拒绝或忽略。
+- 缓存视觉资源仅允许 PNG、JPEG、WebP、GIF 和 BMP。
 - 单个翻译块后端上限为 12,000 字符；全文翻译按小批次执行。
-- 原始 PDF 页面只是视觉参考，不是第二套正文，也不会恢复为 CSS 多栏排版。
+- 用户提供的表格 HTML 仅作为代码围栏导出，不在 Markdown 导出过程中执行。
 
-## 安装
+## 0.5.0 更新摘要
 
-本插件无构建步骤，是 direct-template Hana WebView 插件。
+- 新增稳定的段落级 `Page X / block Y` 引用锚点。
+- 新增全文搜索与自动大纲。
+- 新增锚定笔记、书签、阅读进度和单条删除。
+- 新增最近论文及研究状态自动恢复。
+- 新增标准 SHA-256 解析缓存和可取消任务中心。
+- 新增后端核验的证据助手。
+- 新增术语表、术语版本与翻译缓存隔离。
+- 新增图表、公式、图片和表格实验室。
+- 新增双语 Markdown 导出，保留来源锚点、公式和研究标记。
+- 保留 MinerU 原始二进制协议、旧 Base64 卡片兼容、OCR fallback 和 PDF.js 原页预览。
 
-### 手动安装 ZIP
+完整方向见 [ROADMAP.md](ROADMAP.md)。
 
-在 Hana 插件设置中选择手动安装 ZIP。发布 ZIP 根目录直接包含：
+## 开发与验证
 
-- `manifest.json`
-- `index.js`
-- `README.md`
-- `THIRD_PARTY_NOTICES.md`
-- `assets/`
-- `lib/`
-- `licenses/`
-- `routes/`
-- `tests/`
+仓库没有 `package.json`，测试直接使用 Node.js 内置测试运行器。
 
-无需安装 Python、npm 依赖或浏览器扩展。
-
-### 源目录
-
-也可以把整个 `hana-paper-reader` 目录交给 Hana 的手动安装入口。插件声明 `full-access`，因为它提供 route-backed WebView，并使用 Hana 的 Session、Agent、Model、敏感配置和受控网络能力。
-
-## 开发检查
-
-从插件目录执行：
+运行全部语法检查：
 
 ```powershell
-node --check assets/panel.js
-node --check routes/api.js
-node --check routes/ui.js
-node --check lib/mineru.js
-node --check index.js
-node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8')); console.log('manifest ok')"
-node tests/mineru-protocol.test.mjs
-node tests/static-regression.test.mjs
+$files = Get-ChildItem -Recurse -File -Include *.js,*.mjs
+foreach ($file in $files) {
+  node --check $file.FullName
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 ```
 
-`assets/pdfjs.mjs` 是浏览器原页参考渲染器，不是后端 PDF 解析器。运行时不依赖外部 CDN。
+运行全部测试：
 
-## 第三方软件与开源说明
+```powershell
+$tests = Get-ChildItem tests -File -Filter *.mjs |
+  Sort-Object Name |
+  ForEach-Object FullName
+node --test @tests
+```
 
-- 随包的 `assets/pdfjs.mjs` 来自 **Mozilla PDF.js 5.6.205**，依据 **Apache License 2.0** 分发。完整许可证见 `licenses/PDFJS-APACHE-2.0.txt`，归属说明见 `THIRD_PARTY_NOTICES.md`。
-- 当前 Hana Paper Reader 实现未复制 PaperQuay 源码。若未来直接引入 PaperQuay（`AGPL-3.0-only`）代码，必须保留其版权与许可证信息，并履行 AGPL 对应源代码等义务；“个人使用”或“非商业使用”不会自动免除许可证义务。
-- Hana Paper Reader 本身依据 MIT License 发布，完整文本见项目根目录 `LICENSE`。PDF.js 的 Apache-2.0 许可仅适用于该第三方组件，不替代项目自身许可证。
+0.5.0 当前测试覆盖：
 
-## v0.4.2 设计约束
+- MinerU 二进制协议与旧 Base64 兼容；
+- OCR fallback 触发边界；
+- 论文工作区持久化与最近论文恢复；
+- 搜索、大纲、任务、笔记、书签、进度和术语 CRUD；
+- 术语版本化翻译缓存；
+- SHA-256 原生与 fallback 一致性；
+- 后端解析缓存命中；
+- 真实结构块引用核验；
+- 双语 Markdown、编号转义和 LaTeX 保真；
+- 静态资源与旧 MinerU 路由回归。
 
-- PDF 解析只有 MinerU 一条路线。
-- 新 WebView 与插件后端之间只走原始二进制请求体；Base64 JSON 仅限升级后仍存活的 0.4.0 卡片过渡兼容，不是新流程。
-- 普通模式只在 MinerU 任务级失败或结构结果不可用时自动 OCR 重试一次；鉴权、申请地址、上传、轮询网络、下载、ZIP 安全校验和超时错误不得盲目重试。
-- UI 与 API 通过 `0.4.2` 版本握手，静态资源 URL 带版本参数，解析失败时在状态栏持久显示具体原因。
-- 正文始终为连续单栏；源版面只用于结构顺序和视觉定位。
-- 原页预览只作本地视觉参考。
-- 图片、图表、表格和公式在两侧都必须可见。
-- Token 留在服务端敏感配置，页面只见状态。
-- 不捆绑真实凭据、供应商目录或机器专有模型配置。
+## 开源与第三方软件
+
+- Hana Paper Reader 依据 [MIT License](LICENSE) 发布。
+- `assets/pdfjs.mjs` 来自 Mozilla PDF.js 5.6.205，依据 Apache License 2.0 分发。完整许可证见 [licenses/PDFJS-APACHE-2.0.txt](licenses/PDFJS-APACHE-2.0.txt)，归属说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- 当前实现未复制 PaperQuay 源码。若未来直接引入 PaperQuay（`AGPL-3.0-only`）代码，必须保留其版权和许可证信息，并履行 AGPL 的对应源代码义务；个人或非商业使用不会自动免除许可证要求。
+
+## 设计原则
+
+- **证据优先：** 助手生成的研究结论必须尽可能回到真实论文块。
+- **结构与视觉分离：** MinerU 理解结构，PDF.js 保留页面证据。
+- **低成本动作优先：** 搜索、目录、定位、笔记和缓存尽量本地完成。
+- **结果可复用：** 阅读成果必须能导出并保留证据链。
+- **网络可控：** 只有用户明确导入 PDF、翻译或提问时才触发对应外部处理。
+- **单一路线：** PDF 结构解析只使用 MinerU，不恢复第二套本地解析器。

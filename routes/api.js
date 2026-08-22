@@ -2,9 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { parsePdfWithMineru, readMineruAsset } from "../lib/mineru.js";
+import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.5.0-final";
+import { createPaperWorkspace, searchBlocks, sha256 } from "../lib/paper-workspace.js?hpr=0.5.0-final";
 
 const AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
-const PLUGIN_API_VERSION = "0.4.2";
+const PLUGIN_API_VERSION = "0.5.0";
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 const MAX_LEGACY_BASE64_CHARS = Math.ceil(MAX_PDF_BYTES / 3) * 4;
 const MAX_LEGACY_JSON_BYTES = MAX_LEGACY_BASE64_CHARS + 1024 * 1024;
@@ -19,6 +21,10 @@ const agentSessionCache = new Map();
 const agentTurnLocks = new Map();
 const MINERU_MODELS = new Set(["vlm", "pipeline"]);
 const MINERU_LANGUAGES = new Set(["ch", "en", "japan", "latin"]);
+const researchWorkspaceCache = new WeakMap();
+const MAX_RESEARCH_BLOCKS = 24;
+const MAX_RESEARCH_EVIDENCE_CHARS = 50000;
+const MAX_RESEARCH_LIMIT = 100;
 
 class PdfRequestError extends Error {
   constructor(message, status) {
@@ -395,8 +401,18 @@ function parseJsonArray(text) {
   }
 }
 
-async function runUtilityTranslation(bus, list) {
-  const prompt = `请将以下学术英文逐条翻译为准确、自然的学术中文。保留公式、数字和专业缩写。只返回 JSON 字符串数组，数组长度必须为 ${list.length}，不要附加解释：\n${JSON.stringify(list)}`;
+function glossaryInstruction(terms) {
+  if (!terms || typeof terms !== "object" || Array.isArray(terms)) return "";
+  const entries = Object.entries(terms)
+    .filter(([source, target]) => typeof source === "string" && source.trim() && typeof target === "string" && target.trim())
+    .slice(0, 100);
+  return entries.length
+    ? `\n术语表（必须优先采用固定译法）：${JSON.stringify(Object.fromEntries(entries))}`
+    : "";
+}
+
+async function runUtilityTranslation(bus, list, glossaryTerms = {}) {
+  const prompt = `请将以下学术英文逐条翻译为准确、自然的学术中文。保留公式、数字和专业缩写。只返回 JSON 字符串数组，数组长度必须为 ${list.length}，不要附加解释：${glossaryInstruction(glossaryTerms)}\n${JSON.stringify(list)}`;
   const result = await bus.request("model:sample-text", {
     pluginId: "hana-paper-reader",
     messages: [{ role: "user", content: prompt }],
@@ -584,7 +600,459 @@ async function readPdfRequest(c) {
   throw new PdfRequestError("PDF 上传协议不受支持，请关闭并重新打开阅读器后重试", 415);
 }
 
+function getResearchWorkspace(ctx) {
+  let workspace = researchWorkspaceCache.get(ctx);
+  if (!workspace) {
+    workspace = createPaperWorkspace({ dataDir: ctx.dataDir });
+    researchWorkspaceCache.set(ctx, workspace);
+  }
+  return workspace;
+}
+
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value || {}, key);
+}
+
+function requestQuery(c, key) {
+  return typeof c.req.query === "function" ? c.req.query(key) : "";
+}
+
+function requestParam(c, key) {
+  return typeof c.req.param === "function" ? c.req.param(key) : "";
+}
+
+function researchLimit(value) {
+  const numeric = Number(value);
+  return Number.isInteger(numeric) ? Math.max(1, Math.min(MAX_RESEARCH_LIMIT, numeric)) : MAX_RESEARCH_LIMIT;
+}
+
+function researchPaperHash(c, body = null) {
+  return (body && typeof body.paperHash === "string" ? body.paperHash : requestQuery(c, "paperHash")) || "";
+}
+
+function researchJsonError(c, error, status = 400) {
+  return c.json({ ok: false, error: String(error?.message || error || "研究工作区请求失败").slice(0, 500) }, status);
+}
+
+function publicCachedPaper(paper) {
+  if (!paper) return null;
+  return {
+    paperHash: paper.paperHash,
+    metadata: paper.metadata || {},
+    parser: paper.parser || {},
+    blocks: Array.isArray(paper.blocks) ? paper.blocks : [],
+    resources: Array.isArray(paper.resources) ? paper.resources : [],
+    translations: paper.translations || {},
+    translationGlossaryVersion: Number.isInteger(Number(paper.translationGlossaryVersion)) ? Number(paper.translationGlossaryVersion) : 0,
+    createdAt: paper.createdAt || null,
+    updatedAt: paper.updatedAt || null,
+  };
+}
+
+function translationValue(translations, blockId) {
+  if (!translations || !blockId) return "";
+  const candidate = Array.isArray(translations)
+    ? translations.find((item) => item?.blockId === blockId || item?.block_id === blockId)
+    : translations[blockId];
+  if (typeof candidate === "string") return candidate;
+  return typeof candidate?.translation === "string" ? candidate.translation
+    : typeof candidate?.text === "string" ? candidate.text
+      : typeof candidate?.value === "string" ? candidate.value : "";
+}
+
+function blocksWithTranslations(blocks, translations, clearExisting = false) {
+  if (!Array.isArray(blocks)) return [];
+  return blocks.map((block) => {
+    const normalized = clearExisting && block && typeof block === "object"
+      ? Object.fromEntries(Object.entries(block).filter(([key]) => key !== "translatedText"))
+      : block;
+    const translation = translationValue(translations, block?.id);
+    return translation ? { ...normalized, translatedText: translation } : normalized;
+  });
+}
+
+function normalizedTranslationMap(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value)
+    .map(([blockId, translation]) => [blockId, translationValue({ [blockId]: translation }, blockId).trim()])
+    .filter(([blockId, translation]) => blockId && translation));
+}
+
+function blockTranslationMap(blocks) {
+  return Object.fromEntries((Array.isArray(blocks) ? blocks : [])
+    .filter((block) => block?.id && typeof block.translatedText === "string" && block.translatedText.trim())
+    .map((block) => [block.id, block.translatedText.trim()]));
+}
+
+function paperPayload(body, existing) {
+  const payload = { paperHash: body?.paperHash };
+  for (const key of ["metadata", "parser", "assets"]) {
+    if (hasOwn(body, key)) payload[key] = body[key];
+  }
+  const hasBlocks = hasOwn(body, "blocks");
+  const hasTranslations = hasOwn(body, "translations");
+  const hasTranslationVersion = hasOwn(body, "translationGlossaryVersion");
+  const existingVersion = Number.isInteger(Number(existing?.translationGlossaryVersion)) ? Math.max(0, Number(existing.translationGlossaryVersion)) : 0;
+  const incomingVersion = hasTranslationVersion && Number.isInteger(Number(body.translationGlossaryVersion))
+    ? Math.max(0, Number(body.translationGlossaryVersion))
+    : existingVersion;
+  const replaceTranslations = hasTranslations && (body?.replaceTranslations === true || (hasTranslationVersion && incomingVersion !== existingVersion));
+  const previousTranslations = replaceTranslations ? {} : {
+    ...blockTranslationMap(existing?.blocks),
+    ...normalizedTranslationMap(existing?.translations),
+  };
+  const incomingTranslations = hasTranslations ? normalizedTranslationMap(body.translations) : {};
+  const mergedTranslations = { ...previousTranslations, ...incomingTranslations };
+  if (hasBlocks || hasTranslations) {
+    payload.blocks = blocksWithTranslations(
+      hasBlocks ? body.blocks : existing?.blocks || [],
+      mergedTranslations,
+      replaceTranslations,
+    );
+  }
+  if (hasTranslations || Object.keys(previousTranslations).length) payload.translations = mergedTranslations;
+  if (hasTranslationVersion) payload.translationGlossaryVersion = incomingVersion;
+  return payload;
+}
+
+function paperEvidence(paper, body) {
+  const blocks = Array.isArray(paper?.blocks) ? paper.blocks : [];
+  const requestedBlockIds = Array.isArray(body?.blockIds) ? body.blockIds : [body?.blockId || body?.selectedBlockId].filter(Boolean);
+  const requestedIds = requestedBlockIds.length ? new Set(requestedBlockIds.map(String)) : null;
+  let selected = requestedIds?.size ? blocks.filter((block) => requestedIds.has(String(block.id))) : blocks;
+  const query = typeof body?.query === "string" ? body.query.trim() : "";
+  if (query && !requestedIds?.size) selected = searchBlocks(blocks, query, { limit: MAX_RESEARCH_BLOCKS }).map((hit) => blocks.find((block) => block.id === hit.id)).filter(Boolean);
+  selected = selected.slice(0, MAX_RESEARCH_BLOCKS);
+  const evidence = [];
+  let total = 0;
+  for (const block of selected) {
+    const bodyText = String(block.text || block.translatedText || block.latex || "").trim();
+    if (!bodyText) continue;
+    const line = `[Page ${Number(block.page) > 0 ? Number(block.page) : 1} / block ${block.id}] ${bodyText}`;
+    if (total + line.length > MAX_RESEARCH_EVIDENCE_CHARS) break;
+    evidence.push({ page: Number(block.page) > 0 ? Number(block.page) : 1, id: String(block.id), text: bodyText });
+    total += line.length;
+  }
+  return evidence;
+}
+
+function evidencePrompt(paper, evidence, question) {
+  const title = String(paper?.metadata?.title || "当前论文").slice(0, 500);
+  const source = evidence.map((item) => `[Page ${item.page} / block ${item.id}] ${item.text}`).join("\n");
+  return `论文：${title}\n\n以下是当前论文的原文证据，只能依据这些证据回答：\n${source}\n\n用户问题：${question}\n\n请给出严谨、简洁的回答。每个关键结论后必须附上精确格式的证据提示：Page X / block Y；不要编造未出现在证据中的事实。`;
+}
+
+function evidenceCitation(evidence) {
+  return evidence.map((item) => `Page ${item.page} / block ${item.id}`).join("；");
+}
+
+function enforceEvidenceCitations(answer, evidence) {
+  const allowed = new Set(evidence.map((item) => `Page ${item.page} / block ${item.id}`));
+  let text = String(answer || "").trim().replace(/Page\s+\d+\s+\/\s+block\s+[A-Za-z0-9._:-]+/gi, (match) => {
+    const normalized = match.replace(/Page\s+(\d+)\s+\/\s+block\s+/i, "Page $1 / block ");
+    return allowed.has(normalized) ? normalized : "[未核验来源已移除]";
+  });
+  if (![...allowed].some((citation) => text.includes(citation))) text += `\n\n证据提示：${evidenceCitation(evidence)}`;
+  return text;
+}
+
+function verifiedQuoteCitation(workspace, body) {
+  const hash = typeof body?.paperHash === "string" && /^[a-f0-9]{12,128}$/i.test(body.paperHash) ? body.paperHash : "";
+  const blockId = typeof body?.blockId === "string" ? body.blockId : "";
+  if (!hash || !blockId) return "";
+  const paper = workspace.getPaper(hash);
+  const block = paper?.blocks?.find((item) => String(item.id) === blockId);
+  return block ? `Page ${Number(block.page) > 0 ? Number(block.page) : 1} / block ${block.id}` : "";
+}
+
+function withoutClientCitation(value) {
+  return String(value || "")
+    .replace(/\n\s*(?:来源|已核验来源)：Page\s+\d+\s+\/\s+block\s+[^\r\n]+\s*$/i, "")
+    .trim()
+    .slice(0, MAX_TEXT_CHARS);
+}
+
+function enforceVerifiedCitation(answer, citation) {
+  let text = String(answer || "").trim();
+  if (!citation) return text;
+  text = text.replace(/Page\s+\d+\s+\/\s+block\s+[A-Za-z0-9._:-]+/gi, citation);
+  if (!text.includes(citation)) text += `\n\n来源：${citation}`;
+  return text;
+}
+
+function recentWorkspacePaper(workspace) {
+  const direct = typeof workspace.getRecentPaper === "function" ? workspace.getRecentPaper() : null;
+  if (direct) return direct;
+  const papers = Object.values(workspace.load?.().papers || {}).filter((paper) => paper?.paperHash);
+  papers.sort((left, right) => {
+    const leftTime = String(left.updatedAt || left.createdAt || "");
+    const rightTime = String(right.updatedAt || right.createdAt || "");
+    return rightTime.localeCompare(leftTime);
+  });
+  return papers[0] || null;
+}
+
+function registerResearchRoutes(app, ctx, workspace) {
+  app.get("/api/research/recent", (c) => {
+    try {
+      return c.json({ ok: true, paper: publicCachedPaper(recentWorkspacePaper(workspace)) });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  app.get("/api/research/paper", (c) => {
+    try {
+      const paperHash = researchPaperHash(c);
+      const paper = publicCachedPaper(workspace.getPaper(paperHash));
+      return paper ? c.json({ ok: true, paper }) : c.json({ ok: false, error: "论文不存在" }, 404);
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  app.post("/api/research/paper", async (c) => {
+    try {
+      const body = await c.req.json();
+      const paper = await workspace.upsertPaper(paperPayload(body, workspace.getPaper(body?.paperHash)));
+      return c.json({ ok: true, paper });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  app.get("/api/research/snapshot", (c) => {
+    try {
+      const paperHash = researchPaperHash(c);
+      const snapshot = workspace.snapshot(paperHash, { limit: researchLimit(requestQuery(c, "limit")) });
+      return snapshot ? c.json({ ok: true, snapshot }) : c.json({ ok: false, error: "论文不存在" }, 404);
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  app.get("/api/research/search", (c) => {
+    try {
+      const paperHash = researchPaperHash(c);
+      const query = requestQuery(c, "q") || requestQuery(c, "query");
+      const results = workspace.search(paperHash, query, { type: requestQuery(c, "type"), limit: researchLimit(requestQuery(c, "limit")) });
+      return c.json({ ok: true, paperHash, query, results });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  app.get("/api/research/outline", (c) => {
+    try {
+      const paperHash = researchPaperHash(c);
+      return c.json({ ok: true, paperHash, outline: workspace.outline(paperHash) });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  for (const collection of ["notes", "bookmarks"]) {
+    app.post(`/api/research/${collection}`, async (c) => {
+      try {
+        const item = await workspace[collection === "notes" ? "putNote" : "putBookmark"](await c.req.json());
+        return c.json({ ok: true, [collection.slice(0, -1)]: item });
+      } catch (error) {
+        return researchJsonError(c, error);
+      }
+    });
+    app.get(`/api/research/${collection}`, (c) => {
+      try {
+        const paperHash = researchPaperHash(c);
+        return c.json({ ok: true, paperHash, [collection]: workspace.listItems(collection, paperHash, researchLimit(requestQuery(c, "limit"))) });
+      } catch (error) {
+        return researchJsonError(c, error);
+      }
+    });
+    if (typeof app.delete === "function") {
+      const deleteItem = async (c) => {
+        try {
+          let id = requestParam(c, "id") || requestQuery(c, "id");
+          if (!id && typeof c.req.json === "function") id = (await c.req.json().catch(() => ({}))).id || "";
+          const deleted = await workspace.deleteItem(collection, id);
+          return deleted ? c.json({ ok: true, deleted: true }) : c.json({ ok: false, error: "记录不存在" }, 404);
+        } catch (error) {
+          return researchJsonError(c, error);
+        }
+      };
+      app.delete(`/api/research/${collection}/:id`, deleteItem);
+      app.delete(`/api/research/${collection}`, deleteItem);
+    }
+  }
+
+  app.post("/api/research/progress", async (c) => {
+    try {
+      return c.json({ ok: true, progress: await workspace.setProgress(await c.req.json()) });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+  app.get("/api/research/progress", (c) => {
+    try {
+      const paperHash = researchPaperHash(c);
+      return c.json({ ok: true, paperHash, progress: workspace.getProgress(paperHash) });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  app.get("/api/research/glossary", (c) => {
+    try {
+      const paperHash = researchPaperHash(c);
+      return c.json({ ok: true, glossary: workspace.getGlossary(paperHash) });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+  app.post("/api/research/glossary", async (c) => {
+    try {
+      return c.json({ ok: true, glossary: await workspace.putGlossary(await c.req.json()) });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+  if (typeof app.delete === "function") app.delete("/api/research/glossary", async (c) => {
+    try {
+      const queryTerm = requestQuery(c, "term");
+      const body = queryTerm || typeof c.req.json !== "function" ? {} : await c.req.json().catch(() => ({}));
+      const paperHash = researchPaperHash(c, body);
+      const term = queryTerm || body.term;
+      if (!term) return c.json({ ok: false, error: "term is required" }, 400);
+      return c.json({ ok: true, deleted: await workspace.deleteGlossaryTerm(paperHash, term) });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  app.get("/api/research/translation-cache", (c) => {
+    try {
+      const paperHash = researchPaperHash(c);
+      const blockId = requestQuery(c, "blockId");
+      const glossaryVersion = requestQuery(c, "glossaryVersion");
+      const translation = workspace.getTranslation(paperHash, blockId, glossaryVersion);
+      return c.json({ ok: true, hit: Boolean(translation), translation });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+  app.post("/api/research/translation-cache", async (c) => {
+    try {
+      return c.json({ ok: true, translation: await workspace.putTranslation(await c.req.json()) });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  const listTasks = (c) => {
+    try {
+      const paperHash = researchPaperHash(c);
+      return c.json({ ok: true, paperHash, tasks: workspace.listTasks(paperHash, researchLimit(requestQuery(c, "limit"))) });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  };
+  app.get("/api/research/parse-status/tasks", listTasks);
+  app.post("/api/research/parse-status/tasks", async (c) => {
+    try {
+      return c.json({ ok: true, task: await workspace.createTask(await c.req.json()) });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  const updateTask = async (c, forcedState = null) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const patch = {};
+      for (const key of ["state", "stage", "progress", "error"]) if (hasOwn(body, key)) patch[key] = body[key];
+      if (forcedState) patch.state = forcedState;
+      return c.json({ ok: true, task: await workspace.updateTask(requestParam(c, "taskId") || requestQuery(c, "taskId"), patch) });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  };
+  app.post("/api/research/parse-status/tasks/:taskId", updateTask);
+  app.post("/api/research/parse-status/tasks/:taskId/update", updateTask);
+  app.post("/api/research/parse-status/tasks/:taskId/cancel", (c) => updateTask(c, "cancelled"));
+
+  app.post("/api/research/export", async (c) => {
+    try {
+      const body = await c.req.json();
+      const paperHash = researchPaperHash(c, body);
+      const paper = workspace.getPaper(paperHash);
+      if (!paper) return c.json({ ok: false, error: "论文不存在" }, 404);
+      const markdown = generatePaperMarkdown({
+        metadata: paper.metadata,
+        blocks: paper.blocks,
+        translations: body.translations ?? paper.translations ?? Object.fromEntries(paper.blocks.map((block) => [block.id, block.translatedText]).filter(([, value]) => value)),
+        notes: workspace.listItems("notes", paperHash),
+        bookmarks: workspace.listItems("bookmarks", paperHash),
+        progress: workspace.getProgress(paperHash),
+        glossary: workspace.getGlossary(paperHash).terms,
+        assets: paper.resources,
+        options: body.options,
+      });
+      return new Response(markdown, { status: 200, headers: { "Content-Type": "text/markdown; charset=utf-8", "X-Paper-Hash": paperHash } });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  app.post("/api/research/evidence", async (c) => {
+    try {
+      const body = await c.req.json();
+      const paper = workspace.getPaper(body?.paperHash);
+      if (!paper) return c.json({ ok: false, error: "论文不存在" }, 404);
+      const question = String(body?.question || body?.prompt || "").trim().slice(0, MAX_TEXT_CHARS);
+      if (!question) return c.json({ ok: false, error: "question is required" }, 400);
+      const evidence = paperEvidence(paper, body);
+      if (!evidence.length) return c.json({ ok: false, error: "没有可用的论文证据块" }, 400);
+      const { bus } = getRequestRuntime(c, ctx);
+      const agent = await resolveAgent(bus, body?.agentId);
+      if (!agent) return c.json({ ok: false, error: "未找到指定助手" }, 400);
+      const result = await runAgentTurn(bus, ctx, agent.id, evidencePrompt(paper, evidence, question), {
+        reuse: true,
+        namespace: "research-evidence",
+        thinkingLevel: body.thinkingLevel,
+      });
+      const answer = enforceEvidenceCitations(result.text, evidence);
+      return c.json({ ok: true, answer, evidence, model: agent.model, sessionId: result.target.sessionId, thinkingLevel: result.target.thinkingLevel || result.target.requestedThinkingLevel });
+    } catch (error) {
+      ctx.log?.error?.("research evidence error:", error);
+      return c.json({ ok: false, error: "论文证据问答失败，请稍后重试" }, 502);
+    }
+  });
+
+  app.get("/api/research/parse-cache/check", (c) => {
+    try {
+      const paperHash = researchPaperHash(c);
+      const stored = workspace.getPaper(paperHash);
+      const hit = Boolean(stored && Array.isArray(stored.blocks) && stored.blocks.length);
+      const paper = hit ? publicCachedPaper(stored) : null;
+      return c.json({
+        ok: true,
+        paperHash,
+        hit,
+        cached: hit,
+        blockCount: hit ? paper.blocks.length : 0,
+        pageCount: paper?.parser?.pageCount || 0,
+        paper,
+      });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+}
+
+export { recentWorkspacePaper };
+
 export default function registerApiRoutes(app, ctx) {
+  const researchWorkspace = getResearchWorkspace(ctx);
+  registerResearchRoutes(app, ctx, researchWorkspace);
   app.get("/api/mineru-settings", (c) => c.json(publicMineruSettings(ctx)));
 
   app.post("/api/mineru-settings", async (c) => {
@@ -638,13 +1106,47 @@ export default function registerApiRoutes(app, ctx) {
       if (request.buffer.subarray(0, 5).toString("ascii") !== "%PDF-") {
         throw new PdfRequestError("上传的文件不是有效 PDF", 400);
       }
+      const paperHash = sha256(request.buffer);
+      const stored = researchWorkspace.getPaper(paperHash);
+      if (stored && Array.isArray(stored.blocks) && stored.blocks.length) {
+        return c.json({
+          ok: true,
+          parser: stored.parser?.kind || "mineru",
+          modelVersion: stored.parser?.modelVersion || "vlm",
+          ocrUsed: stored.parser?.ocrUsed === true,
+          ocrFallback: stored.parser?.ocrFallback === true,
+          pageCount: Number(stored.parser?.pageCount || 0),
+          blockCount: stored.blocks.length,
+          blocks: stored.blocks,
+          paperHash,
+          cached: true,
+          apiVersion: PLUGIN_API_VERSION,
+          uiVersion: request.uiVersion || null,
+          transport: request.transport,
+        });
+      }
       const result = await parsePdfWithMineru({
         buffer: request.buffer,
         fileName: request.fileName,
         ctx,
       });
+      await researchWorkspace.upsertPaper({
+        paperHash,
+        metadata: { title: request.fileName },
+        parser: {
+          kind: "mineru",
+          modelVersion: result.modelVersion,
+          pageCount: result.pageCount,
+          ocrUsed: result.ocrUsed === true,
+          ocrFallback: result.ocrFallback === true,
+          attemptCount: result.attemptCount,
+        },
+        blocks: result.blocks,
+      });
       return c.json({
         ...result,
+        paperHash,
+        cached: false,
         apiVersion: PLUGIN_API_VERSION,
         uiVersion: request.uiVersion || null,
         transport: request.transport,
@@ -670,7 +1172,7 @@ export default function registerApiRoutes(app, ctx) {
       if (body?.agentId) {
         const agent = await resolveAgent(bus, body.agentId);
         if (!agent) return c.json({ ok: false, error: "未找到指定助手" }, 400);
-        const prompt = `请翻译下面的学术英文。只返回 JSON 字符串数组，数组长度必须为 ${list.length}，不要输出解释。\n${JSON.stringify(list)}`;
+        const prompt = `请翻译下面的学术英文。只返回 JSON 字符串数组，数组长度必须为 ${list.length}，不要输出解释。${glossaryInstruction(body.glossaryTerms)}\n${JSON.stringify(list)}`;
         const result = await runAgentTurn(bus, ctx, agent.id, prompt, {
           reuse: true,
           namespace: "translation",
@@ -686,7 +1188,7 @@ export default function registerApiRoutes(app, ctx) {
         });
       }
 
-      return c.json({ ok: true, translations: await runUtilityTranslation(bus, list), model: "utility" });
+      return c.json({ ok: true, translations: await runUtilityTranslation(bus, list, body?.glossaryTerms), model: "utility" });
     } catch (error) {
       ctx.log?.error?.("translate error:", error);
       return c.json({ ok: false, error: "翻译失败，请稍后重试" }, 502);
@@ -700,7 +1202,7 @@ export default function registerApiRoutes(app, ctx) {
       const agent = await resolveAgent(bus, body?.agentId);
       if (!agent) return c.json({ ok: false, error: "未找到指定助手" }, 400);
       const quote = typeof body.quote === "string" ? body.quote.trim() : "";
-      const context = typeof body.context === "string" ? body.context.trim() : "";
+      const context = withoutClientCitation(body.context);
       if (!quote || quote.length > MAX_TEXT_CHARS) return c.json({ ok: false, error: "选中文本为空或过长" }, 400);
 
       let task = "请用严谨但易懂的语言解释选中文献内容的原理、论证逻辑和关键要点。";
@@ -709,15 +1211,19 @@ export default function registerApiRoutes(app, ctx) {
       if (body.questionType === "critique") task = "请从审稿人角度客观分析方法和结论的可靠性。";
       if (typeof body.prompt === "string" && body.prompt.trim()) task = body.prompt.trim().slice(0, MAX_TEXT_CHARS);
 
-      const prompt = `论文：${String(body.paperTitle || "当前学术文献").slice(0, 500)}\n上下文：${context}\n选中文本：${quote}\n\n任务：${task}\n请直接回答，支持 Markdown。`;
+      const citation = verifiedQuoteCitation(researchWorkspace, body);
+      const sourceLine = citation ? `\n已由论文工作区核验的来源：${citation}` : "";
+      const prompt = `论文：${String(body.paperTitle || "当前学术文献").slice(0, 500)}\n上下文：${context}\n选中文本：${quote}${sourceLine}${glossaryInstruction(body.glossaryTerms)}\n\n任务：${task}\n请直接回答，支持 Markdown。${citation ? `关键结论必须引用且只能引用已核验来源：${citation}。` : "不要虚构页码或段落编号。"}`;
       const result = await runAgentTurn(bus, ctx, agent.id, prompt, {
         reuse: true,
         namespace: "reader",
         thinkingLevel: body.thinkingLevel,
       });
+      const answer = enforceVerifiedCitation(result.text, citation);
       return c.json({
         ok: true,
-        answer: result.text,
+        answer,
+        citation: citation || null,
         model: agent.model,
         sessionId: result.target.sessionId,
         thinkingLevel: result.target.thinkingLevel || result.target.requestedThinkingLevel,
@@ -737,11 +1243,14 @@ export default function registerApiRoutes(app, ctx) {
       const quote = typeof body.quote === "string" ? body.quote.trim() : "";
       if (!quote || quote.length > MAX_TEXT_CHARS) return c.json({ ok: false, error: "选中文本为空或过长" }, 400);
 
-      const text = `【文献划词研讨】\n论文：${String(body.paperTitle || "当前阅读论文").slice(0, 500)}\n选中文本：${quote}\n上下文：${String(body.context || "").slice(0, MAX_TEXT_CHARS)}\n\n请在这个助手会话中继续分析这段内容。`;
+      const citation = verifiedQuoteCitation(researchWorkspace, body);
+      const context = withoutClientCitation(body.context);
+      const text = `【文献划词研讨】\n论文：${String(body.paperTitle || "当前阅读论文").slice(0, 500)}\n${citation ? `已核验来源：${citation}\n` : ""}选中文本：${quote}\n上下文：${context}\n\n请在这个助手会话中继续分析这段内容。${citation ? `回答时请保留来源标记：${citation}。` : ""}`;
       const target = await sendAgentMessage(bus, ctx, agent.id, text, body.thinkingLevel);
       return c.json({
         ok: true,
         accepted: true,
+        citation: citation || null,
         sessionId: target.sessionId,
         thinkingLevel: target.thinkingLevel || target.requestedThinkingLevel,
         message: "已发送到该助手的文献研讨会话",

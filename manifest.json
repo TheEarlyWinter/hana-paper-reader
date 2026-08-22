@@ -2,8 +2,8 @@
   "manifestVersion": 1,
   "id": "hana-paper-reader",
   "name": "Hana Paper Reader",
-  "version": "0.4.2",
-  "description": "基于 MinerU 精准解析的学术 PDF 双语精读工作台，支持二进制上传、旧卡片升级兼容和 OCR 自动回退。",
+  "version": "0.5.0",
+  "description": "基于 MinerU 精准解析的学术 PDF 双语精读工作台，支持引用锚点、论文搜索、研究笔记、解析缓存、证据助手、术语翻译缓存、视觉实验室和双语 Markdown 导出。",
   "minAppVersion": "0.358.0",
   "trust": "full-access",
   "capabilities": [

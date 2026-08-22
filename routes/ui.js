@@ -1,4 +1,4 @@
-const ASSET_VERSION = "0.4.2";
+const ASSET_VERSION = "0.5.0";
 
 export default function registerPluginUiRoutes(app, ctx) {
   app.get("/card", (c) => c.html(renderShell(c, ctx, "card")));
@@ -12,6 +12,9 @@ function renderShell(c, ctx, surface) {
   const assetBase = c.req.query("hana-asset-base") || `/api/plugins/${encodeURIComponent(ctx.pluginId)}/assets`;
   const panelCssUrl = pluginAssetUrl(assetBase, "panel.css");
   const panelJsUrl = pluginAssetUrl(assetBase, "panel.js");
+  const researchToolsCssUrl = pluginAssetUrl(assetBase, "research-tools.css");
+  const researchToolsJsUrl = pluginAssetUrl(assetBase, "research-tools.js");
+  const sha256JsUrl = pluginAssetUrl(assetBase, "sha256.js");
   const pdfJsUrl = pluginAssetUrl(assetBase, "pdfjs.mjs");
   const title = "Hana Paper Reader";
 
@@ -23,8 +26,9 @@ function renderShell(c, ctx, surface) {
   <title>${escapeHtml(title)}</title>
   ${hanaCss ? `<link rel="stylesheet" href="${escapeAttr(hanaCss)}">` : ""}
   <link rel="stylesheet" href="${escapeAttr(panelCssUrl)}">
+  <link rel="stylesheet" href="${escapeAttr(researchToolsCssUrl)}">
 </head>
-<body data-hana-theme="${escapeAttr(theme)}" data-surface="${surface}" data-pdfjs-url="${escapeAttr(pdfJsUrl)}">
+<body data-hana-theme="${escapeAttr(theme)}" data-surface="${surface}" data-pdfjs-url="${escapeAttr(pdfJsUrl)}" data-research-tools-url="${escapeAttr(researchToolsJsUrl)}" data-sha256-url="${escapeAttr(sha256JsUrl)}">
   <div id="root" data-surface="${surface}">
     <div style="min-height:100vh;display:grid;place-items:center;padding:24px;color:#537d96;background:#f8f5ed;font:14px/1.6 system-ui,sans-serif;text-align:center">
       正在加载 Hana Paper Reader…<br><small style="color:#7a7369">若此提示持续显示，说明前端资源未成功加载。</small>

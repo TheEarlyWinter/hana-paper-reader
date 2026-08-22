@@ -1,6 +1,6 @@
 const PROTOCOL = "hana.plugin.ui";
 const VERSION = 1;
-const UI_VERSION = "0.4.2";
+const UI_VERSION = "0.5.0";
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 let seq = 0;
 
@@ -94,6 +94,47 @@ async function copyTextToClipboard(text) {
   }
 }
 
+function isPaperHash(value) {
+  return /^[a-f0-9]{12,128}$/i.test(String(value || ""));
+}
+
+let sha256ModulePromise = null;
+
+async function sha256Hex(value) {
+  const moduleUrl = document.body?.dataset?.sha256Url;
+  if (!moduleUrl) throw new Error("SHA-256 资源未加载");
+  sha256ModulePromise ||= import(moduleUrl);
+  const module = await sha256ModulePromise;
+  return module.sha256Hex(value);
+}
+
+async function hashFile(file) {
+  return sha256Hex(new Uint8Array(await file.arrayBuffer()));
+}
+
+async function hashPaperSource(paper) {
+  const source = {
+    title: String(paper?.title || ""),
+    parser: String(paper?.parser || ""),
+    blocks: Array.isArray(paper?.blocks) ? paper.blocks.map((block) => ({
+      id: block?.id,
+      page: block?.page,
+      type: block?.type,
+      text: block?.text,
+      latex: block?.latex,
+      tableHtml: block?.tableHtml,
+      assetPath: block?.assetPath,
+    })) : [],
+  };
+  return sha256Hex(JSON.stringify(source));
+}
+
+function citationAnchorForBlock(block) {
+  const page = Number(block?.page) > 0 ? Number(block.page) : 1;
+  const id = String(block?.id || "block").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "block";
+  return `paper-p${page}-b-${id}`;
+}
+
 // ================= 全局状态 =================
 let agentsList = [
   { id: "hakimi", name: "哈基米", model: "gemini-3.7-flash", description: "理性与推导兼备", avatarUrl: null },
@@ -105,8 +146,11 @@ let agentsList = [
 let currentAgent = agentsList[0];
 let currentPaper = {
   title: "未导入文献",
+  paperHash: null,
   blocks: [],
-  translations: {}
+  translations: {},
+  glossaryVersion: 0,
+  translationGlossaryVersion: 0,
 };
 let mineruConfigured = false;
 let mineruApiVersion = null;
@@ -152,6 +196,12 @@ let pdfJsModulePromise = null;
 const pdfPreviewObjectUrls = new Set();
 const mineruAssetUrlPromises = new Map();
 const pdfPageRenderLocks = new Map();
+let researchTools = null;
+let researchToolsPromise = null;
+let selectedBlockId = null;
+let activeParseTask = null;
+let progressSyncTimer = null;
+let researchSyncTimer = null;
 
 const SAMPLE_PAPER = {
   title: "Attention Is All You Need (Vaswani et al.)",
@@ -190,6 +240,7 @@ function initLayout() {
         <button id="btn-open-file" class="btn primary small">📂 导入 PDF / 文档</button>
         <button id="btn-reparse" class="btn small" style="display:none">↻ MinerU 重解析</button>
         <button id="btn-sample" class="btn small">🧪 示例论文</button>
+        <button id="btn-research-tools" class="btn small" style="display:none" title="搜索、大纲、笔记、任务、证据助手、术语、图表实验室和导出">研究工具</button>
         <button id="btn-translate-all" class="btn small" style="display:none">⚡ 翻译全文</button>
         <button id="btn-locate-sync" class="btn small" style="display:none" title="以当前滚动面板为基准，对齐另一侧的同一段落">⌖ 对齐</button>
       </div>
@@ -339,6 +390,8 @@ function initLayout() {
   bindEvents();
   loadAgentsList();
   void loadMineruSettings();
+  void initializeResearchTools();
+  void restoreRecentPaper();
 }
 
 function bindEvents() {
@@ -348,6 +401,7 @@ function bindEvents() {
   const btnSample = document.getElementById("btn-sample");
   const btnEmptySample = document.getElementById("btn-empty-sample");
   const btnTranslateAll = document.getElementById("btn-translate-all");
+  const btnResearchTools = document.getElementById("btn-research-tools");
   const btnLocateSync = document.getElementById("btn-locate-sync");
   const btnReparse = document.getElementById("btn-reparse");
   const btnMineruSettings = document.getElementById("btn-mineru-settings");
@@ -363,6 +417,7 @@ function bindEvents() {
   btnSample.addEventListener("click", loadSamplePaper);
   btnEmptySample.addEventListener("click", loadSamplePaper);
   btnTranslateAll.addEventListener("click", () => startFullTranslation());
+  btnResearchTools.addEventListener("click", () => void openResearchTools());
   btnLocateSync.addEventListener("click", () => locateSameBlock(activePane));
   btnReparse.addEventListener("click", () => {
     if (currentPdfFile) void parsePdfFile(currentPdfFile);
@@ -439,6 +494,7 @@ function bindEvents() {
     pane.addEventListener("focusin", () => { activePane = pane; });
     pane.addEventListener("scroll", () => {
       if (!syncingPanes) activePane = pane;
+      scheduleProgressSync();
     }, { passive: true });
   });
   activePane = origPane;
@@ -601,6 +657,330 @@ function applyEffectiveThinkingLevel(data) {
   if (!actual) return;
   effectiveThinkingLevel = normalizeThinkingLevel(actual);
   renderThinkingLevelUI();
+}
+
+function researchPaperView() {
+  return {
+    ...currentPaper,
+    loaded: currentPaper.blocks.length > 0,
+    blocks: currentPaper.blocks.map((block) => ({
+      ...block,
+      translatedText: currentPaper.translations?.[block.id] || block.translatedText || "",
+    })),
+    agentId: currentAgent?.id || null,
+    thinkingLevel: currentThinkingLevel,
+    glossaryTerms: currentPaper.glossaryTerms || {},
+  };
+}
+
+function selectedResearchBlock() {
+  const visibleId = firstVisibleBlock(activePane)?.dataset?.id;
+  const id = selectedBlockId || visibleId;
+  return currentPaper.blocks.find((block) => block.id === id) || currentPaper.blocks[0] || null;
+}
+
+function currentReadingProgress() {
+  const pane = activePane || document.getElementById("original-pane");
+  const block = selectedResearchBlock();
+  const maximum = pane ? Math.max(0, pane.scrollHeight - pane.clientHeight) : 0;
+  const percent = maximum > 0 ? Math.round(Math.max(0, Math.min(1, pane.scrollTop / maximum)) * 100) : 0;
+  return {
+    paperHash: currentPaper.paperHash,
+    page: Number(block?.page || 1),
+    percent,
+    blockId: block?.id || null,
+    pageCount: Number(currentPaper.pageCount || 0),
+  };
+}
+
+async function initializeResearchTools() {
+  if (researchTools) return researchTools;
+  if (researchToolsPromise) return researchToolsPromise;
+  researchToolsPromise = (async () => {
+    const moduleUrl = document.body?.dataset?.researchToolsUrl;
+    const mount = document.querySelector(".main-layout");
+    if (!moduleUrl || !mount) throw new Error("研究工具资源未加载");
+    const module = await import(moduleUrl);
+    researchTools = module.createResearchTools({
+      root: mount,
+      document,
+      apiFetch: pluginApiFetch,
+      getPaper: researchPaperView,
+      getSelectedBlock: selectedResearchBlock,
+      getProgress: currentReadingProgress,
+      onLocateBlock: locateResearchBlock,
+      onPaperStateChanged: (change) => {
+        if (change?.kind === "glossary") void refreshGlossaryState();
+        researchTools?.refresh();
+      },
+      onCancelTask: async (task) => {
+        if (task?.id && activeParseController && activeParseTask?.id === task.id) {
+          await cancelActiveParse();
+          return;
+        }
+        if (task?.id) {
+          const response = await pluginApiFetch(`/api/research/parse-status/tasks/${encodeURIComponent(task.id)}/cancel`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+          });
+          if (!response.ok) throw new Error("解析任务取消失败");
+        }
+      },
+      toast: safeToast,
+    });
+    return researchTools;
+  })().catch((error) => {
+    researchToolsPromise = null;
+    throw error;
+  });
+  return researchToolsPromise;
+}
+
+async function openResearchTools() {
+  try {
+    await ensureResearchPaper();
+    (await initializeResearchTools()).refresh().open();
+  } catch (error) {
+    await safeToast({ message: `研究工具打开失败：${error?.message || "资源不可用"}`, type: "error" });
+  }
+}
+
+async function restoreRecentPaper() {
+  const revision = paperRevision;
+  try {
+    const response = await pluginApiFetch("/api/research/recent");
+    const data = await response.json();
+    if (revision !== paperRevision || currentPaper.blocks.length || !response.ok || !data.ok || !data.paper?.blocks?.length) return false;
+    const parser = data.paper.parser && typeof data.paper.parser === "object" ? data.paper.parser : {};
+    loadPaper({
+      ...data.paper,
+      title: data.paper.metadata?.title || "最近阅读论文",
+      pageCount: Number(parser.pageCount || 0),
+      isPdf: parser.kind === "mineru",
+      modelVersion: parser.modelVersion || null,
+      cached: true,
+      restored: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function locateResearchBlock(blockId) {
+  const id = String(blockId || "");
+  if (!id) return;
+  selectedBlockId = id;
+  for (const [paneId, prefix] of [["original-pane", "orig"], ["trans-pane", "trans"]]) {
+    const pane = document.getElementById(paneId);
+    const target = document.getElementById(`${prefix}-${id}`);
+    if (!pane || !target) continue;
+    const paneRect = pane.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    pane.scrollTop = Math.max(0, pane.scrollTop + targetRect.top - paneRect.top - 52);
+    target.classList.add("locate-flash", "anchor-selected");
+    window.setTimeout(() => target.classList.remove("locate-flash"), 700);
+  }
+  document.querySelectorAll(".block.anchor-selected").forEach((element) => {
+    if (element.dataset.id !== id) element.classList.remove("anchor-selected");
+  });
+  researchTools?.refresh();
+}
+
+async function ensureResearchPaper() {
+  if (!currentPaper.blocks.length) return null;
+  if (!isPaperHash(currentPaper.paperHash)) currentPaper.paperHash = await hashPaperSource(currentPaper);
+  const payload = {
+    paperHash: currentPaper.paperHash,
+    metadata: { title: currentPaper.title },
+    parser: {
+      kind: typeof currentPaper.parser === "string" ? currentPaper.parser : (currentPaper.parser?.kind || (currentPaper.isPdf ? "mineru" : "text")),
+      modelVersion: currentPaper.modelVersion || currentPaper.parser?.modelVersion || null,
+      pageCount: Number(currentPaper.pageCount || currentPaper.parser?.pageCount || 0),
+      ocrUsed: currentPaper.ocrUsed === true || currentPaper.parser?.ocrUsed === true,
+      ocrFallback: currentPaper.ocrFallback === true || currentPaper.parser?.ocrFallback === true,
+    },
+    assets: currentPaper.resources || [],
+    blocks: currentPaper.blocks,
+    translations: currentPaper.translations || {},
+    translationGlossaryVersion: Number(currentPaper.translationGlossaryVersion || currentPaper.glossaryVersion || 0),
+    replaceTranslations: currentPaper.replaceTranslations === true,
+  };
+  const response = await pluginApiFetch("/api/research/paper", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) throw new Error(data.error || "论文工作区同步失败");
+  const remoteTranslations = data.paper?.translations && typeof data.paper.translations === "object" ? data.paper.translations : {};
+  const remoteBlockTranslations = Object.fromEntries((Array.isArray(data.paper?.blocks) ? data.paper.blocks : [])
+    .filter((block) => block?.id && typeof block.translatedText === "string" && block.translatedText.trim())
+    .map((block) => [block.id, block.translatedText.trim()]));
+  currentPaper.translations = { ...remoteBlockTranslations, ...remoteTranslations, ...currentPaper.translations };
+  currentPaper.translationGlossaryVersion = Number(data.paper?.translationGlossaryVersion || currentPaper.translationGlossaryVersion || 0);
+  currentPaper.replaceTranslations = false;
+  await refreshGlossaryState();
+  researchTools?.refresh();
+  return data.paper;
+}
+
+function scheduleResearchSync() {
+  window.clearTimeout(researchSyncTimer);
+  researchSyncTimer = window.setTimeout(() => {
+    void ensureResearchPaper().catch(() => {});
+  }, 450);
+}
+
+async function restorePaperProgress(revision = paperRevision) {
+  if (!isPaperHash(currentPaper.paperHash)) return;
+  try {
+    const response = await pluginApiFetch(`/api/research/progress?paperHash=${encodeURIComponent(currentPaper.paperHash)}`);
+    const data = await response.json();
+    if (revision !== paperRevision || !response.ok || !data.ok || !data.progress) return;
+    const progress = data.progress;
+    selectedBlockId = progress.blockId || selectedBlockId;
+    if (progress.blockId) {
+      window.setTimeout(() => {
+        if (revision === paperRevision) locateResearchBlock(progress.blockId);
+      }, 80);
+    }
+  } catch {}
+}
+
+async function refreshGlossaryState() {
+  if (!isPaperHash(currentPaper.paperHash)) return false;
+  try {
+    const response = await pluginApiFetch(`/api/research/glossary?paperHash=${encodeURIComponent(currentPaper.paperHash)}`);
+    const data = await response.json();
+    if (!response.ok || !data.ok) return false;
+    const nextVersion = Number(data.glossary?.version || 0);
+    const previousTranslationVersion = Number(currentPaper.translationGlossaryVersion || 0);
+    currentPaper.glossaryVersion = nextVersion;
+    currentPaper.glossaryTerms = data.glossary?.terms && typeof data.glossary.terms === "object" ? data.glossary.terms : {};
+    if (nextVersion !== previousTranslationVersion) {
+      currentPaper.translations = {};
+      currentPaper.translationGlossaryVersion = nextVersion;
+      currentPaper.replaceTranslations = true;
+      renderBlocks();
+      scheduleResearchSync();
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function scheduleProgressSync() {
+  if (!isPaperHash(currentPaper.paperHash) || !currentPaper.blocks.length) return;
+  window.clearTimeout(progressSyncTimer);
+  progressSyncTimer = window.setTimeout(() => {
+    void syncReadingProgress();
+  }, 650);
+}
+
+async function syncReadingProgress() {
+  if (!isPaperHash(currentPaper.paperHash)) return;
+  try {
+    await pluginApiFetch("/api/research/progress", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(currentReadingProgress()),
+    });
+  } catch {}
+}
+
+async function getCachedBlockTranslation(block, sourceText, allowCache = true) {
+  if (!allowCache || !isPaperHash(currentPaper.paperHash) || !block?.id) return "";
+  try {
+    const query = new URLSearchParams({
+      paperHash: currentPaper.paperHash,
+      blockId: block.id,
+      glossaryVersion: String(currentPaper.glossaryVersion || 0),
+    });
+    const response = await pluginApiFetch(`/api/research/translation-cache?${query}`);
+    const data = await response.json();
+    const cached = data?.translation;
+    if (response.ok && data.ok && data.hit && cached?.source === sourceText && typeof cached.translation === "string") {
+      return cached.translation.trim();
+    }
+  } catch {}
+  return "";
+}
+
+async function cacheBlockTranslation(block, source, translation) {
+  if (!isPaperHash(currentPaper.paperHash) || !block?.id || !translation) return;
+  try {
+    await pluginApiFetch("/api/research/translation-cache", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        paperHash: currentPaper.paperHash,
+        blockId: block.id,
+        glossaryVersion: currentPaper.glossaryVersion || 0,
+        source,
+        translation,
+      }),
+    });
+  } catch {}
+}
+
+async function checkParseCache(paperHash) {
+  if (!isPaperHash(paperHash)) return null;
+  try {
+    const response = await pluginApiFetch(`/api/research/parse-cache/check?paperHash=${encodeURIComponent(paperHash)}`);
+    const data = await response.json();
+    return response.ok && data.ok && data.hit && data.paper ? data.paper : null;
+  } catch {
+    return null;
+  }
+}
+
+async function createParseTask(paperHash, fileName) {
+  if (!isPaperHash(paperHash)) return null;
+  try {
+    const response = await pluginApiFetch("/api/research/parse-status/tasks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paperHash, state: "queued", stage: "queued", progress: 0, fileName }),
+    });
+    const data = await response.json();
+    return response.ok && data.ok ? data.task : null;
+  } catch {
+    return null;
+  }
+}
+
+async function updateParseTask(task, patch) {
+  if (!task?.id) return;
+  try {
+    const response = await pluginApiFetch(`/api/research/parse-status/tasks/${encodeURIComponent(task.id)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    if (!response.ok) return;
+    researchTools?.refresh();
+  } catch {}
+}
+
+function commitBlockTranslation(blockId, translation) {
+  const value = String(translation || "").trim();
+  if (!value) return;
+  currentPaper.translations[blockId] = value;
+  const target = document.getElementById(`trans-text-${blockId}`);
+  if (target) {
+    target.innerHTML = formatMath(escapeHtml(value));
+    target.classList.remove("trans-empty-tip");
+  }
+  setBlockTranslationAction(blockId, "重新翻译");
+}
+
+async function cachedTranslationsForBlocks(blocks, allowCache = true) {
+  if (!allowCache || !blocks.length) return new Map();
+  await refreshGlossaryState();
+  const pairs = await Promise.all(blocks.map(async (block) => [block.id, await getCachedBlockTranslation(block, translationTextForBlock(block), true)]));
+  return new Map(pairs.filter(([, value]) => value));
 }
 
 function paneContentTop(pane) {
@@ -1125,6 +1505,11 @@ function cancelActiveParse() {
   parseJobId += 1;
   activeParseController?.abort();
   activeParseController = null;
+  const task = activeParseTask;
+  activeParseTask = null;
+  return task?.id
+    ? updateParseTask(task, { state: "cancelled", stage: "cancelled", error: "用户取消解析" })
+    : Promise.resolve();
 }
 
 function loadSamplePaper() {
@@ -1142,24 +1527,56 @@ async function parsePdfFile(file) {
     await safeToast({ message: "PDF 不得超过 50 MB", type: "error" });
     return;
   }
-  if (!mineruConfigured) {
-    pendingPdfFile = file;
-    openMineruSettings();
-    await safeToast({ message: "请先配置 MinerU API Token，保存后将自动继续解析", type: "error" });
-    return;
-  }
 
-  activeParseController?.abort();
+  cancelActiveParse();
   const controller = new AbortController();
   activeParseController = controller;
   const jobId = ++parseJobId;
   currentPdfFile = file;
   updateMineruUI();
   const paperBadge = document.getElementById("paper-badge");
-  paperBadge.textContent = `MinerU 正在上传并解析: ${file.name}...`;
+  paperBadge.textContent = `正在检查解析缓存: ${file.name}...`;
   paperBadge.title = `文件：${file.name}\nUI ${UI_VERSION} / API ${mineruApiVersion || "未知"}`;
+  let paperHash = "";
+  let task = null;
 
   try {
+    paperHash = await hashFile(file);
+    if (jobId !== parseJobId || controller.signal.aborted) return;
+
+    const cached = await checkParseCache(paperHash);
+    if (jobId !== parseJobId || controller.signal.aborted) return;
+    if (cached) {
+      const generation = resetPdfPreview();
+      loadPaper({
+        ...cached,
+        title: file.name,
+        paperHash,
+        blocks: Array.isArray(cached.blocks) ? cached.blocks : [],
+        pageCount: Number(cached.parser?.pageCount || cached.pageCount || 0),
+        isPdf: true,
+        parser: cached.parser || { kind: "mineru" },
+        modelVersion: cached.parser?.modelVersion || mineruSettings.modelVersion,
+        cached: true,
+      });
+      void initializePdfPreview(file, generation);
+      paperBadge.title = `文件指纹：${paperHash}`;
+      await safeToast({ message: `已命中解析缓存：${cached.blocks.length} 个结构块`, type: "success" });
+      return;
+    }
+
+    if (!mineruConfigured) {
+      pendingPdfFile = file;
+      openMineruSettings();
+      await safeToast({ message: "请先配置 MinerU API Token，保存后将自动继续解析", type: "error" });
+      return;
+    }
+
+    task = await createParseTask(paperHash, file.name);
+    activeParseTask = task;
+    await updateParseTask(task, { state: "running", stage: "upload-and-parse", progress: 10 });
+    paperBadge.textContent = `MinerU 正在上传并解析: ${file.name}...`;
+
     const fileName = encodeURIComponent(file.name || "paper.pdf");
     const response = await pluginApiFetch(`/api/parse-pdf?parser=mineru&fileName=${fileName}`, {
       method: "POST",
@@ -1168,20 +1585,31 @@ async function parsePdfFile(file) {
       signal: controller.signal,
     });
     const data = await response.json();
-    if (jobId !== parseJobId) return;
+    if (jobId !== parseJobId || controller.signal.aborted) return;
     if (!response.ok || !data.ok || Number(data.pageCount) <= 0) throw new Error(data.error || "MinerU 未返回有效页面");
+    await updateParseTask(task, { state: "running", stage: "rendering", progress: 88 });
     const generation = resetPdfPreview();
     loadPaper({
       title: file.name,
+      paperHash: data.paperHash || paperHash,
       blocks: Array.isArray(data.blocks) ? data.blocks : [],
       pageCount: Number(data.pageCount),
       isPdf: true,
-      parser: "mineru",
+      parser: {
+        kind: "mineru",
+        modelVersion: data.modelVersion || mineruSettings.modelVersion,
+        pageCount: Number(data.pageCount),
+        ocrUsed: data.ocrUsed === true,
+        ocrFallback: data.ocrFallback === true,
+      },
       modelVersion: data.modelVersion || mineruSettings.modelVersion,
+      ocrUsed: data.ocrUsed === true,
+      ocrFallback: data.ocrFallback === true,
       truncated: Boolean(data.truncated),
     });
     void initializePdfPreview(file, generation);
-    paperBadge.title = "";
+    await updateParseTask(task, { state: "succeeded", stage: "complete", progress: 100 });
+    paperBadge.title = `文件指纹：${data.paperHash || paperHash}`;
     const versionMismatch = data.apiVersion && data.apiVersion !== UI_VERSION;
     const routeDetail = data.transport === "legacy-base64" ? "；已兼容旧版卡片传输" : "";
     const ocrDetail = data.ocrFallback ? "；普通解析失败后已由 OCR 重试完成" : data.ocrUsed ? "；OCR 模式" : "";
@@ -1194,6 +1622,7 @@ async function parsePdfFile(file) {
   } catch (error) {
     if (jobId !== parseJobId || controller.signal.aborted || error?.name === "AbortError") return;
     const message = String(error?.message || "接口连接异常").slice(0, 240);
+    await updateParseTask(task, { state: "failed", stage: "failed", progress: 0, error: message });
     paperBadge.textContent = `MinerU 解析失败：${message}`;
     paperBadge.title = `文件：${file.name}\nUI ${UI_VERSION} / API ${mineruApiVersion || "未知"}`;
     await safeToast({ message: `MinerU 解析失败：${message}`, type: "error" });
@@ -1203,6 +1632,7 @@ async function parsePdfFile(file) {
     }
   } finally {
     if (activeParseController === controller) activeParseController = null;
+    if (activeParseTask === task) activeParseTask = null;
   }
 }
 
@@ -1255,34 +1685,68 @@ function translatableBlocks() {
 
 function loadPaper(paper) {
   paperRevision += 1;
+  const revision = paperRevision;
   fullTranslationRunId += 1;
   fullTranslationBusy = false;
   blockTranslationRunIds.clear();
   sanitizedTableCache.clear();
+  selectedBlockId = null;
   if (!paper?.isPdf) {
     resetPdfPreview();
     currentPdfFile = null;
   }
-  currentPaper = { ...paper, blocks: Array.isArray(paper?.blocks) ? paper.blocks : [], translations: {} };
+  const blocks = Array.isArray(paper?.blocks) ? paper.blocks : [];
+  const persistedTranslations = paper?.translations && typeof paper.translations === "object" ? paper.translations : {};
+  const blockTranslations = Object.fromEntries(blocks.filter((block) => typeof block?.translatedText === "string" && block.translatedText.trim()).map((block) => [block.id, block.translatedText.trim()]));
+  currentPaper = {
+    ...paper,
+    title: String(paper?.title || "未命名论文"),
+    blocks,
+    translations: { ...blockTranslations, ...persistedTranslations },
+    paperHash: isPaperHash(paper?.paperHash) ? paper.paperHash : null,
+    glossaryVersion: Number(paper?.glossaryVersion || 0),
+    translationGlossaryVersion: Number(paper?.translationGlossaryVersion || paper?.glossaryVersion || 0),
+    glossaryTerms: paper?.glossaryTerms && typeof paper.glossaryTerms === "object" ? paper.glossaryTerms : {},
+    replaceTranslations: false,
+  };
   document.getElementById("empty-view").style.display = "none";
   document.getElementById("reader-container").style.display = "flex";
   const translateButton = document.getElementById("btn-translate-all");
+  const researchButton = document.getElementById("btn-research-tools");
   translateButton.style.display = translatableBlocks().length ? "inline-flex" : "none";
   translateButton.disabled = false;
   translateButton.textContent = "⚡ 翻译全文";
+  researchButton.style.display = currentPaper.blocks.length ? "inline-flex" : "none";
   document.getElementById("btn-locate-sync").style.display = currentPaper.blocks.length ? "inline-flex" : "none";
-  document.getElementById("paper-badge").textContent = paper.title;
+  document.getElementById("paper-badge").textContent = currentPaper.title;
   const visualCount = currentPaper.blocks.filter((block) => block.assetRef || block.crop || block.tableHtml || ["image", "table", "chart", "equation"].includes(block.type)).length;
+  const parserKind = typeof paper?.parser === "string" ? paper.parser : paper?.parser?.kind;
   const parserLabel = paper.isPdf
-    ? `MinerU ${paper.modelVersion || mineruSettings.modelVersion || ""}`.trim()
+    ? `MinerU ${paper.modelVersion || paper.parser?.modelVersion || mineruSettings.modelVersion || ""}`.trim()
     : "文本";
   document.getElementById("orig-blocks-count").textContent = paper.isPdf
-    ? `${paper.pageCount || 0} 页 · ${currentPaper.blocks.length} 块 · ${visualCount} 视觉 · ${parserLabel}`
+    ? `${paper.pageCount || paper.parser?.pageCount || 0} 页 · ${currentPaper.blocks.length} 块 · ${visualCount} 视觉 · ${parserLabel}${paper.cached ? " · 缓存" : ""}`
     : `${currentPaper.blocks.length} 段落`;
+  currentPaper.parser = typeof paper?.parser === "object" ? { ...paper.parser, kind: parserKind || "text" } : (paper?.parser || "text");
   updateMineruUI();
   renderBlocks();
   document.getElementById("original-pane").scrollTop = 0;
   document.getElementById("trans-pane").scrollTop = 0;
+  void (async () => {
+    if (!isPaperHash(currentPaper.paperHash)) {
+      try { currentPaper.paperHash = await hashPaperSource(currentPaper); } catch {}
+    }
+    if (revision !== paperRevision) return;
+    await ensureResearchPaper().catch(() => {});
+    await refreshGlossaryState();
+    await restorePaperProgress(revision);
+    const cacheable = translatableBlocks().filter((block) => !currentPaper.translations[block.id]);
+    const cached = await cachedTranslationsForBlocks(cacheable, true);
+    if (revision !== paperRevision) return;
+    cached.forEach((translation, blockId) => { currentPaper.translations[blockId] = translation; });
+    if (cached.size) renderBlocks();
+    researchTools?.refresh();
+  })();
 }
 
 function blockGroupsByPage() {
@@ -1291,9 +1755,9 @@ function blockGroupsByPage() {
     for (let page = 1; page <= Number(currentPaper.pageCount || 0); page += 1) pages.set(page, []);
   }
   currentPaper.blocks.forEach((block, index) => {
-    const page = Number.isFinite(Number(block.page)) ? Number(block.page) : 1;
+    const page = Number(block.page) > 0 ? Number(block.page) : 1;
     if (!pages.has(page)) pages.set(page, []);
-    pages.get(page).push({ ...block, _order: index });
+    pages.get(page).push({ ...block, page, _order: index });
   });
   return [...pages.entries()].sort((a, b) => a[0] - b[0]);
 }
@@ -1411,8 +1875,11 @@ function renderStructuredVisual(block, translated) {
 
 function renderBlock(block, translated) {
   const id = escapeAttr(block.id);
+  const rawId = String(block.id || "");
+  const anchor = escapeAttr(citationAnchorForBlock(block));
+  const page = Number(block.page) > 0 ? Number(block.page) : 1;
   const translationSource = translationTextForBlock(block);
-  const existingTranslation = currentPaper.translations?.[block.id];
+  const existingTranslation = currentPaper.translations?.[rawId];
   const visual = renderStructuredVisual(block, translated);
   let text = "";
   if (translationSource) {
@@ -1423,13 +1890,15 @@ function renderBlock(block, translated) {
       : `<span class="block-text">${formatMath(escapeHtml(translationSource))}</span>`;
   }
   const action = translated || existingTranslation ? "重新翻译" : "译";
-  const actionButton = translationSource
-    ? `<div class="block-actions"><button class="btn-block-action btn-trans-single" data-id="${id}">${action}</button></div>`
+  const translateAction = translationSource
+    ? `<button class="btn-block-action btn-trans-single" data-id="${id}" title="翻译此段">${action}</button>`
     : "";
+  const citationAction = `<button class="btn-block-action btn-copy-citation" data-id="${id}" title="复制 Page ${page} / block ${escapeAttr(rawId)} 引用">引用</button>`;
+  const actionButton = `<div class="block-actions">${citationAction}${translateAction}</div>`;
   const tag = block.type !== "paragraph"
     ? `<span class="tag-pill">${translated && translationSource ? "对照 · " : ""}${escapeHtml(blockTypeLabel(block))}</span>`
     : "";
-  return `<div id="${translated ? "trans" : "orig"}-${id}" class="block ${escapeAttr(block.type || "paragraph")}${visual ? " structured-block" : ""}" data-id="${id}">
+  return `<div id="${translated ? "trans" : "orig"}-${id}" class="block ${escapeAttr(block.type || "paragraph")}${visual ? " structured-block" : ""}" data-id="${id}" data-citation-anchor="${anchor}" data-page="${page}">
     ${actionButton}
     ${tag}
     ${visual}
@@ -1439,20 +1908,23 @@ function renderBlock(block, translated) {
 
 function renderPdfVisualPreview(page, translated) {
   if (!currentPaper.isPdf) return "";
+  const needsLocalPdf = currentPaper.restored === true && !currentPdfFile;
   const noText = translated && !blocksForPage(page).some((block) => translationTextForBlock(block))
     ? `<div class="pdf-no-text">本页没有可翻译文字；原页和结构化视觉内容仍保留。</div>`
     : "";
-  return `<div class="pdf-visual-preview${translated ? " pdf-visual-translation" : ""}" data-pdf-page="${page}" data-state="waiting">
+  const state = needsLocalPdf ? "unavailable" : "waiting";
+  const status = needsLocalPdf ? "已恢复解析结构；重新选择同一 PDF 可恢复原页预览" : "正在准备原页预览…";
+  return `<div class="pdf-visual-preview${translated ? " pdf-visual-translation" : ""}" data-pdf-page="${page}" data-state="${state}">
     <div class="pdf-visual-head">
       <span>${translated ? "原页视觉参考" : "原始 PDF 页面"} · 不参与正文排栏</span>
-      <button type="button" class="pdf-visual-toggle" aria-expanded="false">放大</button>
+      <button type="button" class="pdf-visual-toggle" aria-expanded="false"${needsLocalPdf ? " disabled" : ""}>放大</button>
     </div>
-    <div class="pdf-visual-canvas-wrap"><div class="pdf-visual-status">正在准备原页预览…</div></div>
+    <div class="pdf-visual-canvas-wrap"><div class="pdf-visual-status">${status}</div></div>
   </div>${noText}`;
 }
 
 function blocksForPage(page) {
-  return currentPaper.blocks.filter((block) => Number(block.page || 1) === Number(page));
+  return currentPaper.blocks.filter((block) => (Number(block.page) > 0 ? Number(block.page) : 1) === Number(page));
 }
 
 function renderPage(page, blocks, translated) {
@@ -1481,6 +1953,17 @@ function renderBlocks() {
       const id = el.getAttribute("data-id");
       translateSingleBlock(id);
     });
+  });
+
+  document.querySelectorAll(".btn-copy-citation").forEach((el) => {
+    el.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void copyBlockCitation(el.getAttribute("data-id"));
+    });
+  });
+
+  document.querySelectorAll(".block[data-id]").forEach((el) => {
+    el.addEventListener("click", () => { selectedBlockId = el.getAttribute("data-id"); });
   });
 
   origContainer.querySelectorAll(".block").forEach(el => {
@@ -1524,6 +2007,24 @@ function setTranslationPlaceholder(blockId, message, retryable = false) {
   }
 }
 
+function citationTextForBlock(block, selected = "") {
+  const page = Number(block?.page) > 0 ? Number(block.page) : 1;
+  const id = String(block?.id || "unknown");
+  const source = String(selected || block?.text || "").trim();
+  return `【论文引用】\n论文：${currentPaper.title}\n来源：Page ${page} / block ${id}\n锚点：#${citationAnchorForBlock(block)}\n原文：${source}`;
+}
+
+async function copyBlockCitation(blockId) {
+  const block = currentPaper.blocks.find((item) => item.id === blockId);
+  if (!block) return;
+  selectedBlockId = block.id;
+  if (await copyTextToClipboard(citationTextForBlock(block))) {
+    await safeToast({ message: `已复制 Page ${Number(block.page || 1)} / block ${block.id} 引用`, type: "success" });
+  } else {
+    await safeToast({ message: "浏览器未允许复制，请手动复制引用", type: "error" });
+  }
+}
+
 async function translateSingleBlock(blockId) {
   if (fullTranslationBusy) return;
   const block = currentPaper.blocks.find((item) => item.id === blockId);
@@ -1532,11 +2033,20 @@ async function translateSingleBlock(blockId) {
   const revision = paperRevision;
   const runId = (blockTranslationRunIds.get(blockId) || 0) + 1;
   blockTranslationRunIds.set(blockId, runId);
+  const hadTranslation = Boolean(currentPaper.translations?.[blockId]);
   alignTranslationBlock(blockId);
-  setTranslationPlaceholder(blockId, "正在翻译中...");
+  setTranslationPlaceholder(blockId, "正在检查翻译缓存...");
   window.requestAnimationFrame(() => alignTranslationBlock(blockId));
 
   try {
+    const cached = await getCachedBlockTranslation(block, sourceText, hadTranslation);
+    if (revision !== paperRevision || blockTranslationRunIds.get(blockId) !== runId) return;
+    if (cached && !hadTranslation) {
+      commitBlockTranslation(blockId, cached);
+      window.requestAnimationFrame(() => alignTranslationBlock(blockId));
+      return;
+    }
+    setTranslationPlaceholder(blockId, "正在翻译中...");
     const res = await pluginApiFetch("/api/translate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1544,7 +2054,8 @@ async function translateSingleBlock(blockId) {
         text: sourceText,
         agentId: currentAgent.id,
         thinkingLevel: currentThinkingLevel,
-      })
+        glossaryTerms: currentPaper.glossaryTerms || {},
+      }),
     });
     const data = await res.json();
     if (revision !== paperRevision || blockTranslationRunIds.get(blockId) !== runId) return;
@@ -1553,13 +2064,9 @@ async function translateSingleBlock(blockId) {
       ? data.translations[0].trim()
       : "";
     if (!data.ok || !transText) throw new Error(data.error || "翻译模型未返回有效结果");
-    currentPaper.translations[blockId] = transText;
-    const target = document.getElementById(`trans-text-${blockId}`);
-    if (target) {
-      target.innerHTML = formatMath(escapeHtml(transText));
-      target.classList.remove("trans-empty-tip");
-    }
-    setBlockTranslationAction(blockId, "重新翻译");
+    commitBlockTranslation(blockId, transText);
+    await cacheBlockTranslation(block, sourceText, transText);
+    scheduleResearchSync();
     window.requestAnimationFrame(() => alignTranslationBlock(blockId));
   } catch (error) {
     if (revision !== paperRevision || blockTranslationRunIds.get(blockId) !== runId) return;
@@ -1574,8 +2081,11 @@ async function startFullTranslation() {
   if (!blocks.length) return;
   const revision = paperRevision;
   const runId = ++fullTranslationRunId;
-  const retranslateAll = blocks.every((block) => Boolean(currentPaper.translations[block.id]));
-  if (retranslateAll) blocks.forEach((block) => { delete currentPaper.translations[block.id]; });
+  const force = blocks.every((block) => Boolean(currentPaper.translations[block.id]));
+  if (force) {
+    blocks.forEach((block) => { delete currentPaper.translations[block.id]; });
+    currentPaper.replaceTranslations = true;
+  }
   const pending = blocks.filter((block) => !currentPaper.translations[block.id]);
   if (!pending.length) return;
 
@@ -1588,9 +2098,12 @@ async function startFullTranslation() {
   let failedCount = 0;
   const batchSize = 2;
   try {
-    for (let index = 0; index < pending.length; index += batchSize) {
+    const cache = force ? new Map() : await cachedTranslationsForBlocks(pending, true);
+    cache.forEach((translation, blockId) => commitBlockTranslation(blockId, translation));
+    const uncached = pending.filter((block) => !currentPaper.translations[block.id]);
+    for (let index = 0; index < uncached.length; index += batchSize) {
       if (revision !== paperRevision || runId !== fullTranslationRunId) return;
-      const slice = pending.slice(index, index + batchSize);
+      const slice = uncached.slice(index, index + batchSize);
       const texts = slice.map((block) => translationTextForBlock(block));
       try {
         const res = await pluginApiFetch("/api/translate", {
@@ -1600,7 +2113,8 @@ async function startFullTranslation() {
             texts,
             agentId: currentAgent.id,
             thinkingLevel: currentThinkingLevel,
-          })
+            glossaryTerms: currentPaper.glossaryTerms || {},
+          }),
         });
         const data = await res.json();
         if (revision !== paperRevision || runId !== fullTranslationRunId) return;
@@ -1610,16 +2124,13 @@ async function startFullTranslation() {
         }
         const translations = data.translations.map((value) => typeof value === "string" ? value.trim() : "");
         if (translations.some((value) => !value)) throw new Error("翻译模型返回空结果");
-        slice.forEach((block, offset) => {
+        for (let offset = 0; offset < slice.length; offset += 1) {
+          const block = slice[offset];
           const transText = translations[offset];
-          currentPaper.translations[block.id] = transText;
-          const target = document.getElementById(`trans-text-${block.id}`);
-          if (target) {
-            target.innerHTML = formatMath(escapeHtml(transText));
-            target.classList.remove("trans-empty-tip");
-          }
-          setBlockTranslationAction(block.id, "重新翻译");
-        });
+          commitBlockTranslation(block.id, transText);
+          await cacheBlockTranslation(block, texts[offset], transText);
+        }
+        scheduleResearchSync();
       } catch (error) {
         if (revision !== paperRevision || runId !== fullTranslationRunId) return;
         failedCount += slice.length;
@@ -1631,6 +2142,7 @@ async function startFullTranslation() {
       fullTranslationBusy = false;
       button.disabled = false;
       button.textContent = failedCount ? `⚡ 重试未完成段落 (${failedCount})` : "⚡ 重新翻译全文";
+      renderBlocks();
     }
   }
 }
@@ -1653,6 +2165,7 @@ function handleTextSelection() {
   }
   selectedText = text;
   selectedContext = node.textContent.trim();
+  selectedBlockId = node.getAttribute("data-id") || selectedBlockId;
 
   const range = selection.getRangeAt(0);
   const rect = range.getBoundingClientRect();
@@ -1669,9 +2182,11 @@ async function askAgentQuestion(questionType = "default") {
   const drawer = document.getElementById("answer-drawer");
   const drawerQuote = document.getElementById("drawer-quote");
   const drawerContent = document.getElementById("drawer-content");
+  const selectedBlock = currentPaper.blocks.find((block) => block.id === selectedBlockId) || null;
+  const citation = selectedBlock ? `Page ${Number(selectedBlock.page || 1)} / block ${selectedBlock.id}` : "";
 
   drawer.classList.add("open");
-  drawerQuote.textContent = `“${selectedText}”`;
+  drawerQuote.textContent = citation ? `“${selectedText}” · ${citation}` : `“${selectedText}”`;
   drawerContent.innerHTML = `<span class="trans-loading">${escapeHtml(currentAgent.name)}（${escapeHtml(currentAgent.model || "")}）正在深度推导与解析中...</span>`;
 
   try {
@@ -1681,16 +2196,25 @@ async function askAgentQuestion(questionType = "default") {
       body: JSON.stringify({
         agentId: currentAgent.id,
         quote: selectedText,
-        context: selectedContext,
+        context: `${selectedContext}${citation ? `\n来源：${citation}` : ""}`,
         questionType,
         paperTitle: currentPaper.title,
+        paperHash: currentPaper.paperHash,
+        blockId: selectedBlock?.id || null,
+        page: selectedBlock?.page || null,
         thinkingLevel: currentThinkingLevel,
+        glossaryTerms: currentPaper.glossaryTerms || {},
       })
     });
     const data = await res.json();
     applyEffectiveThinkingLevel(data);
     if (data.ok) {
+      const verifiedCitation = typeof data.citation === "string" ? data.citation : "";
+      drawerQuote.textContent = verifiedCitation ? `“${selectedText}” · ${verifiedCitation}` : `“${selectedText}”`;
       drawerContent.innerHTML = formatMarkdown(data.answer);
+      if (verifiedCitation && !String(data.answer || "").includes(verifiedCitation)) {
+        drawerContent.insertAdjacentText("beforeend", `\n\n${verifiedCitation}`);
+      }
     } else {
       drawerContent.textContent = `解析遇到问题: ${data.error || "未知异常"}`;
     }
@@ -1701,7 +2225,9 @@ async function askAgentQuestion(questionType = "default") {
 
 async function sendQuoteToSession() {
   document.getElementById("selection-toolbar").style.display = "none";
-  const textToCopy = `【论文划选研讨】\n论文：${currentPaper.title}\n选中文本：${selectedText}\n上下文：${selectedContext}`;
+  const selectedBlock = currentPaper.blocks.find((block) => block.id === selectedBlockId) || null;
+  const citation = selectedBlock ? `Page ${Number(selectedBlock.page || 1)} / block ${selectedBlock.id}` : "";
+  const textToCopy = `【论文划选研讨】\n论文：${currentPaper.title}\n${citation ? `来源：${citation}\n` : ""}选中文本：${selectedText}\n上下文：${selectedContext}`;
   let copied = false;
   copied = await copyTextToClipboard(textToCopy);
 
@@ -1712,8 +2238,11 @@ async function sendQuoteToSession() {
       body: JSON.stringify({
         agentId: currentAgent.id,
         quote: selectedText,
-        context: selectedContext,
+        context: `${selectedContext}${citation ? `\n来源：${citation}` : ""}`,
         paperTitle: currentPaper.title,
+        paperHash: currentPaper.paperHash,
+        blockId: selectedBlock?.id || null,
+        page: selectedBlock?.page || null,
         thinkingLevel: currentThinkingLevel,
       })
     });
@@ -1728,8 +2257,10 @@ async function sendQuoteToSession() {
 
 async function copyQuoteText() {
   document.getElementById("selection-toolbar").style.display = "none";
-  if (await copyTextToClipboard(selectedText)) {
-    await safeToast({ message: "已复制选中内容", type: "success" });
+  const selectedBlock = currentPaper.blocks.find((block) => block.id === selectedBlockId) || null;
+  const value = selectedBlock ? citationTextForBlock(selectedBlock, selectedText) : selectedText;
+  if (await copyTextToClipboard(value)) {
+    await safeToast({ message: selectedBlock ? "已复制带来源引用" : "已复制选中内容", type: "success" });
   } else {
     await safeToast({ message: "浏览器未允许复制，请手动复制选中文本", type: "error" });
   }
