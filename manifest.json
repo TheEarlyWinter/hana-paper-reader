@@ -1,0 +1,109 @@
+{
+  "manifestVersion": 1,
+  "id": "hana-paper-reader",
+  "name": "Hana Paper Reader",
+  "version": "0.4.2",
+  "description": "基于 MinerU 精准解析的学术 PDF 双语精读工作台，支持二进制上传、旧卡片升级兼容和 OCR 自动回退。",
+  "minAppVersion": "0.358.0",
+  "trust": "full-access",
+  "capabilities": [
+    "session",
+    "agent",
+    "model.sample",
+    "network.fetch"
+  ],
+  "network": {
+    "allowedHosts": [
+      "mineru.net",
+      "*.mineru.net",
+      "*.openxlab.org.cn",
+      "mineru.oss-cn-shanghai.aliyuncs.com"
+    ],
+    "methods": ["GET", "POST", "PUT"],
+    "defaultTimeoutMs": 60000,
+    "maxResponseBytes": 262144000
+  },
+  "contributes": {
+    "configuration": {
+      "title": "MinerU 精准解析设置",
+      "properties": {
+        "mineruApiToken": {
+          "type": "string",
+          "default": "",
+          "title": "MinerU API Token",
+          "description": "仅在服务端用于 MinerU 精准解析请求。可在阅读器右上角的 MinerU 设置中填写，值不会回显。",
+          "scope": "global",
+          "sensitive": true,
+          "ui": { "control": "password" }
+        },
+        "mineruApiBaseUrl": {
+          "type": "string",
+          "default": "https://mineru.net/api/v4",
+          "title": "MinerU API 地址",
+          "description": "默认官方精准解析 API 地址；仅允许 mineru.net 官方 HTTPS 地址。",
+          "scope": "global"
+        },
+        "mineruModelVersion": {
+          "type": "string",
+          "enum": ["vlm", "pipeline"],
+          "default": "vlm",
+          "title": "MinerU 解析模型",
+          "scope": "global"
+        },
+        "mineruLanguage": {
+          "type": "string",
+          "enum": ["ch", "en", "japan", "latin"],
+          "default": "ch",
+          "title": "文档语言包",
+          "scope": "global"
+        },
+        "mineruEnableFormula": {
+          "type": "boolean",
+          "default": true,
+          "title": "识别公式",
+          "scope": "global"
+        },
+        "mineruEnableTable": {
+          "type": "boolean",
+          "default": true,
+          "title": "识别表格",
+          "scope": "global"
+        },
+        "mineruOcr": {
+          "type": "boolean",
+          "default": false,
+          "title": "启用 OCR",
+          "scope": "global"
+        },
+        "mineruTimeoutSeconds": {
+          "type": "integer",
+          "default": 900,
+          "title": "解析超时（秒）",
+          "scope": "global"
+        },
+        "mineruPollIntervalSeconds": {
+          "type": "integer",
+          "default": 5,
+          "title": "任务轮询间隔（秒）",
+          "scope": "global"
+        }
+      }
+    },
+    "cards": [
+      {
+        "id": "reader",
+        "type": "webview",
+        "title": "Hana Paper Reader",
+        "route": "/card",
+        "realization": "page",
+        "icon": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"><path d=\"M4 19.5A2.5 2.5 0 0 1 6.5 17H20\"/><path d=\"M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z\"/><path d=\"M8 7h8M8 11h6\"/></svg>",
+        "cardForm": "framed",
+        "titlebar": "solid",
+        "functionPanel": {
+          "id": "paper-reader-panel",
+          "label": "Paper Reader"
+        }
+      }
+    ]
+  }
+}
