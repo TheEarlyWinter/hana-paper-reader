@@ -331,6 +331,7 @@ node --test @tests
 
 - Hana Paper Reader 依据 [MIT License](LICENSE) 发布。
 - `assets/pdfjs.mjs` 来自 Mozilla PDF.js 5.6.205，依据 Apache License 2.0 分发。完整许可证见 [licenses/PDFJS-APACHE-2.0.txt](licenses/PDFJS-APACHE-2.0.txt)，归属说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- 感谢 PaperQuay 在论文精读产品设计与单篇阅读流程方面提供的思路和启发。
 
 ## 设计原则
 
