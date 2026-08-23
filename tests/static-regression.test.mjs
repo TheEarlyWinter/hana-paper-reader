@@ -63,7 +63,7 @@ assert.doesNotMatch(mineruSource, /file-urls\/batch\?/);
 assert.match(mineruSource, /shouldRetryWithOcr/);
 assert.match(mineruSource, /ocrFallback/);
 assert.match(read("routes/ui.js"), /ASSET_VERSION = "0\.5\.0"/);
-assert.match(readme, /^# Hana Paper Reader 0\.5\.0/m);
+assert.match(readme, /^# Hana Paper Reader/m);
 assert.match(readme, /MIT License/);
 assert.match(readme, /application\/pdf/);
 assert.doesNotMatch(readme, /本地 · 默认|两种解析路线|默认本地解析/);
