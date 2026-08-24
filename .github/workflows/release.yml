@@ -1,0 +1,70 @@
+name: Release QA and Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub Release after QA
+        required: true
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Read and validate version
+        id: version
+        shell: pwsh
+        run: |
+          $manifest = Get-Content -LiteralPath manifest.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          $version = [string]$manifest.version
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match manifest version v$version."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Syntax, tests, ZIP, reverse unpack, retest, scan, SHA-256
+        shell: pwsh
+        run: ./scripts/build-release.ps1 -Version "${{ steps.version.outputs.version }}" -OutputDir ./dist
+
+      - name: Upload release QA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hana-paper-reader-${{ steps.version.outputs.version }}
+          if-no-files-found: error
+          path: |
+            dist/hana-paper-reader-${{ steps.version.outputs.version }}.zip
+            dist/hana-paper-reader-${{ steps.version.outputs.version }}.sha256
+            dist/hana-paper-reader-${{ steps.version.outputs.version }}-QA.md
+            RELEASE_NOTES_${{ steps.version.outputs.version }}.md
+
+      - name: Publish GitHub Release from UTF-8 notes file
+        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "v$version" }
+          gh release create $tag `
+            --verify-tag `
+            --title "Hana Paper Reader $version" `
+            --notes-file "RELEASE_NOTES_$version.md" `
+            "dist/hana-paper-reader-$version.zip" `
+            "dist/hana-paper-reader-$version.sha256" `
+            "dist/hana-paper-reader-$version-QA.md"

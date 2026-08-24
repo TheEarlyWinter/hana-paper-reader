@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "description": "Hana Paper Reader fixed synthetic PDF regression fixtures; no private or production data.",
+  "samples": [
+    {
+      "id": "english-two-column",
+      "file": "english-two-column.pdf",
+      "kind": "english-two-column",
+      "sha256": "2f67f9203be045afd7f32713d2b0af162c759d22903a52cd9129cf6294418933",
+      "expectedText": "GREEN LIGHT PHOTOTHERMAL TRANSITION",
+      "requiresOcr": false
+    },
+    {
+      "id": "chinese-paper",
+      "file": "chinese-paper.pdf",
+      "kind": "chinese",
+      "sha256": "1ec284b908007506c3d3faafe7e94f449fe0b3430b445d25a442054afaba7d58",
+      "expectedText": "绿色光热相变",
+      "requiresOcr": false
+    },
+    {
+      "id": "scanned-paper",
+      "file": "scanned-paper.pdf",
+      "kind": "scanned-image-only",
+      "sha256": "529b7fe74da160c96048c1b8c5be86e5be99fab7281195f773ecff0727a43934",
+      "expectedText": "PHOTOTHERMAL TRANSITION UNDER GREEN LIGHT",
+      "requiresOcr": true
+    },
+    {
+      "id": "formula-dense",
+      "file": "formula-dense.pdf",
+      "kind": "formula-dense",
+      "sha256": "96f8702177282430e7d9b1a15c3020171d57575ae651a03f5a272b1e7eed2324",
+      "expectedText": "LIGHT-TO-HEAT CONVERSION EFFICIENCY",
+      "requiresOcr": false
+    },
+    {
+      "id": "figure-table-dense",
+      "file": "figure-table-dense.pdf",
+      "kind": "figure-table-dense",
+      "sha256": "edaaf9c1c53dda523494d66c099581ba15cd6dd008c8d87c61f8c1f7bbb0e2e2",
+      "expectedText": "VISUAL EVIDENCE CHAIN",
+      "requiresOcr": false
+    }
+  ],
+  "ocrFallbackProtocolTest": "tests/mineru-protocol.test.mjs"
+}

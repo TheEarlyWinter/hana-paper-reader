@@ -1,6 +1,6 @@
 const PROTOCOL = "hana.plugin.ui";
 const VERSION = 1;
-const UI_VERSION = "0.5.0";
+const UI_VERSION = "0.6.1";
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 let seq = 0;
 
@@ -149,6 +149,7 @@ let currentPaper = {
   paperHash: null,
   blocks: [],
   translations: {},
+  translationStates: {},
   glossaryVersion: 0,
   translationGlossaryVersion: 0,
 };
@@ -173,6 +174,7 @@ let fullTranslationBusy = false;
 const blockTranslationRunIds = new Map();
 let selectedText = "";
 let selectedContext = "";
+let selectedFromTranslation = false;
 const THINKING_LEVEL_ORDER = ["off", "low", "medium", "high", "max"];
 const THINKING_LEVEL_LABELS = {
   off: "无",
@@ -183,8 +185,12 @@ const THINKING_LEVEL_LABELS = {
 };
 let currentThinkingLevel = "max";
 let effectiveThinkingLevel = null;
+const READING_MODES = new Set(["original", "bilingual", "translation"]);
+let currentReadingMode = "bilingual";
 try {
   currentThinkingLevel = normalizeThinkingLevel(localStorage.getItem("hana-paper-reader-thinking-level"));
+  const savedReadingMode = localStorage.getItem("hana-paper-reader-reading-mode");
+  if (READING_MODES.has(savedReadingMode)) currentReadingMode = savedReadingMode;
 } catch {}
 let activePane = null;
 let syncingPanes = false;
@@ -202,6 +208,9 @@ let selectedBlockId = null;
 let activeParseTask = null;
 let progressSyncTimer = null;
 let researchSyncTimer = null;
+let researchStateRevision = 0;
+let restoredResearchUiState = { searchState: {}, noteDraft: null };
+let activeSearchQuery = "";
 
 const SAMPLE_PAPER = {
   title: "Attention Is All You Need (Vaswani et al.)",
@@ -233,6 +242,7 @@ function initLayout() {
 
       <div class="nav-actions">
         <input type="file" id="file-input" accept=".pdf,.txt,.md" style="display:none">
+        <input type="file" id="backup-input" accept=".json,application/json" style="display:none">
         <button id="btn-mineru-settings" class="btn small mineru-config-button" title="配置 MinerU API Token 与解析参数">
           <span id="mineru-status-dot" class="status-dot"></span>
           <span id="mineru-status-text">MinerU 未配置</span>
@@ -240,8 +250,13 @@ function initLayout() {
         <button id="btn-open-file" class="btn primary small">📂 导入 PDF / 文档</button>
         <button id="btn-reparse" class="btn small" style="display:none">↻ MinerU 重解析</button>
         <button id="btn-sample" class="btn small">🧪 示例论文</button>
-        <button id="btn-research-tools" class="btn small" style="display:none" title="搜索、大纲、笔记、任务、证据助手、术语、图表实验室和导出">研究工具</button>
-        <button id="btn-translate-all" class="btn small" style="display:none">⚡ 翻译全文</button>
+        <button id="btn-research-tools" class="btn small" style="display:none" title="定位、核验与沉淀三条研究工作流">研究工作流</button>
+        <div id="reading-mode-control" class="reading-mode-control" style="display:none" role="group" aria-label="阅读模式">
+          <button type="button" class="reading-mode-button" data-reading-mode="original">原文</button>
+          <button type="button" class="reading-mode-button" data-reading-mode="bilingual">双语</button>
+          <button type="button" class="reading-mode-button" data-reading-mode="translation">译文</button>
+        </div>
+        <button id="btn-translate-all" class="btn small" style="display:none">翻译全文</button>
         <button id="btn-locate-sync" class="btn small" style="display:none" title="以当前滚动面板为基准，对齐另一侧的同一段落">⌖ 对齐</button>
       </div>
 
@@ -273,21 +288,25 @@ function initLayout() {
       <div id="empty-view" class="empty-view">
         <div class="empty-box">
           <div class="empty-icon">📖</div>
-          <div class="empty-title">学术文献双语精读工作台</div>
-          <div class="empty-desc">
-            将电脑里的任意 <strong>PDF 论文、文献或学术文本</strong> 直接拖入窗口，即可开启中英文对照精读。<br>
-            PDF 统一使用 <strong>MinerU 精准解析 API</strong>；首次导入前请点击顶部的 MinerU 设置填写 Token。<br>
-            在文献中选中任何难以理解的句子、实验或公式，可以直接呼叫 Hana 助手深度拆解。
+          <div class="empty-title">从论文开始，不必先学技术名词</div>
+          <div class="empty-desc">选择一个动作即可进入阅读。解析模型、文件指纹和结构块等技术细节只在需要时展开。</div>
+          <div class="onboarding-actions">
+            <button id="btn-empty-sample" class="onboarding-action">
+              <strong>体验示例论文</strong><span>立即看看原文、双语和研究工具</span>
+            </button>
+            <button id="btn-empty-config" class="onboarding-action">
+              <strong>配置 MinerU</strong><span>首次导入 PDF 前填写解析 Token</span>
+            </button>
+            <button id="btn-empty-import" class="onboarding-action primary">
+              <strong>导入我的论文</strong><span>选择 PDF、Markdown 或文本文件</span>
+            </button>
           </div>
-          <div style="display:flex;gap:10px;margin-top:8px">
-            <button id="btn-empty-import" class="btn primary">拖入或选择 PDF 文件</button>
-            <button id="btn-empty-sample" class="btn">载入经典 Transformer 示例</button>
-          </div>
+          <button id="btn-empty-restore" class="btn small">从研究备份恢复</button>
         </div>
       </div>
 
       <!-- 双栏阅读器 -->
-      <div id="reader-container" class="reader-container" style="display:none">
+      <div id="reader-container" class="reader-container" data-reading-mode="bilingual" style="display:none">
         <div id="original-pane" class="pane original">
           <div class="pane-header">
             <span>ENGLISH ORIGINAL (英文原文)</span>
@@ -299,7 +318,7 @@ function initLayout() {
         <div id="trans-pane" class="pane translation">
           <div class="pane-header">
             <span>CHINESE TRANSLATION (学术中文对照)</span>
-            <span id="trans-status">点击「⚡ 翻译全文」或各段「译」生成</span>
+            <span id="trans-status">点击「翻译全文」或各段「译」生成</span>
           </div>
           <div id="trans-blocks"></div>
         </div>
@@ -359,6 +378,7 @@ function initLayout() {
         </button>
         <button id="btn-ask-formula" class="tool-btn">📐 公式拆解</button>
         <button id="btn-ask-explain" class="tool-btn">🔍 概念解析</button>
+        <button id="btn-create-note" class="tool-btn">📝 创建研究笔记</button>
         <button id="btn-send-session" class="tool-btn">✉️ 发送到会话</button>
         <button id="btn-copy-quote" class="tool-btn">📋 复制</button>
       </div>
@@ -396,12 +416,14 @@ function initLayout() {
 
 function bindEvents() {
   const fileInput = document.getElementById("file-input");
+  const backupInput = document.getElementById("backup-input");
   const btnOpenFile = document.getElementById("btn-open-file");
   const btnEmptyImport = document.getElementById("btn-empty-import");
   const btnSample = document.getElementById("btn-sample");
   const btnEmptySample = document.getElementById("btn-empty-sample");
   const btnTranslateAll = document.getElementById("btn-translate-all");
   const btnResearchTools = document.getElementById("btn-research-tools");
+  const readingModeControl = document.getElementById("reading-mode-control");
   const btnLocateSync = document.getElementById("btn-locate-sync");
   const btnReparse = document.getElementById("btn-reparse");
   const btnMineruSettings = document.getElementById("btn-mineru-settings");
@@ -414,13 +436,22 @@ function bindEvents() {
 
   btnOpenFile.addEventListener("click", () => fileInput.click());
   btnEmptyImport.addEventListener("click", () => fileInput.click());
+  document.getElementById("btn-empty-config").addEventListener("click", openMineruSettings);
+  document.getElementById("btn-empty-restore").addEventListener("click", () => backupInput.click());
   btnSample.addEventListener("click", loadSamplePaper);
   btnEmptySample.addEventListener("click", loadSamplePaper);
   btnTranslateAll.addEventListener("click", () => startFullTranslation());
   btnResearchTools.addEventListener("click", () => void openResearchTools());
+  readingModeControl.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-reading-mode]");
+    if (button) setReadingMode(button.dataset.readingMode);
+  });
   btnLocateSync.addEventListener("click", () => locateSameBlock(activePane));
   btnReparse.addEventListener("click", () => {
-    if (currentPdfFile) void parsePdfFile(currentPdfFile);
+    if (!currentPdfFile) return;
+    if (window.confirm("将绕过现有解析缓存，把同一 PDF 重新提交给 MinerU。现有笔记、书签、译文和用户定稿会保留并重新绑定稳定 Evidence。确认继续？")) {
+      void parsePdfFile(currentPdfFile, { force: true });
+    }
   });
   btnMineruSettings.addEventListener("click", openMineruSettings);
   document.getElementById("btn-close-mineru-settings").addEventListener("click", closeMineruSettings);
@@ -444,6 +475,11 @@ function bindEvents() {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (file) handleFile(file);
+  });
+  backupInput.addEventListener("change", (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (file) void restoreResearchBackup(file);
   });
 
   agentBtn.addEventListener("click", (e) => {
@@ -477,6 +513,7 @@ function bindEvents() {
   document.getElementById("btn-ask-agent").addEventListener("click", () => askAgentQuestion("default"));
   document.getElementById("btn-ask-formula").addEventListener("click", () => askAgentQuestion("formula"));
   document.getElementById("btn-ask-explain").addEventListener("click", () => askAgentQuestion("explain"));
+  document.getElementById("btn-create-note").addEventListener("click", () => void createNoteFromSelection());
   document.getElementById("btn-send-session").addEventListener("click", sendQuoteToSession);
   document.getElementById("btn-copy-quote").addEventListener("click", copyQuoteText);
 
@@ -659,17 +696,53 @@ function applyEffectiveThinkingLevel(data) {
   renderThinkingLevelUI();
 }
 
+function setReadingMode(mode, options = {}) {
+  if (!READING_MODES.has(mode)) return;
+  currentReadingMode = mode;
+  try { localStorage.setItem("hana-paper-reader-reading-mode", mode); } catch {}
+  const container = document.getElementById("reader-container");
+  if (container) container.dataset.readingMode = mode;
+  document.querySelectorAll(".reading-mode-button[data-reading-mode]").forEach((button) => {
+    const active = button.dataset.readingMode === mode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  const originalPane = document.getElementById("original-pane");
+  const translationPane = document.getElementById("trans-pane");
+  if (mode === "original" && originalPane) activePane = originalPane;
+  if (mode === "translation" && translationPane) activePane = translationPane;
+  const align = document.getElementById("btn-locate-sync");
+  if (align) align.style.display = currentPaper.blocks.length && mode === "bilingual" ? "inline-flex" : "none";
+  if (!options.silent) {
+    researchTools?.refresh();
+    if (currentPaper.blocks.length) scheduleResearchSync();
+  }
+}
+
+function translationState(blockId) {
+  const hasTranslation = Boolean(String(currentPaper.translations?.[blockId] || "").trim());
+  const state = currentPaper.translationStates?.[blockId];
+  if (hasTranslation && state?.kind === "final") return { kind: "final", locked: state.locked !== false };
+  return { kind: hasTranslation ? "ai" : "none", locked: false };
+}
+
+function isFinalTranslation(blockId) {
+  return translationState(blockId).kind === "final";
+}
+
 function researchPaperView() {
   return {
     ...currentPaper,
     loaded: currentPaper.blocks.length > 0,
     blocks: currentPaper.blocks.map((block) => ({
       ...block,
-      translatedText: currentPaper.translations?.[block.id] || block.translatedText || "",
+      translatedText: currentPaper.translations?.[block.id] || "",
     })),
     agentId: currentAgent?.id || null,
     thinkingLevel: currentThinkingLevel,
     glossaryTerms: currentPaper.glossaryTerms || {},
+    translationStates: currentPaper.translationStates || {},
+    readingMode: currentReadingMode,
   };
 }
 
@@ -684,12 +757,18 @@ function currentReadingProgress() {
   const block = selectedResearchBlock();
   const maximum = pane ? Math.max(0, pane.scrollHeight - pane.clientHeight) : 0;
   const percent = maximum > 0 ? Math.round(Math.max(0, Math.min(1, pane.scrollTop / maximum)) * 100) : 0;
+  const uiState = researchTools?.uiState?.() || restoredResearchUiState;
   return {
     paperHash: currentPaper.paperHash,
     page: Number(block?.page || 1),
     percent,
     blockId: block?.id || null,
     pageCount: Number(currentPaper.pageCount || 0),
+    originalScrollTop: Math.max(0, Number(document.getElementById("original-pane")?.scrollTop || 0)),
+    translationScrollTop: Math.max(0, Number(document.getElementById("trans-pane")?.scrollTop || 0)),
+    readingMode: currentReadingMode,
+    noteDraft: uiState?.noteDraft || {},
+    searchState: uiState?.searchState || {},
   };
 }
 
@@ -708,11 +787,23 @@ async function initializeResearchTools() {
       getPaper: researchPaperView,
       getSelectedBlock: selectedResearchBlock,
       getProgress: currentReadingProgress,
+      getSelection: () => ({ text: selectedText, context: selectedContext, blockId: selectedBlockId, fromTranslation: selectedFromTranslation }),
       onLocateBlock: locateResearchBlock,
+      onSearchHighlight: highlightSearchInReader,
+      onUiStateChanged: (uiState) => { restoredResearchUiState = uiState; scheduleProgressSync(); },
       onPaperStateChanged: (change) => {
         if (change?.kind === "glossary") void refreshGlossaryState();
         researchTools?.refresh();
       },
+      onPaperDataChanged: (change) => {
+        if (change?.paper?.blocks?.length) {
+          const parser = change.paper.parser || {};
+          loadPaper({ ...change.paper, title: change.paper.metadata?.title || currentPaper.title, isPdf: parser.kind === "mineru", pageCount: parser.pageCount || 0, restored: true });
+        } else if (change?.action === "structure-keep-notes" && change?.paper) {
+          loadDetachedResearchRecord({ ...change.paper, structureDetached: true });
+        }
+      },
+      onPaperDeleted: () => clearCurrentPaperView("论文及其全部研究数据已删除。"),
       onCancelTask: async (task) => {
         if (task?.id && activeParseController && activeParseTask?.id === task.id) {
           await cancelActiveParse();
@@ -746,12 +837,141 @@ async function openResearchTools() {
   }
 }
 
+function clearCurrentPaperView(message = "未载入文献") {
+  cancelActiveParse();
+  resetPdfPreview();
+  currentPdfFile = null;
+  currentPaper = { title: "未导入文献", paperHash: null, blocks: [], translations: {}, translationStates: {}, glossaryVersion: 0, translationGlossaryVersion: 0 };
+  selectedBlockId = null;
+  paperRevision += 1;
+  document.getElementById("reader-container").style.display = "none";
+  document.getElementById("empty-view").style.display = "flex";
+  document.getElementById("reading-mode-control").style.display = "none";
+  document.getElementById("btn-translate-all").style.display = "none";
+  document.getElementById("btn-research-tools").style.display = "none";
+  document.getElementById("paper-badge").textContent = message;
+  const description = document.querySelector(".empty-desc");
+  if (description) description.textContent = "选择一个动作即可进入阅读。解析模型、文件指纹和结构块等技术细节只在需要时展开。";
+  updateMineruUI();
+  researchTools?.refresh();
+}
+
+async function restoreResearchBackup(file) {
+  if (!file || file.size > 256 * 1024 * 1024) {
+    await safeToast({ message: "备份文件为空或超过 256 MB", type: "error" });
+    return;
+  }
+  try {
+    const backup = JSON.parse(await file.text());
+    if (backup?.format !== "hana-paper-reader-backup") throw new Error("不是 Hana Paper Reader 备份文件");
+    if (!window.confirm("恢复会用备份内容替换同一论文当前的数据；其他论文不受影响。确认继续？")) return;
+    const response = await pluginApiFetch("/api/research/restore", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(backup),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok || !data.paper) throw new Error(data.error || "备份恢复失败");
+    const parser = data.paper.parser || {};
+    loadPaper({ ...data.paper, title: data.paper.metadata?.title || "已恢复论文", isPdf: parser.kind === "mineru", pageCount: parser.pageCount || 0, restored: true, cached: true });
+    await safeToast({ message: "研究备份已恢复；重新选择同一 PDF 可恢复原页预览，不会重复解析", type: "success" });
+  } catch (error) {
+    await safeToast({ message: `备份恢复失败：${error?.message || "文件无效"}`, type: "error" });
+  }
+}
+
+async function createNoteFromSelection() {
+  document.getElementById("selection-toolbar").style.display = "none";
+  if (!selectedBlockId) {
+    await safeToast({ message: "请先划选一段原文或译文", type: "error" });
+    return;
+  }
+  try {
+    const tools = await initializeResearchTools();
+    tools.refresh().open("notes");
+  } catch (error) {
+    await safeToast({ message: `研究笔记打开失败：${error?.message || "资源不可用"}`, type: "error" });
+  }
+}
+
+function clearSearchHighlights() {
+  document.querySelectorAll("mark[data-hpr-search]").forEach((mark) => mark.replaceWith(mark.textContent || ""));
+  document.querySelectorAll(".pdf-visual-preview.search-page-hit").forEach((element) => element.classList.remove("search-page-hit"));
+}
+
+function highlightSearchInReader(query, blockId = null, page = null) {
+  clearSearchHighlights();
+  activeSearchQuery = String(query || "").trim();
+  if (!activeSearchQuery) return;
+  const targets = blockId
+    ? [document.getElementById(`orig-${blockId}`), document.getElementById(`trans-${blockId}`)].filter(Boolean)
+    : [...document.querySelectorAll(".block-copy")];
+  const needle = activeSearchQuery.toLocaleLowerCase();
+  for (const target of targets) {
+    const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        return node.parentElement?.closest("button,textarea,script,style,mark") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    for (const node of nodes) {
+      const value = node.nodeValue || "";
+      const lower = value.toLocaleLowerCase();
+      let cursor = 0;
+      const fragment = document.createDocumentFragment();
+      let found = false;
+      while (cursor < value.length) {
+        const index = lower.indexOf(needle, cursor);
+        if (index < 0) { fragment.append(value.slice(cursor)); break; }
+        found = true;
+        fragment.append(value.slice(cursor, index));
+        const mark = document.createElement("mark");
+        mark.dataset.hprSearch = "true";
+        mark.textContent = value.slice(index, index + activeSearchQuery.length);
+        fragment.appendChild(mark);
+        cursor = index + activeSearchQuery.length;
+      }
+      if (found) node.replaceWith(fragment);
+    }
+  }
+  const selectedPage = Number(page || currentPaper.blocks.find((block) => block.id === blockId)?.page || 0);
+  if (selectedPage > 0) document.querySelectorAll(`.pdf-visual-preview[data-pdf-page="${selectedPage}"]`).forEach((element) => element.classList.add("search-page-hit"));
+}
+
+function loadDetachedResearchRecord(paper) {
+  const parser = paper.parser && typeof paper.parser === "object" ? paper.parser : {};
+  currentPaper = {
+    ...paper,
+    title: paper.metadata?.title || "保留的研究记录",
+    blocks: [],
+    translations: {},
+    translationStates: {},
+    structureDetached: true,
+    loaded: true,
+    isPdf: parser.kind === "mineru",
+    pageCount: Number(parser.pageCount || 0),
+  };
+  document.getElementById("paper-badge").textContent = `${currentPaper.title} · 仅保留研究记录`;
+  document.getElementById("empty-view").style.display = "flex";
+  document.getElementById("reader-container").style.display = "none";
+  document.getElementById("reading-mode-control").style.display = "none";
+  document.getElementById("btn-translate-all").style.display = "none";
+  document.getElementById("btn-research-tools").style.display = "inline-flex";
+  const description = document.querySelector(".empty-desc");
+  if (description) description.textContent = "论文正文结构已按你的操作删除；证据型研究笔记仍可在研究工作流中查看。重新选择同一 PDF 可重新解析并恢复正文。";
+  researchTools?.refresh();
+}
+
 async function restoreRecentPaper() {
   const revision = paperRevision;
   try {
     const response = await pluginApiFetch("/api/research/recent");
     const data = await response.json();
-    if (revision !== paperRevision || currentPaper.blocks.length || !response.ok || !data.ok || !data.paper?.blocks?.length) return false;
+    if (revision !== paperRevision || currentPaper.blocks.length || !response.ok || !data.ok || !data.paper) return false;
+    if (data.paper.structureDetached) {
+      loadDetachedResearchRecord(data.paper);
+      return true;
+    }
+    if (!data.paper.blocks?.length) return false;
     const parser = data.paper.parser && typeof data.paper.parser === "object" ? data.paper.parser : {};
     loadPaper({
       ...data.paper,
@@ -768,7 +988,7 @@ async function restoreRecentPaper() {
   }
 }
 
-function locateResearchBlock(blockId) {
+function locateResearchBlock(blockId, evidence = null) {
   const id = String(blockId || "");
   if (!id) return;
   selectedBlockId = id;
@@ -785,12 +1005,22 @@ function locateResearchBlock(blockId) {
   document.querySelectorAll(".block.anchor-selected").forEach((element) => {
     if (element.dataset.id !== id) element.classList.remove("anchor-selected");
   });
+  const page = Number(evidence?.page || currentPaper.blocks.find((block) => block.id === id)?.page || 0);
+  if (page > 0) {
+    document.querySelectorAll(`.pdf-visual-preview[data-pdf-page="${page}"]`).forEach((preview) => {
+      preview.classList.add("locate-flash");
+      window.setTimeout(() => preview.classList.remove("locate-flash"), 700);
+    });
+  }
   researchTools?.refresh();
 }
 
 async function ensureResearchPaper() {
   if (!currentPaper.blocks.length) return null;
   if (!isPaperHash(currentPaper.paperHash)) currentPaper.paperHash = await hashPaperSource(currentPaper);
+  const revision = paperRevision;
+  const stateRevision = researchStateRevision;
+  const paperHash = currentPaper.paperHash;
   const payload = {
     paperHash: currentPaper.paperHash,
     metadata: { title: currentPaper.title },
@@ -804,6 +1034,8 @@ async function ensureResearchPaper() {
     assets: currentPaper.resources || [],
     blocks: currentPaper.blocks,
     translations: currentPaper.translations || {},
+    translationStates: currentPaper.translationStates || {},
+    readingMode: currentReadingMode,
     translationGlossaryVersion: Number(currentPaper.translationGlossaryVersion || currentPaper.glossaryVersion || 0),
     replaceTranslations: currentPaper.replaceTranslations === true,
   };
@@ -814,11 +1046,27 @@ async function ensureResearchPaper() {
   });
   const data = await response.json();
   if (!response.ok || !data.ok) throw new Error(data.error || "论文工作区同步失败");
+  if (revision !== paperRevision || paperHash !== currentPaper.paperHash) return data.paper;
+  const remoteBlocks = Array.isArray(data.paper?.blocks) ? data.paper.blocks : [];
   const remoteTranslations = data.paper?.translations && typeof data.paper.translations === "object" ? data.paper.translations : {};
-  const remoteBlockTranslations = Object.fromEntries((Array.isArray(data.paper?.blocks) ? data.paper.blocks : [])
+  const remoteBlockTranslations = Object.fromEntries(remoteBlocks
     .filter((block) => block?.id && typeof block.translatedText === "string" && block.translatedText.trim())
     .map((block) => [block.id, block.translatedText.trim()]));
-  currentPaper.translations = { ...remoteBlockTranslations, ...remoteTranslations, ...currentPaper.translations };
+  if (stateRevision === researchStateRevision) {
+    currentPaper.translations = { ...remoteBlockTranslations, ...remoteTranslations };
+    currentPaper.translationStates = data.paper?.translationStates && typeof data.paper.translationStates === "object"
+      ? { ...data.paper.translationStates }
+      : {};
+  } else {
+    scheduleResearchSync();
+  }
+  if (remoteBlocks.length) {
+    const localById = new Map(currentPaper.blocks.map((block) => [block.id, block]));
+    currentPaper.blocks = remoteBlocks.map((block) => {
+      const { translatedText: _remoteTranslation, ...remoteBlock } = block;
+      return { ...localById.get(block.id), ...remoteBlock, translatedText: currentPaper.translations?.[block.id] || "" };
+    });
+  }
   currentPaper.translationGlossaryVersion = Number(data.paper?.translationGlossaryVersion || currentPaper.translationGlossaryVersion || 0);
   currentPaper.replaceTranslations = false;
   await refreshGlossaryState();
@@ -841,10 +1089,20 @@ async function restorePaperProgress(revision = paperRevision) {
     if (revision !== paperRevision || !response.ok || !data.ok || !data.progress) return;
     const progress = data.progress;
     selectedBlockId = progress.blockId || selectedBlockId;
-    if (progress.blockId) {
-      window.setTimeout(() => {
-        if (revision === paperRevision) locateResearchBlock(progress.blockId);
-      }, 80);
+    restoredResearchUiState = { searchState: progress.searchState || {}, noteDraft: progress.noteDraft || null };
+    researchTools?.restoreUiState(restoredResearchUiState);
+    if (READING_MODES.has(progress.readingMode)) setReadingMode(progress.readingMode, { silent: true });
+    window.setTimeout(() => {
+      if (revision !== paperRevision) return;
+      const original = document.getElementById("original-pane");
+      const translation = document.getElementById("trans-pane");
+      if (original) original.scrollTop = Math.max(0, Number(progress.originalScrollTop || 0));
+      if (translation) translation.scrollTop = Math.max(0, Number(progress.translationScrollTop || 0));
+      if (!Number(progress.originalScrollTop) && !Number(progress.translationScrollTop) && progress.blockId) locateResearchBlock(progress.blockId);
+      if (progress.searchState?.query) highlightSearchInReader(progress.searchState.query);
+    }, 100);
+    if (currentPaper.restored) {
+      await safeToast({ message: "研究内容与上次阅读位置已恢复。重新选择同一 PDF 可恢复原页预览，不会重复解析。", type: "success" });
     }
   } catch {}
 }
@@ -860,11 +1118,25 @@ async function refreshGlossaryState() {
     currentPaper.glossaryVersion = nextVersion;
     currentPaper.glossaryTerms = data.glossary?.terms && typeof data.glossary.terms === "object" ? data.glossary.terms : {};
     if (nextVersion !== previousTranslationVersion) {
-      currentPaper.translations = {};
+      const finalTranslations = {};
+      const finalStates = {};
+      let invalidated = 0;
+      for (const [blockId, translation] of Object.entries(currentPaper.translations || {})) {
+        if (isFinalTranslation(blockId)) {
+          finalTranslations[blockId] = translation;
+          finalStates[blockId] = currentPaper.translationStates[blockId];
+        } else {
+          invalidated += 1;
+        }
+      }
+      currentPaper.translations = finalTranslations;
+      currentPaper.translationStates = finalStates;
+      researchStateRevision += 1;
       currentPaper.translationGlossaryVersion = nextVersion;
       currentPaper.replaceTranslations = true;
       renderBlocks();
       scheduleResearchSync();
+      if (invalidated) void safeToast({ message: `术语已更新：${invalidated} 段 AI 译文待重译，用户定稿已保留`, type: "success" });
       return true;
     }
   } catch {}
@@ -964,16 +1236,23 @@ async function updateParseTask(task, patch) {
   } catch {}
 }
 
-function commitBlockTranslation(blockId, translation) {
+function commitBlockTranslation(blockId, translation, options = {}) {
   const value = String(translation || "").trim();
   if (!value) return;
   currentPaper.translations[blockId] = value;
+  currentPaper.translationStates ||= {};
+  currentPaper.translationStates[blockId] = options.kind === "final"
+    ? { kind: "final", locked: true, updatedAt: new Date().toISOString() }
+    : { kind: "ai", locked: false, updatedAt: new Date().toISOString() };
+  researchStateRevision += 1;
   const target = document.getElementById(`trans-text-${blockId}`);
   if (target) {
     target.innerHTML = formatMath(escapeHtml(value));
     target.classList.remove("trans-empty-tip");
   }
-  setBlockTranslationAction(blockId, "重新翻译");
+  setBlockTranslationAction(blockId, options.kind === "final" ? "编辑定稿" : "重新翻译");
+  updateTranslationStateUi(blockId);
+  scheduleResearchSync();
 }
 
 async function cachedTranslationsForBlocks(blocks, allowCache = true) {
@@ -1517,7 +1796,7 @@ function loadSamplePaper() {
   loadPaper(SAMPLE_PAPER);
 }
 
-async function parsePdfFile(file) {
+async function parsePdfFile(file, options = {}) {
   if (!file) return;
   if (!Number.isFinite(file.size) || file.size <= 0) {
     await safeToast({ message: "PDF 文件为空或无法读取", type: "error" });
@@ -1535,16 +1814,17 @@ async function parsePdfFile(file) {
   currentPdfFile = file;
   updateMineruUI();
   const paperBadge = document.getElementById("paper-badge");
-  paperBadge.textContent = `正在检查解析缓存: ${file.name}...`;
+  paperBadge.textContent = `正在上传论文：${file.name}`;
   paperBadge.title = `文件：${file.name}\nUI ${UI_VERSION} / API ${mineruApiVersion || "未知"}`;
   let paperHash = "";
   let task = null;
+  let waitStatusTimer = null;
 
   try {
     paperHash = await hashFile(file);
     if (jobId !== parseJobId || controller.signal.aborted) return;
 
-    const cached = await checkParseCache(paperHash);
+    const cached = options.force === true ? null : await checkParseCache(paperHash);
     if (jobId !== parseJobId || controller.signal.aborted) return;
     if (cached) {
       const generation = resetPdfPreview();
@@ -1560,8 +1840,9 @@ async function parsePdfFile(file) {
         cached: true,
       });
       void initializePdfPreview(file, generation);
-      paperBadge.title = `文件指纹：${paperHash}`;
-      await safeToast({ message: `已命中解析缓存：${cached.blocks.length} 个结构块`, type: "success" });
+      paperBadge.textContent = currentPaper.title;
+      paperBadge.title = `论文已准备好\n文件指纹：${paperHash}\n解析缓存命中：${cached.blocks.length} 个结构块`;
+      await safeToast({ message: "论文已准备好；已复用本机解析结果", type: "success" });
       return;
     }
 
@@ -1574,20 +1855,27 @@ async function parsePdfFile(file) {
 
     task = await createParseTask(paperHash, file.name);
     activeParseTask = task;
-    await updateParseTask(task, { state: "running", stage: "upload-and-parse", progress: 10 });
-    paperBadge.textContent = `MinerU 正在上传并解析: ${file.name}...`;
+    await updateParseTask(task, { state: "running", stage: "uploading", progress: 10 });
+    paperBadge.textContent = `正在上传论文：${file.name}`;
 
     const fileName = encodeURIComponent(file.name || "paper.pdf");
-    const response = await pluginApiFetch(`/api/parse-pdf?parser=mineru&fileName=${fileName}`, {
+    waitStatusTimer = window.setTimeout(() => {
+      if (jobId === parseJobId && !controller.signal.aborted) paperBadge.textContent = "正在等待 MinerU 解析";
+    }, 600);
+    const forceQuery = options.force === true ? "&force=1" : "";
+    const response = await pluginApiFetch(`/api/parse-pdf?parser=mineru&fileName=${fileName}${forceQuery}`, {
       method: "POST",
       headers: { "Content-Type": "application/pdf" },
       body: file,
       signal: controller.signal,
     });
+    window.clearTimeout(waitStatusTimer);
+    waitStatusTimer = null;
     const data = await response.json();
     if (jobId !== parseJobId || controller.signal.aborted) return;
     if (!response.ok || !data.ok || Number(data.pageCount) <= 0) throw new Error(data.error || "MinerU 未返回有效页面");
-    await updateParseTask(task, { state: "running", stage: "rendering", progress: 88 });
+    paperBadge.textContent = "正在整理正文和图表";
+    await updateParseTask(task, { state: "running", stage: "organizing", progress: 88 });
     const generation = resetPdfPreview();
     loadPaper({
       title: file.name,
@@ -1609,7 +1897,8 @@ async function parsePdfFile(file) {
     });
     void initializePdfPreview(file, generation);
     await updateParseTask(task, { state: "succeeded", stage: "complete", progress: 100 });
-    paperBadge.title = `文件指纹：${data.paperHash || paperHash}`;
+    paperBadge.textContent = currentPaper.title;
+    paperBadge.title = `论文已准备好\n文件指纹：${data.paperHash || paperHash}\n${options.force === true ? "已强制重新解析" : "首次解析"}`;
     const versionMismatch = data.apiVersion && data.apiVersion !== UI_VERSION;
     const routeDetail = data.transport === "legacy-base64" ? "；已兼容旧版卡片传输" : "";
     const ocrDetail = data.ocrFallback ? "；普通解析失败后已由 OCR 重试完成" : data.ocrUsed ? "；OCR 模式" : "";
@@ -1620,6 +1909,8 @@ async function parsePdfFile(file) {
       await safeToast({ message: `MinerU 解析完成：${data.blockCount || data.blocks.length} 个结构块${routeDetail}${ocrDetail}${versionDetail}`, type: "success" });
     }
   } catch (error) {
+    window.clearTimeout(waitStatusTimer);
+    waitStatusTimer = null;
     if (jobId !== parseJobId || controller.signal.aborted || error?.name === "AbortError") return;
     const message = String(error?.message || "接口连接异常").slice(0, 240);
     await updateParseTask(task, { state: "failed", stage: "failed", progress: 0, error: message });
@@ -1631,6 +1922,7 @@ async function parsePdfFile(file) {
       openMineruSettings();
     }
   } finally {
+    window.clearTimeout(waitStatusTimer);
     if (activeParseController === controller) activeParseController = null;
     if (activeParseTask === task) activeParseTask = null;
   }
@@ -1685,6 +1977,7 @@ function translatableBlocks() {
 
 function loadPaper(paper) {
   paperRevision += 1;
+  researchStateRevision += 1;
   const revision = paperRevision;
   fullTranslationRunId += 1;
   fullTranslationBusy = false;
@@ -1697,12 +1990,14 @@ function loadPaper(paper) {
   }
   const blocks = Array.isArray(paper?.blocks) ? paper.blocks : [];
   const persistedTranslations = paper?.translations && typeof paper.translations === "object" ? paper.translations : {};
+  const persistedTranslationStates = paper?.translationStates && typeof paper.translationStates === "object" ? paper.translationStates : {};
   const blockTranslations = Object.fromEntries(blocks.filter((block) => typeof block?.translatedText === "string" && block.translatedText.trim()).map((block) => [block.id, block.translatedText.trim()]));
   currentPaper = {
     ...paper,
     title: String(paper?.title || "未命名论文"),
     blocks,
     translations: { ...blockTranslations, ...persistedTranslations },
+    translationStates: { ...persistedTranslationStates },
     paperHash: isPaperHash(paper?.paperHash) ? paper.paperHash : null,
     glossaryVersion: Number(paper?.glossaryVersion || 0),
     translationGlossaryVersion: Number(paper?.translationGlossaryVersion || paper?.glossaryVersion || 0),
@@ -1711,13 +2006,14 @@ function loadPaper(paper) {
   };
   document.getElementById("empty-view").style.display = "none";
   document.getElementById("reader-container").style.display = "flex";
+  document.getElementById("reading-mode-control").style.display = "inline-flex";
   const translateButton = document.getElementById("btn-translate-all");
   const researchButton = document.getElementById("btn-research-tools");
   translateButton.style.display = translatableBlocks().length ? "inline-flex" : "none";
   translateButton.disabled = false;
-  translateButton.textContent = "⚡ 翻译全文";
+  translateButton.textContent = "翻译全文";
   researchButton.style.display = currentPaper.blocks.length ? "inline-flex" : "none";
-  document.getElementById("btn-locate-sync").style.display = currentPaper.blocks.length ? "inline-flex" : "none";
+  setReadingMode(READING_MODES.has(paper?.readingMode) ? paper.readingMode : currentReadingMode, { silent: true });
   document.getElementById("paper-badge").textContent = currentPaper.title;
   const visualCount = currentPaper.blocks.filter((block) => block.assetRef || block.crop || block.tableHtml || ["image", "table", "chart", "equation"].includes(block.type)).length;
   const parserKind = typeof paper?.parser === "string" ? paper.parser : paper?.parser?.kind;
@@ -1730,6 +2026,7 @@ function loadPaper(paper) {
   currentPaper.parser = typeof paper?.parser === "object" ? { ...paper.parser, kind: parserKind || "text" } : (paper?.parser || "text");
   updateMineruUI();
   renderBlocks();
+  setReadingMode(currentReadingMode, { silent: true });
   document.getElementById("original-pane").scrollTop = 0;
   document.getElementById("trans-pane").scrollTop = 0;
   void (async () => {
@@ -1743,8 +2040,15 @@ function loadPaper(paper) {
     const cacheable = translatableBlocks().filter((block) => !currentPaper.translations[block.id]);
     const cached = await cachedTranslationsForBlocks(cacheable, true);
     if (revision !== paperRevision) return;
-    cached.forEach((translation, blockId) => { currentPaper.translations[blockId] = translation; });
-    if (cached.size) renderBlocks();
+    cached.forEach((translation, blockId) => {
+      currentPaper.translations[blockId] = translation;
+      currentPaper.translationStates[blockId] = { kind: "ai", locked: false, updatedAt: new Date().toISOString() };
+    });
+    if (cached.size) {
+      researchStateRevision += 1;
+      renderBlocks();
+      scheduleResearchSync();
+    }
     researchTools?.refresh();
   })();
 }
@@ -1889,18 +2193,23 @@ function renderBlock(block, translated) {
         : `<span id="trans-text-${id}" class="block-text trans-empty-tip" data-id="${id}">[ 点击翻译本段 ]</span>`)
       : `<span class="block-text">${formatMath(escapeHtml(translationSource))}</span>`;
   }
-  const action = translated || existingTranslation ? "重新翻译" : "译";
+  const state = translationState(rawId);
+  const action = state.kind === "final" ? "编辑定稿" : (existingTranslation ? "重新翻译" : "译");
   const translateAction = translationSource
-    ? `<button class="btn-block-action btn-trans-single" data-id="${id}" title="翻译此段">${action}</button>`
+    ? `<button class="btn-block-action btn-trans-single" data-id="${id}" title="${state.kind === "final" ? "编辑用户定稿" : "翻译此段"}">${action}</button>`
+    : "";
+  const finalizeAction = translated && existingTranslation
+    ? `<button class="btn-block-action btn-edit-translation" data-id="${id}" title="编辑并保存为用户定稿">${state.kind === "final" ? "已定稿" : "定稿"}</button>`
     : "";
   const citationAction = `<button class="btn-block-action btn-copy-citation" data-id="${id}" title="复制 Page ${page} / block ${escapeAttr(rawId)} 引用">引用</button>`;
-  const actionButton = `<div class="block-actions">${citationAction}${translateAction}</div>`;
+  const actionButton = `<div class="block-actions">${citationAction}${translateAction}${finalizeAction}</div>`;
   const tag = block.type !== "paragraph"
     ? `<span class="tag-pill">${translated && translationSource ? "对照 · " : ""}${escapeHtml(blockTypeLabel(block))}</span>`
     : "";
   return `<div id="${translated ? "trans" : "orig"}-${id}" class="block ${escapeAttr(block.type || "paragraph")}${visual ? " structured-block" : ""}" data-id="${id}" data-citation-anchor="${anchor}" data-page="${page}">
     ${actionButton}
     ${tag}
+    ${translated && existingTranslation ? `<span class="translation-state-badge ${state.kind === "final" ? "final" : "ai"}" data-translation-state="${id}">${state.kind === "final" ? "用户定稿" : "AI 译文"}</span>` : ""}
     ${visual}
     ${text ? `<div class="block-copy">${text}</div>` : ""}
   </div>`;
@@ -1937,6 +2246,75 @@ function renderPage(page, blocks, translated) {
   </section>`;
 }
 
+function updateTranslationStateUi(blockId) {
+  const state = translationState(blockId);
+  const translationBlock = document.getElementById(`trans-${blockId}`);
+  if (!translationBlock || state.kind === "none") return;
+  let badge = translationBlock.querySelector("[data-translation-state]");
+  if (!badge) {
+    badge = document.createElement("span");
+    badge.dataset.translationState = blockId;
+    const insertionPoint = translationBlock.querySelector(".structured-visual, .structured-table-wrap, .equation-display, .block-copy");
+    translationBlock.insertBefore(badge, insertionPoint || null);
+  }
+  badge.className = `translation-state-badge ${state.kind === "final" ? "final" : "ai"}`;
+  badge.textContent = state.kind === "final" ? "用户定稿" : "AI 译文";
+  let editButton = translationBlock.querySelector(".btn-edit-translation");
+  if (!editButton) {
+    editButton = document.createElement("button");
+    editButton.type = "button";
+    editButton.className = "btn-block-action btn-edit-translation";
+    editButton.dataset.id = blockId;
+    editButton.title = "编辑并保存为用户定稿";
+    editButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openTranslationEditor(blockId);
+    });
+    translationBlock.querySelector(".block-actions")?.appendChild(editButton);
+  }
+  editButton.textContent = state.kind === "final" ? "已定稿" : "定稿";
+}
+
+function openTranslationEditor(blockId) {
+  if (currentReadingMode === "original") setReadingMode("translation");
+  const target = document.getElementById(`trans-text-${blockId}`);
+  const current = String(currentPaper.translations?.[blockId] || "");
+  if (!target || !current || target.parentElement?.querySelector(".translation-editor")) return;
+  const editor = document.createElement("div");
+  editor.className = "translation-editor";
+  const textarea = document.createElement("textarea");
+  textarea.className = "translation-editor-input";
+  textarea.value = current;
+  textarea.setAttribute("aria-label", "编辑用户定稿译文");
+  const actions = document.createElement("div");
+  actions.className = "translation-editor-actions";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "btn small primary";
+  save.textContent = "保存为定稿";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn small";
+  cancel.textContent = "取消";
+  actions.append(save, cancel);
+  editor.append(textarea, actions);
+  const parent = target.parentElement;
+  target.hidden = true;
+  parent.appendChild(editor);
+  const closeEditor = () => { editor.remove(); target.hidden = false; };
+  cancel.addEventListener("click", closeEditor);
+  save.addEventListener("click", () => {
+    const value = textarea.value.trim();
+    if (!value) return;
+    commitBlockTranslation(blockId, value, { kind: "final" });
+    closeEditor();
+    scheduleResearchSync();
+    void safeToast({ message: "用户定稿已保存并锁定", type: "success" });
+  });
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+}
+
 function renderBlocks() {
   const origContainer = document.getElementById("orig-blocks");
   const transContainer = document.getElementById("trans-blocks");
@@ -1952,6 +2330,13 @@ function renderBlocks() {
       e.stopPropagation();
       const id = el.getAttribute("data-id");
       translateSingleBlock(id);
+    });
+  });
+
+  document.querySelectorAll(".btn-edit-translation").forEach((el) => {
+    el.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openTranslationEditor(el.getAttribute("data-id"));
     });
   });
 
@@ -2027,6 +2412,10 @@ async function copyBlockCitation(blockId) {
 
 async function translateSingleBlock(blockId) {
   if (fullTranslationBusy) return;
+  if (isFinalTranslation(blockId)) {
+    openTranslationEditor(blockId);
+    return;
+  }
   const block = currentPaper.blocks.find((item) => item.id === blockId);
   const sourceText = translationTextForBlock(block);
   if (!block || !sourceText) return;
@@ -2039,9 +2428,9 @@ async function translateSingleBlock(blockId) {
   window.requestAnimationFrame(() => alignTranslationBlock(blockId));
 
   try {
-    const cached = await getCachedBlockTranslation(block, sourceText, hadTranslation);
+    const cached = await getCachedBlockTranslation(block, sourceText, !hadTranslation);
     if (revision !== paperRevision || blockTranslationRunIds.get(blockId) !== runId) return;
-    if (cached && !hadTranslation) {
+    if (cached) {
       commitBlockTranslation(blockId, cached);
       window.requestAnimationFrame(() => alignTranslationBlock(blockId));
       return;
@@ -2076,23 +2465,37 @@ async function translateSingleBlock(blockId) {
 
 async function startFullTranslation() {
   if (fullTranslationBusy) return;
-  const blocks = translatableBlocks();
+  let blocks = translatableBlocks();
   const button = document.getElementById("btn-translate-all");
   if (!blocks.length) return;
   const revision = paperRevision;
   const runId = ++fullTranslationRunId;
-  const force = blocks.every((block) => Boolean(currentPaper.translations[block.id]));
-  if (force) {
-    blocks.forEach((block) => { delete currentPaper.translations[block.id]; });
-    currentPaper.replaceTranslations = true;
-  }
-  const pending = blocks.filter((block) => !currentPaper.translations[block.id]);
-  if (!pending.length) return;
-
   fullTranslationBusy = true;
-  blockTranslationRunIds.clear();
   button.disabled = true;
-  button.textContent = "⏳ 正在翻译中...";
+  button.textContent = "正在准备翻译…";
+  await refreshGlossaryState();
+  if (revision !== paperRevision || runId !== fullTranslationRunId) return;
+  blocks = translatableBlocks();
+  const mutableBlocks = blocks.filter((block) => !isFinalTranslation(block.id));
+  const force = mutableBlocks.length > 0 && mutableBlocks.every((block) => Boolean(currentPaper.translations[block.id]));
+  if (force) {
+    mutableBlocks.forEach((block) => {
+      delete currentPaper.translations[block.id];
+      delete currentPaper.translationStates[block.id];
+    });
+    currentPaper.replaceTranslations = true;
+    researchStateRevision += 1;
+  }
+  const pending = mutableBlocks.filter((block) => !currentPaper.translations[block.id]);
+  if (!pending.length) {
+    fullTranslationBusy = false;
+    button.disabled = false;
+    button.textContent = mutableBlocks.length ? "重新翻译全文" : "译文均已定稿";
+    return;
+  }
+
+  blockTranslationRunIds.clear();
+  button.textContent = "正在翻译中…";
   pending.forEach((block) => setTranslationPlaceholder(block.id, "正在翻译中..."));
 
   let failedCount = 0;
@@ -2141,8 +2544,9 @@ async function startFullTranslation() {
     if (revision === paperRevision && runId === fullTranslationRunId) {
       fullTranslationBusy = false;
       button.disabled = false;
-      button.textContent = failedCount ? `⚡ 重试未完成段落 (${failedCount})` : "⚡ 重新翻译全文";
+      button.textContent = failedCount ? `重试未完成段落 (${failedCount})` : "重新翻译全文";
       renderBlocks();
+      scheduleResearchSync();
     }
   }
 }
@@ -2166,6 +2570,7 @@ function handleTextSelection() {
   selectedText = text;
   selectedContext = node.textContent.trim();
   selectedBlockId = node.getAttribute("data-id") || selectedBlockId;
+  selectedFromTranslation = Boolean(node.closest("#trans-pane"));
 
   const range = selection.getRangeAt(0);
   const rect = range.getBoundingClientRect();

@@ -83,7 +83,13 @@ test("registers research routes without changing the existing MinerU route surfa
       "GET /api/research/paper",
       "POST /api/research/paper",
       "GET /api/research/snapshot",
+      "GET /api/research/storage",
+      "POST /api/research/cleanup",
+      "DELETE /api/research/paper",
+      "POST /api/research/backup",
+      "POST /api/research/restore",
       "GET /api/research/search",
+      "GET /api/research/evidence",
       "GET /api/research/outline",
       "POST /api/research/notes",
       "GET /api/research/notes",
@@ -102,6 +108,7 @@ test("registers research routes without changing the existing MinerU route surfa
       "POST /api/research/translation-cache",
       "GET /api/research/parse-status/tasks",
       "POST /api/research/parse-status/tasks",
+      "POST /api/research/parse-status/tasks/:taskId",
       "POST /api/research/parse-status/tasks/:taskId/update",
       "POST /api/research/parse-status/tasks/:taskId/cancel",
       "POST /api/research/export",
@@ -157,25 +164,70 @@ test("research CRUD routes persist paper data and serve bounded read APIs", asyn
     const updatedPaper = await postPaper(requestContext({
       paperHash,
       translations: { "b-water": "水分胁迫会降低作物产量。" },
+      translationStates: { "b-water": { kind: "ai", locked: false } },
       translationGlossaryVersion: 1,
+      readingMode: "translation",
     }));
     assert.equal(updatedPaper.value.paper.translations["b-water"], "水分胁迫会降低作物产量。");
+    assert.equal(updatedPaper.value.paper.translationStates["b-water"].kind, "ai");
+    assert.equal(updatedPaper.value.paper.readingMode, "translation");
+
+    const finalizedPaper = await postPaper(requestContext({
+      paperHash,
+      translations: { "b-water": "水分胁迫降低作物产量（用户定稿）。" },
+      translationStates: { "b-water": { kind: "final", locked: true } },
+      translationGlossaryVersion: 1,
+    }));
+    assert.equal(finalizedPaper.value.paper.translationStates["b-water"].kind, "final");
+
+    const glossaryChanged = await postPaper(requestContext({
+      paperHash,
+      translations: {},
+      translationStates: {},
+      translationGlossaryVersion: 2,
+      replaceTranslations: true,
+    }));
+    assert.equal(glossaryChanged.value.paper.translations["b-water"], "水分胁迫降低作物产量（用户定稿）。", "glossary changes must preserve user finals");
+    assert.equal(glossaryChanged.value.paper.translationStates["b-water"].kind, "final");
+
+    const staleAiSync = await postPaper(requestContext({
+      paperHash,
+      translations: { "b-water": "过期客户端尝试覆盖" },
+      translationStates: { "b-water": { kind: "ai", locked: false } },
+      translationGlossaryVersion: 2,
+    }));
+    assert.equal(staleAiSync.value.paper.translations["b-water"], "水分胁迫降低作物产量（用户定稿）。", "AI state must not overwrite an existing final");
+    assert.equal(staleAiSync.value.paper.translationStates["b-water"].kind, "final");
+
+    const evidenceList = app.routes.get("GET /api/research/evidence")(requestContext({}, { paperHash, limit: "2" }));
+    assert.equal(evidenceList.value.ok, true);
+    assert.equal(evidenceList.value.evidence.length, 2);
+    assert.match(evidenceList.value.evidence[1].evidenceId, /^ev-/);
+    const evidenceRecord = app.routes.get("GET /api/research/evidence")(requestContext({}, { paperHash, blockId: "b-water" }));
+    assert.equal(evidenceRecord.value.evidence.originalQuote, "Water stress reduces crop yield.");
+    assert.equal(evidenceRecord.value.evidence.validationStatus, "verified");
 
     const snapshot = app.routes.get("GET /api/research/snapshot")(requestContext({}, { paperHash, limit: "2" }));
     assert.equal(snapshot.value.ok, true);
     assert.equal(snapshot.value.snapshot.paper.blockIndex.length, 2);
     assert.equal(snapshot.value.snapshot.paper.blocks, undefined);
 
-    const search = app.routes.get("GET /api/research/search")(requestContext({}, { paperHash, q: "产量" }));
+    const search = app.routes.get("GET /api/research/search")(requestContext({}, { paperHash, q: "产量", scope: "page", page: "1", language: "translation", types: "body", currentBlockId: "b-water" }));
     assert.equal(search.value.results[0].matches.translated, true);
+    assert.equal(search.value.options.scope, "page");
+    assert.match(search.value.ranking, /词频/);
+    assert.ok(search.value.results[0].scoreExplanation.length > 0);
     const outline = app.routes.get("GET /api/research/outline")(requestContext({}, { paperHash }));
     assert.equal(outline.value.outline[0].title, "Methods");
 
-    const note = await app.routes.get("POST /api/research/notes")(requestContext({ paperHash, blockId: "b-water", note: "Verify field result", tags: ["check"] }));
+    const note = await app.routes.get("POST /api/research/notes")(requestContext({ paperHash, blockId: "b-water", note: "Verify field result", noteType: "question", tags: ["check"] }));
     const bookmark = await app.routes.get("POST /api/research/bookmarks")(requestContext({ paperHash, blockId: "b-formula", label: "Formula", page: 2 }));
     assert.equal(note.value.note.blockId, "b-water");
+    assert.equal(note.value.note.noteType, "question");
+    assert.equal(note.value.note.quote, "Water stress reduces crop yield.");
     assert.equal(bookmark.value.bookmark.label, "Formula");
     assert.equal(app.routes.get("GET /api/research/notes")(requestContext({}, { paperHash })).value.notes.length, 1);
+    assert.equal(app.routes.get("GET /api/research/notes")(requestContext({}, { paperHash, noteType: "question", unresolvedOnly: "true" })).value.notes.length, 1);
     assert.equal(app.routes.get("GET /api/research/bookmarks")(requestContext({}, { paperHash })).value.bookmarks.length, 1);
     assert.equal((await app.routes.get("DELETE /api/research/notes/:id")(requestContext({}, {}, { id: note.value.note.id }))).value.deleted, true);
 
@@ -196,8 +248,8 @@ test("research CRUD routes persist paper data and serve bounded read APIs", asyn
 
     const task = await app.routes.get("POST /api/research/parse-status/tasks")(requestContext({ paperHash, id: "parse-1" }));
     assert.equal(task.value.task.state, "queued");
-    const updated = await app.routes.get("POST /api/research/parse-status/tasks/:taskId/update")(requestContext({ state: "running", stage: "upload", progress: 20 }, {}, { taskId: "parse-1" }));
-    assert.equal(updated.value.task.stage, "upload");
+    const updated = await app.routes.get("POST /api/research/parse-status/tasks/:taskId")(requestContext({ state: "running", stage: "upload", progress: 20 }, {}, { taskId: "parse-1" }), async () => {});
+    assert.equal(updated.value.task.stage, "upload", "Hono next callback must not be mistaken for a forced task state");
     const cancelled = await app.routes.get("POST /api/research/parse-status/tasks/:taskId/cancel")(requestContext({}, {}, { taskId: "parse-1" }));
     assert.equal(cancelled.value.task.state, "cancelled");
     assert.equal(app.routes.get("GET /api/research/parse-status/tasks")(requestContext({}, { paperHash })).value.tasks.length, 1);
@@ -205,6 +257,24 @@ test("research CRUD routes persist paper data and serve bounded read APIs", asyn
     const cacheCheck = app.routes.get("GET /api/research/parse-cache/check")(requestContext({}, { paperHash }));
     assert.equal(cacheCheck.value.hit, true);
     assert.equal(cacheCheck.value.blockCount, 3);
+
+    const storage = app.routes.get("GET /api/research/storage")(requestContext({}, { paperHash }));
+    assert.equal(storage.value.ok, true);
+    assert.equal(storage.value.storage.layout, "per-paper-v1");
+    assert.equal(storage.value.storage.counts.notes, 0, "the note was deleted earlier in this test");
+
+    const backupResponse = await app.routes.get("POST /api/research/backup")(requestContext({ paperHash, includeAssets: false }));
+    const backupText = await readResponse(backupResponse);
+    const backup = JSON.parse(backupText.text);
+    assert.equal(backup.format, "hana-paper-reader-backup");
+    assert.equal(backup.paperHash, paperHash);
+
+    const cleared = await app.routes.get("POST /api/research/cleanup")(requestContext({ paperHash, action: "ai-translations" }));
+    assert.equal(cleared.value.ok, true);
+    assert.equal(cleared.value.result.preservedFinals, 1);
+    const restored = await app.routes.get("POST /api/research/restore")(requestContext(backup));
+    assert.equal(restored.value.ok, true);
+    assert.equal(restored.value.paper.paperHash, paperHash);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -254,11 +324,14 @@ test("export and evidence routes stay local except for the explicitly mocked age
     assert.match(markdown.contentType, /^text\/markdown/);
     assert.match(markdown.text, /Research API fixture/);
     assert.match(markdown.text, /水分胁迫降低作物产量/);
-    assert.match(markdown.text, /page:1 block:b-water/);
+    assert.match(markdown.text, /page:1 block:b-water evidence:ev-/);
+    assert.match(markdown.text, /AI 译文/);
 
     const evidence = await app.routes.get("POST /api/research/evidence")(requestContext({ paperHash, agentId: "fixture-agent", question: "What affects yield?", blockIds: ["b-water"] }));
     assert.equal(evidence.value.ok, true);
     assert.match(evidence.value.answer, /Page 1 \/ block b-water/);
+    assert.match(evidence.value.evidence[0].evidenceId, /^ev-/);
+    assert.equal(evidence.value.evidence[0].validationStatus, "verified");
     assert.doesNotMatch(evidence.value.answer, /Page 99 \/ block bogus/);
     assert.match(sentPrompts.at(-1), /Page 1 \/ block b-water/);
     assert.match(sentPrompts.at(-1), /What affects yield/);

@@ -23,7 +23,22 @@ test("exports anchors, bilingual text, outline, and configured attachments", () 
   assert.match(markdown, /<!-- page:2 block:p-1 -->/);
   assert.match(markdown, /- \[1\. Introduction\]\(#paper-p2-b-intro\)/);
   assert.ok(markdown.includes(["Original ", String.fromCharCode(92), "*claim", String.fromCharCode(92), "*"].join("")));
-  assert.match(markdown, /> \*\*译文：\*\* 中文译文/);
+  assert.match(markdown, /> \*\*AI 译文：\*\* 中文译文/);
+});
+
+test("exports stable Evidence IDs and distinguishes user finals from AI translations", () => {
+  const markdown = generatePaperMarkdown({
+    blocks: [
+      { id: "ai", evidenceId: "ev-aaaaaaaaaaaa-111111111111111111111111", page: 1, type: "paragraph", text: "AI source" },
+      { id: "final", evidenceId: "ev-aaaaaaaaaaaa-222222222222222222222222", page: 2, type: "paragraph", text: "Final source" },
+    ],
+    translations: { ai: "AI 翻译", final: "用户修订译文" },
+    translationStates: { ai: { kind: "ai" }, final: { kind: "final", locked: true } },
+  });
+
+  assert.match(markdown, /page:1 block:ai evidence:ev-aaaaaaaaaaaa-111111111111111111111111/);
+  assert.match(markdown, /> \*\*AI 译文：\*\* AI 翻译/);
+  assert.match(markdown, /> \*\*用户定稿：\*\* 用户修订译文/);
 });
 
 test("exports visual blocks without executing user supplied HTML", () => {
@@ -68,8 +83,8 @@ test("escapes ordered-list-looking translated headings without moving the backsl
     translations: { "section-2": "2. 模型架构" },
   });
 
-  assert.match(markdown, /> \*\*译文：\*\* 2\\\. 模型架构/);
-  assert.doesNotMatch(markdown, /> \*\*译文：\*\* \\2\. 模型架构/);
+  assert.match(markdown, /> \*\*AI 译文：\*\* 2\\\. 模型架构/);
+  assert.doesNotMatch(markdown, /> \*\*AI 译文：\*\* \\2\. 模型架构/);
 });
 
 test("preserves inline and display LaTeX while escaping surrounding Markdown", () => {

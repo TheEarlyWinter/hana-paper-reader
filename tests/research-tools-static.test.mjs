@@ -12,10 +12,14 @@ assert.match(source, /export default createResearchTools/);
 for (const symbol of ["open", "close", "destroy", "refresh", "apiFetch", "getPaper", "getSelectedBlock", "onLocateBlock", "onPaperStateChanged", "toast"]) {
   assert.match(source, new RegExp(symbol));
 }
-for (const entry of ["全文搜索", "自动大纲", "笔记 \/ 书签 \/ 进度", "解析任务状态", "证据助手", "术语表 \/ 翻译缓存", "图表 \/ 公式 \/ 图片实验室", "双语 Markdown"]) {
+for (const entry of ["定位", "核验", "沉淀", "全文搜索", "自动大纲", "书签与进度", "数据与任务", "证据助手", "术语与译文", "图表、表格与公式", "研究导出", "研究发现", "方法与条件", "疑问", "局限与风险", "仅清理解析缓存", "从备份恢复"]) {
   assert.match(source, new RegExp(entry));
 }
-for (const endpoint of ["notes", "bookmarks", "progress", "parse", "evidence", "glossary", "export"]) {
+assert.match(source, /WORKFLOW_DEFINITIONS/);
+assert.match(source, /activeWorkflow/);
+assert.match(source, /dataset\.evidenceId/);
+assert.match(source, /result\.evidence/);
+for (const endpoint of ["notes", "bookmarks", "progress", "parse", "evidence", "glossary", "export", "storage", "cleanup", "backup", "restore"]) {
   assert.match(source, new RegExp(`\\b${endpoint}: \\"/api/research/`));
 }
 assert.match(source, /endpoints\[kind\]/);
@@ -38,7 +42,7 @@ assert.match(css, /var\(--accent/);
 
 const cssClasses = [
   "research-tools-drawer", "research-tools-header", "research-tools-heading", "research-tools-title",
-  "research-tools-paper", "research-tools-close", "research-tools-nav", "research-tools-nav-button",
+  "research-tools-paper", "research-tools-close", "research-workflow-nav", "research-workflow-button", "research-tools-nav", "research-tools-nav-button",
   "research-tools-body", "research-tools-empty", "research-tools-content", "research-tools-view",
   "research-tools-form", "research-tools-actions", "research-tools-input", "research-tools-select",
   "research-tools-textarea", "research-tools-context", "research-tools-muted", "research-tools-results",
@@ -49,6 +53,9 @@ for (const cls of cssClasses) {
   assert.ok(css.includes(cls), `missing CSS rule for .${cls}`);
 }
 
+assert.match(source, /tableRowsFromHtml/);
+assert.match(source, /scoreExplanation/);
+assert.match(source, /restoreUiState/);
 assert.match(source, /shell\.remove\(\)/);
 assert.match(source, /state\.destroyed = true/);
 assert.doesNotMatch(source, /lastChild\.textContent/);

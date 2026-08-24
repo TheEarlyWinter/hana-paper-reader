@@ -37,7 +37,12 @@ test("paper metadata, block anchors, resources, search and outline persist", asy
   const paper = await workspace.upsertPaper(fixture());
   assert.equal(paper.paperHash, hash);
   assert.deepEqual(workspace.outline(hash), [{ id: "mineru_p1_b1", title: "Introduction", page: 1, level: 1 }]);
-  assert.deepEqual(workspace.search(hash, "water"), [{ id: "mineru_p1_b2", page: 1, type: "paragraph", text: "Water stress affects crop yield.", translatedText: "水分胁迫影响作物产量。", matches: { original: true, translated: false }, bbox: [1, 2, 3, 4] }]);
+  const searchHit = workspace.search(hash, "water")[0];
+  assert.equal(searchHit.id, "mineru_p1_b2");
+  assert.equal(searchHit.matches.original, true);
+  assert.equal(searchHit.evidence.evidenceId, searchHit.evidenceId);
+  assert.equal(searchHit.evidence.validationStatus, "verified");
+  assert.equal(searchHit.evidence.sectionTitle, "Introduction");
   assert.equal(workspace.search(hash, "产量")[0].matches.translated, true);
   assert.equal(paper.resources.length, 2);
   assert.equal(paper.resources[0].type, "equation");
@@ -78,7 +83,11 @@ test("notes, bookmarks, progress and glossary CRUD are paper-scoped", async () =
   const note = await workspace.putNote({ paperHash: hash, blockId: "mineru_p1_b2", note: "Check the field trial", tags: ["todo"] });
   const bookmark = await workspace.putBookmark({ paperHash: hash, blockId: "mineru_p2_b1", label: "Formula", page: 2 });
   assert.equal(note.blockId, "mineru_p1_b2");
+  assert.match(note.evidenceId, /^ev-[a-f0-9-]+$/);
+  assert.equal(note.evidence.evidenceId, note.evidenceId);
+  assert.equal(note.validationStatus, "verified");
   assert.equal(bookmark.page, 2);
+  assert.equal(bookmark.evidence.blockType, "equation");
   assert.equal(await workspace.deleteItem("notes", note.id), true);
   assert.equal(await workspace.deleteItem("notes", note.id), false);
   const progress = await workspace.setProgress({ paperHash: hash, page: 2, percent: 48 });
@@ -91,6 +100,53 @@ test("notes, bookmarks, progress and glossary CRUD are paper-scoped", async () =
   assert.equal(workspace.getGlossary(hash).terms.yield, undefined);
   assert.equal(workspace.getProgress(hash).page, 2);
   assert.ok(workspace.snapshot(hash).bookmarks.some((item) => item.id === bookmark.id));
+});
+
+test("Evidence IDs stay stable and visual evidence resolves from either evidenceId or blockId", async () => {
+  const first = await workspace.upsertPaper(fixture());
+  const paragraph = workspace.getEvidence(hash, { blockId: "mineru_p1_b2" });
+  const equation = workspace.getEvidence(hash, { blockId: "mineru_p2_b1" });
+  assert.equal(paragraph.evidenceId, first.blocks[1].evidenceId);
+  assert.equal(workspace.getEvidence(hash, { evidenceId: paragraph.evidenceId }).blockId, "mineru_p1_b2");
+  assert.equal(equation.visualResource.type, "equation");
+  assert.equal(equation.visualResource.latex, "y = ax");
+
+  await workspace.upsertPaper({ ...fixture(), metadata: { title: "Updated title" } });
+  assert.equal(workspace.getEvidence(hash, { blockId: "mineru_p1_b2" }).evidenceId, paragraph.evidenceId);
+  assert.equal(workspace.listEvidence(hash).length, fixture().blocks.length);
+});
+
+test("schema 1 data migrates with a backup and Evidence relations", async () => {
+  const filePath = path.join(tempDir, "paper-workspace.json");
+  fs.writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: "2026-08-22T00:00:00.000Z",
+    papers: { [hash]: fixture() },
+    tasks: {},
+    notes: {
+      "legacy-note": {
+        id: "legacy-note",
+        paperHash: hash,
+        blockId: "mineru_p1_b2",
+        note: "Legacy note",
+        createdAt: "2026-08-22T00:00:00.000Z",
+        updatedAt: "2026-08-22T00:00:00.000Z"
+      }
+    },
+    bookmarks: {},
+    progress: {},
+    glossaries: {},
+    translationCache: {}
+  }, null, 2), "utf8");
+
+  const migrated = workspace.load();
+  assert.equal(migrated.schemaVersion, 3);
+  assert.equal(JSON.parse(fs.readFileSync(filePath, "utf8")).storageLayout, "per-paper-v1");
+  assert.ok(fs.existsSync(path.join(tempDir, "papers", hash, "paper.json")));
+  assert.match(migrated.papers[hash].blocks[1].evidenceId, /^ev-/);
+  assert.equal(workspace.getItem("notes", "legacy-note").validationStatus, "verified");
+  assert.equal(workspace.getItem("notes", "legacy-note").evidence.originalQuote, "Water stress affects crop yield.");
+  assert.ok(fs.readdirSync(tempDir).some((name) => name.startsWith("paper-workspace.json.schema-v1-") && name.endsWith(".backup")));
 });
 
 test("translation cache is keyed by paper, block and glossary version", async () => {
@@ -121,4 +177,115 @@ test("outline and search are pure bounded functions", () => {
   assert.equal(buildOutline(blocks).length, 200);
   assert.equal(searchBlocks(blocks, "same", { limit: 3 }).length, 3);
   assert.deepEqual(searchBlocks(blocks, "", { limit: 3 }), []);
+});
+
+test("scoped search ranks explainably and filters language and block groups", async () => {
+  const paper = fixture();
+  paper.blocks.push(
+    { id: "mineru_p2_b2", page: 2, type: "paragraph", text: "Water appears twice: water.", translatedText: "这里没有目标词。" },
+    { id: "mineru_p2_b3", page: 2, type: "heading", level: 2, text: "Water methods" },
+  );
+  await workspace.upsertPaper(paper);
+  const pageHits = workspace.search(hash, "water", { scope: "page", page: 2, language: "original", types: "title,body", currentBlockId: "mineru_p2_b2" });
+  assert.equal(pageHits.length, 2);
+  assert.equal(pageHits[0].id, "mineru_p2_b3", "title weight must be visible in deterministic ranking");
+  assert.ok(pageHits[0].scoreExplanation.some((item) => item.includes("标题块")));
+  assert.equal(workspace.search(hash, "产量", { language: "original" }).length, 0);
+  assert.equal(workspace.search(hash, "产量", { language: "translation" })[0].matches.translated, true);
+  assert.equal(workspace.search(hash, "Growth", { types: "equation" })[0].typeGroup, "equation");
+});
+
+test("typed notes retain Evidence snapshots and support filters", async () => {
+  await workspace.upsertPaper(fixture());
+  const finding = await workspace.putNote({ paperHash: hash, blockId: "mineru_p1_b2", noteType: "finding", note: "Yield finding", tags: ["yield"] });
+  const question = await workspace.putNote({ paperHash: hash, blockId: "mineru_p1_b2", noteType: "question", note: "Why?", tags: ["todo"] });
+  assert.equal(finding.quote, "Water stress affects crop yield.");
+  assert.equal(finding.translation, "水分胁迫影响作物产量。");
+  assert.equal(finding.evidenceSnapshot.evidenceId, finding.evidenceId);
+  assert.deepEqual(workspace.listItems("notes", hash, 100, { noteType: "question" }).map((item) => item.id), [question.id]);
+  assert.deepEqual(workspace.listItems("notes", hash, 100, { tag: "yield" }).map((item) => item.id), [finding.id]);
+  assert.deepEqual(workspace.listItems("notes", hash, 100, { unresolvedOnly: true }).map((item) => item.id), [question.id]);
+  const resolved = await workspace.putNote({ ...question, resolved: true });
+  assert.equal(resolved.resolved, true);
+  assert.equal(workspace.listItems("notes", hash, 100, { unresolvedOnly: true }).length, 0);
+});
+
+test("schema 3 writes each paper to an independent directory", async () => {
+  await workspace.upsertPaper(fixture());
+  await workspace.putNote({ paperHash: hash, blockId: "mineru_p1_b2", note: "Independent note" });
+  await workspace.close();
+  const index = JSON.parse(fs.readFileSync(path.join(tempDir, "paper-workspace.json"), "utf8"));
+  assert.equal(index.storageLayout, "per-paper-v1");
+  assert.equal(index.papers[hash].metadata.title, "A test paper");
+  assert.equal("blocks" in index.papers[hash], false, "global index must not duplicate paper blocks");
+  for (const name of ["paper.json", "research.json", "translations.json", "tasks.json"]) {
+    assert.ok(fs.existsSync(path.join(tempDir, "papers", hash, name)), `missing per-paper ${name}`);
+  }
+  const reopened = createPaperWorkspace({ dataDir: tempDir });
+  assert.equal(reopened.getPaper(hash).blocks.length, fixture().blocks.length);
+  assert.equal(reopened.listItems("notes", hash)[0].note, "Independent note");
+  await reopened.close();
+});
+
+test("data ownership actions preserve user finals and Evidence-bound notes", async () => {
+  await workspace.upsertPaper({
+    ...fixture(),
+    translations: { mineru_p1_b2: "AI", mineru_p2_b1: "用户定稿" },
+    translationStates: { mineru_p1_b2: { kind: "ai" }, mineru_p2_b1: { kind: "final", locked: true } },
+  });
+  await workspace.putTranslation({ paperHash: hash, blockId: "mineru_p1_b2", glossaryVersion: 0, source: "Water", translation: "AI" });
+  const note = await workspace.putNote({ paperHash: hash, blockId: "mineru_p1_b2", noteType: "limitation", note: "Keep this" });
+  const stats = workspace.storageStats(hash);
+  assert.equal(stats.layout, "per-paper-v1");
+  assert.equal(stats.counts.notes, 1);
+  const cleared = await workspace.clearPaperData(hash, "ai-translations");
+  assert.equal(cleared.paper.translations.mineru_p1_b2, undefined);
+  assert.equal(cleared.paper.translations.mineru_p2_b1, "用户定稿");
+  assert.equal(cleared.preservedFinals, 1);
+  const detached = await workspace.clearPaperData(hash, "structure-keep-notes");
+  assert.equal(detached.notesKept, 1);
+  assert.equal(workspace.getPaper(hash).blocks.length, 0);
+  const kept = workspace.getItem("notes", note.id);
+  assert.equal(kept.validationStatus, "detached");
+  assert.equal(kept.evidence.originalQuote, "Water stress affects crop yield.");
+});
+
+test("backup round-trip restores paper research and assets after full deletion", async () => {
+  const cacheId = "d".repeat(24);
+  const source = fixture();
+  source.blocks[3].assetRef = { cacheId, path: "figures/plot.png" };
+  fs.mkdirSync(path.join(tempDir, "mineru-cache", cacheId, "figures"), { recursive: true });
+  fs.writeFileSync(path.join(tempDir, "mineru-cache", cacheId, "figures", "plot.png"), Buffer.from("png-bytes"));
+  await workspace.upsertPaper(source);
+  await workspace.putNote({ paperHash: hash, blockId: "mineru_p1_b2", noteType: "method", note: "Backup me" });
+  const backup = workspace.exportBackup(hash);
+  assert.equal(backup.assets.length, 1);
+  assert.equal(await workspace.removePaper(hash), true);
+  assert.equal(workspace.getPaper(hash), null);
+  await workspace.restoreBackup(backup);
+  assert.equal(workspace.getPaper(hash).metadata.title, "A test paper");
+  assert.equal(workspace.listItems("notes", hash)[0].note, "Backup me");
+  assert.equal(fs.readFileSync(path.join(tempDir, "mineru-cache", cacheId, "figures", "plot.png"), "utf8"), "png-bytes");
+  await assert.rejects(() => workspace.restoreBackup({ ...backup, assets: [{ cacheId, path: "../escape", data: "eA==" }] }), /path/);
+});
+
+test("precise progress persists reading mode scroll positions drafts and search filters", async () => {
+  await workspace.upsertPaper(fixture());
+  await workspace.setProgress({
+    paperHash: hash,
+    blockId: "mineru_p1_b2",
+    page: 1,
+    percent: 21,
+    readingMode: "translation",
+    originalScrollTop: 120,
+    translationScrollTop: 340,
+    noteDraft: { note: "unfinished", noteType: "question" },
+    searchState: { query: "water", scope: "section", language: "both", types: ["body"] },
+  });
+  const progress = workspace.getProgress(hash);
+  assert.equal(progress.readingMode, "translation");
+  assert.equal(progress.originalScrollTop, 120);
+  assert.equal(progress.translationScrollTop, 340);
+  assert.equal(progress.noteDraft.note, "unfinished");
+  assert.equal(progress.searchState.scope, "section");
 });
