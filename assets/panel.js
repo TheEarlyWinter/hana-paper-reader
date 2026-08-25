@@ -1,6 +1,6 @@
 const PROTOCOL = "hana.plugin.ui";
 const VERSION = 1;
-const UI_VERSION = "0.6.1";
+const UI_VERSION = "0.6.2";
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 let seq = 0;
 
@@ -185,7 +185,7 @@ const THINKING_LEVEL_LABELS = {
 };
 let currentThinkingLevel = "max";
 let effectiveThinkingLevel = null;
-const READING_MODES = new Set(["original", "bilingual", "translation"]);
+const READING_MODES = new Set(["original", "bilingual", "translation", "contrast"]);
 let currentReadingMode = "bilingual";
 try {
   currentThinkingLevel = normalizeThinkingLevel(localStorage.getItem("hana-paper-reader-thinking-level"));
@@ -255,6 +255,7 @@ function initLayout() {
           <button type="button" class="reading-mode-button" data-reading-mode="original">原文</button>
           <button type="button" class="reading-mode-button" data-reading-mode="bilingual">双语</button>
           <button type="button" class="reading-mode-button" data-reading-mode="translation">译文</button>
+          <button type="button" class="reading-mode-button" data-reading-mode="contrast">对照</button>
         </div>
         <button id="btn-translate-all" class="btn small" style="display:none">翻译全文</button>
         <button id="btn-locate-sync" class="btn small" style="display:none" title="以当前滚动面板为基准，对齐另一侧的同一段落">⌖ 对齐</button>
@@ -305,7 +306,7 @@ function initLayout() {
         </div>
       </div>
 
-      <!-- 双栏阅读器 -->
+      <!-- 双栏与逐段对照阅读器 -->
       <div id="reader-container" class="reader-container" data-reading-mode="bilingual" style="display:none">
         <div id="original-pane" class="pane original">
           <div class="pane-header">
@@ -321,6 +322,14 @@ function initLayout() {
             <span id="trans-status">点击「翻译全文」或各段「译」生成</span>
           </div>
           <div id="trans-blocks"></div>
+        </div>
+
+        <div id="contrast-pane" class="pane contrast" aria-label="英文原文与中文译文逐段对照">
+          <div class="pane-header">
+            <span>CONTRAST (逐段上下对照)</span>
+            <span id="contrast-status">英文在上，中文在下</span>
+          </div>
+          <div id="contrast-blocks"></div>
         </div>
       </div>
 
@@ -522,10 +531,11 @@ function bindEvents() {
   });
   btnDrawerSendChat.addEventListener("click", sendQuoteToSession);
 
-  // 两侧保持独立滚动；只记录用户最后操作的面板，供“对齐同一行”使用。
+  // 双栏两侧独立滚动；「对照」模式使用自己的单栏滚动位置。
   const origPane = document.getElementById("original-pane");
   const transPane = document.getElementById("trans-pane");
-  [origPane, transPane].forEach((pane) => {
+  const contrastPane = document.getElementById("contrast-pane");
+  [origPane, transPane, contrastPane].forEach((pane) => {
     pane.addEventListener("wheel", () => { activePane = pane; }, { passive: true });
     pane.addEventListener("pointerdown", () => { activePane = pane; });
     pane.addEventListener("focusin", () => { activePane = pane; });
@@ -709,13 +719,19 @@ function setReadingMode(mode, options = {}) {
   });
   const originalPane = document.getElementById("original-pane");
   const translationPane = document.getElementById("trans-pane");
+  const contrastPane = document.getElementById("contrast-pane");
   if (mode === "original" && originalPane) activePane = originalPane;
   if (mode === "translation" && translationPane) activePane = translationPane;
+  if (mode === "contrast" && contrastPane) activePane = contrastPane;
+  if (mode === "bilingual" && activePane === contrastPane) activePane = originalPane;
   const align = document.getElementById("btn-locate-sync");
   if (align) align.style.display = currentPaper.blocks.length && mode === "bilingual" ? "inline-flex" : "none";
   if (!options.silent) {
     researchTools?.refresh();
-    if (currentPaper.blocks.length) scheduleResearchSync();
+    if (currentPaper.blocks.length) {
+      scheduleResearchSync();
+      scheduleProgressSync();
+    }
   }
 }
 
@@ -766,6 +782,7 @@ function currentReadingProgress() {
     pageCount: Number(currentPaper.pageCount || 0),
     originalScrollTop: Math.max(0, Number(document.getElementById("original-pane")?.scrollTop || 0)),
     translationScrollTop: Math.max(0, Number(document.getElementById("trans-pane")?.scrollTop || 0)),
+    contrastScrollTop: Math.max(0, Number(document.getElementById("contrast-pane")?.scrollTop || 0)),
     readingMode: currentReadingMode,
     noteDraft: uiState?.noteDraft || {},
     searchState: uiState?.searchState || {},
@@ -902,7 +919,12 @@ function highlightSearchInReader(query, blockId = null, page = null) {
   activeSearchQuery = String(query || "").trim();
   if (!activeSearchQuery) return;
   const targets = blockId
-    ? [document.getElementById(`orig-${blockId}`), document.getElementById(`trans-${blockId}`)].filter(Boolean)
+    ? [
+      document.getElementById(`orig-${blockId}`),
+      document.getElementById(`trans-${blockId}`),
+      document.getElementById(`contrast-orig-${blockId}`),
+      document.getElementById(`contrast-trans-${blockId}`),
+    ].filter(Boolean)
     : [...document.querySelectorAll(".block-copy")];
   const needle = activeSearchQuery.toLocaleLowerCase();
   for (const target of targets) {
@@ -992,7 +1014,7 @@ function locateResearchBlock(blockId, evidence = null) {
   const id = String(blockId || "");
   if (!id) return;
   selectedBlockId = id;
-  for (const [paneId, prefix] of [["original-pane", "orig"], ["trans-pane", "trans"]]) {
+  for (const [paneId, prefix] of [["original-pane", "orig"], ["trans-pane", "trans"], ["contrast-pane", "contrast-orig"]]) {
     const pane = document.getElementById(paneId);
     const target = document.getElementById(`${prefix}-${id}`);
     if (!pane || !target) continue;
@@ -1096,9 +1118,11 @@ async function restorePaperProgress(revision = paperRevision) {
       if (revision !== paperRevision) return;
       const original = document.getElementById("original-pane");
       const translation = document.getElementById("trans-pane");
+      const contrast = document.getElementById("contrast-pane");
       if (original) original.scrollTop = Math.max(0, Number(progress.originalScrollTop || 0));
       if (translation) translation.scrollTop = Math.max(0, Number(progress.translationScrollTop || 0));
-      if (!Number(progress.originalScrollTop) && !Number(progress.translationScrollTop) && progress.blockId) locateResearchBlock(progress.blockId);
+      if (contrast) contrast.scrollTop = Math.max(0, Number(progress.contrastScrollTop || 0));
+      if (!Number(progress.originalScrollTop) && !Number(progress.translationScrollTop) && !Number(progress.contrastScrollTop) && progress.blockId) locateResearchBlock(progress.blockId);
       if (progress.searchState?.query) highlightSearchInReader(progress.searchState.query);
     }, 100);
     if (currentPaper.restored) {
@@ -1236,6 +1260,16 @@ async function updateParseTask(task, patch) {
   } catch {}
 }
 
+function translationTextElements(blockId) {
+  return [...document.querySelectorAll("[data-translation-text][data-id]")]
+    .filter((element) => element.dataset.id === blockId);
+}
+
+function translationBlockElements(blockId) {
+  return [...document.querySelectorAll("[data-translation-block][data-id]")]
+    .filter((element) => element.dataset.id === blockId);
+}
+
 function commitBlockTranslation(blockId, translation, options = {}) {
   const value = String(translation || "").trim();
   if (!value) return;
@@ -1245,11 +1279,10 @@ function commitBlockTranslation(blockId, translation, options = {}) {
     ? { kind: "final", locked: true, updatedAt: new Date().toISOString() }
     : { kind: "ai", locked: false, updatedAt: new Date().toISOString() };
   researchStateRevision += 1;
-  const target = document.getElementById(`trans-text-${blockId}`);
-  if (target) {
+  translationTextElements(blockId).forEach((target) => {
     target.innerHTML = formatMath(escapeHtml(value));
     target.classList.remove("trans-empty-tip");
-  }
+  });
   setBlockTranslationAction(blockId, options.kind === "final" ? "编辑定稿" : "重新翻译");
   updateTranslationStateUi(blockId);
   scheduleResearchSync();
@@ -1332,6 +1365,19 @@ function locateSameBlock(sourcePane = activePane) {
 }
 
 function alignTranslationBlock(blockId) {
+  const contrastPane = document.getElementById("contrast-pane");
+  if (currentReadingMode === "contrast" && contrastPane) {
+    const source = document.getElementById(`contrast-orig-${blockId}`);
+    const target = document.getElementById(`contrast-trans-${blockId}`);
+    activePane = contrastPane;
+    source?.classList.add("locate-flash");
+    target?.classList.add("locate-flash");
+    window.setTimeout(() => {
+      source?.classList.remove("locate-flash");
+      target?.classList.remove("locate-flash");
+    }, 700);
+    return;
+  }
   const originalPane = document.getElementById("original-pane");
   const translationPane = document.getElementById("trans-pane");
   const sourceBlock = document.getElementById(`orig-${blockId}`);
@@ -2029,6 +2075,7 @@ function loadPaper(paper) {
   setReadingMode(currentReadingMode, { silent: true });
   document.getElementById("original-pane").scrollTop = 0;
   document.getElementById("trans-pane").scrollTop = 0;
+  document.getElementById("contrast-pane").scrollTop = 0;
   void (async () => {
     if (!isPaperHash(currentPaper.paperHash)) {
       try { currentPaper.paperHash = await hashPaperSource(currentPaper); } catch {}
@@ -2177,42 +2224,75 @@ function renderStructuredVisual(block, translated) {
   return `${media}${table}${latex}${fallback}`;
 }
 
-function renderBlock(block, translated) {
+function renderBlock(block, translated, options = {}) {
   const id = escapeAttr(block.id);
   const rawId = String(block.id || "");
   const anchor = escapeAttr(citationAnchorForBlock(block));
   const page = Number(block.page) > 0 ? Number(block.page) : 1;
   const translationSource = translationTextForBlock(block);
   const existingTranslation = currentPaper.translations?.[rawId];
-  const visual = renderStructuredVisual(block, translated);
+  const blockPrefix = options.blockPrefix || (translated ? "trans" : "orig");
+  const textPrefix = options.textPrefix || "trans-text";
+  const visual = options.showVisual === false ? "" : renderStructuredVisual(block, translated);
   let text = "";
   if (translationSource) {
     text = translated
       ? (existingTranslation
-        ? `<span id="trans-text-${id}" class="block-text" data-id="${id}">${formatMath(escapeHtml(existingTranslation))}</span>`
-        : `<span id="trans-text-${id}" class="block-text trans-empty-tip" data-id="${id}">[ 点击翻译本段 ]</span>`)
+        ? `<span id="${textPrefix}-${id}" class="block-text" data-id="${id}" data-translation-text>${formatMath(escapeHtml(existingTranslation))}</span>`
+        : `<span id="${textPrefix}-${id}" class="block-text trans-empty-tip" data-id="${id}" data-translation-text>[ 点击翻译本段 ]</span>`)
       : `<span class="block-text">${formatMath(escapeHtml(translationSource))}</span>`;
   }
   const state = translationState(rawId);
   const action = state.kind === "final" ? "编辑定稿" : (existingTranslation ? "重新翻译" : "译");
-  const translateAction = translationSource
+  const translateAction = options.showTranslateAction !== false && translationSource
     ? `<button class="btn-block-action btn-trans-single" data-id="${id}" title="${state.kind === "final" ? "编辑用户定稿" : "翻译此段"}">${action}</button>`
     : "";
-  const finalizeAction = translated && existingTranslation
+  const finalizeAction = options.showFinalizeAction !== false && translated && existingTranslation
     ? `<button class="btn-block-action btn-edit-translation" data-id="${id}" title="编辑并保存为用户定稿">${state.kind === "final" ? "已定稿" : "定稿"}</button>`
     : "";
-  const citationAction = `<button class="btn-block-action btn-copy-citation" data-id="${id}" title="复制 Page ${page} / block ${escapeAttr(rawId)} 引用">引用</button>`;
-  const actionButton = `<div class="block-actions">${citationAction}${translateAction}${finalizeAction}</div>`;
+  const citationAction = options.showCitationAction === false
+    ? ""
+    : `<button class="btn-block-action btn-copy-citation" data-id="${id}" title="复制 Page ${page} / block ${escapeAttr(rawId)} 引用">引用</button>`;
+  const actions = `${citationAction}${translateAction}${finalizeAction}`;
+  const actionButton = actions ? `<div class="block-actions">${actions}</div>` : "";
   const tag = block.type !== "paragraph"
     ? `<span class="tag-pill">${translated && translationSource ? "对照 · " : ""}${escapeHtml(blockTypeLabel(block))}</span>`
     : "";
-  return `<div id="${translated ? "trans" : "orig"}-${id}" class="block ${escapeAttr(block.type || "paragraph")}${visual ? " structured-block" : ""}" data-id="${id}" data-citation-anchor="${anchor}" data-page="${page}">
+  return `<div id="${blockPrefix}-${id}" class="block ${escapeAttr(block.type || "paragraph")}${visual ? " structured-block" : ""}" data-id="${id}" data-citation-anchor="${anchor}" data-page="${page}"${translated ? " data-translation-block" : ""}>
     ${actionButton}
     ${tag}
     ${translated && existingTranslation ? `<span class="translation-state-badge ${state.kind === "final" ? "final" : "ai"}" data-translation-state="${id}">${state.kind === "final" ? "用户定稿" : "AI 译文"}</span>` : ""}
     ${visual}
     ${text ? `<div class="block-copy">${text}</div>` : ""}
   </div>`;
+}
+
+function renderContrastPair(block) {
+  const id = escapeAttr(block.id);
+  const translationSource = translationTextForBlock(block);
+  const original = renderBlock(block, false, {
+    blockPrefix: "contrast-orig",
+    showFinalizeAction: false,
+  });
+  const translation = translationSource
+    ? `<div class="contrast-part contrast-translation">
+        <div class="contrast-language-label">中文译文</div>
+        ${renderBlock(block, true, {
+          blockPrefix: "contrast-trans",
+          textPrefix: "contrast-trans-text",
+          showVisual: false,
+          showTranslateAction: false,
+          showCitationAction: false,
+        })}
+      </div>`
+    : "";
+  return `<article id="contrast-pair-${id}" class="contrast-pair${translationSource ? "" : " contrast-source-only"}" data-id="${id}">
+    <div class="contrast-part contrast-original">
+      <div class="contrast-language-label">English original</div>
+      ${original}
+    </div>
+    ${translation}
+  </article>`;
 }
 
 function renderPdfVisualPreview(page, translated) {
@@ -2246,38 +2326,57 @@ function renderPage(page, blocks, translated) {
   </section>`;
 }
 
+function renderContrastPage(page, blocks) {
+  const pageLabel = `<div class="pdf-page-label">Page ${page} · 逐段上下对照</div>`;
+  const visualPreview = renderPdfVisualPreview(page, false);
+  return `<section class="pdf-page contrast-page" data-page="${page}">
+    ${pageLabel}
+    ${visualPreview}
+    <div class="contrast-page-flow">${blocks.map((block) => renderContrastPair(block)).join("")}</div>
+  </section>`;
+}
+
 function updateTranslationStateUi(blockId) {
   const state = translationState(blockId);
-  const translationBlock = document.getElementById(`trans-${blockId}`);
-  if (!translationBlock || state.kind === "none") return;
-  let badge = translationBlock.querySelector("[data-translation-state]");
-  if (!badge) {
-    badge = document.createElement("span");
-    badge.dataset.translationState = blockId;
-    const insertionPoint = translationBlock.querySelector(".structured-visual, .structured-table-wrap, .equation-display, .block-copy");
-    translationBlock.insertBefore(badge, insertionPoint || null);
-  }
-  badge.className = `translation-state-badge ${state.kind === "final" ? "final" : "ai"}`;
-  badge.textContent = state.kind === "final" ? "用户定稿" : "AI 译文";
-  let editButton = translationBlock.querySelector(".btn-edit-translation");
-  if (!editButton) {
-    editButton = document.createElement("button");
-    editButton.type = "button";
-    editButton.className = "btn-block-action btn-edit-translation";
-    editButton.dataset.id = blockId;
-    editButton.title = "编辑并保存为用户定稿";
-    editButton.addEventListener("click", (event) => {
-      event.stopPropagation();
-      openTranslationEditor(blockId);
-    });
-    translationBlock.querySelector(".block-actions")?.appendChild(editButton);
-  }
-  editButton.textContent = state.kind === "final" ? "已定稿" : "定稿";
+  if (state.kind === "none") return;
+  translationBlockElements(blockId).forEach((translationBlock) => {
+    let badge = translationBlock.querySelector("[data-translation-state]");
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.dataset.translationState = blockId;
+      const insertionPoint = translationBlock.querySelector(".structured-visual, .structured-table-wrap, .equation-display, .block-copy");
+      translationBlock.insertBefore(badge, insertionPoint || null);
+    }
+    badge.className = `translation-state-badge ${state.kind === "final" ? "final" : "ai"}`;
+    badge.textContent = state.kind === "final" ? "用户定稿" : "AI 译文";
+    let actions = translationBlock.querySelector(".block-actions");
+    if (!actions) {
+      actions = document.createElement("div");
+      actions.className = "block-actions";
+      translationBlock.prepend(actions);
+    }
+    let editButton = actions.querySelector(".btn-edit-translation");
+    if (!editButton) {
+      editButton = document.createElement("button");
+      editButton.type = "button";
+      editButton.className = "btn-block-action btn-edit-translation";
+      editButton.dataset.id = blockId;
+      editButton.title = "编辑并保存为用户定稿";
+      editButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openTranslationEditor(blockId);
+      });
+      actions.appendChild(editButton);
+    }
+    editButton.textContent = state.kind === "final" ? "已定稿" : "定稿";
+  });
 }
 
 function openTranslationEditor(blockId) {
   if (currentReadingMode === "original") setReadingMode("translation");
-  const target = document.getElementById(`trans-text-${blockId}`);
+  const target = currentReadingMode === "contrast"
+    ? document.getElementById(`contrast-trans-text-${blockId}`)
+    : document.getElementById(`trans-text-${blockId}`);
   const current = String(currentPaper.translations?.[blockId] || "");
   if (!target || !current || target.parentElement?.querySelector(".translation-editor")) return;
   const editor = document.createElement("div");
@@ -2318,10 +2417,12 @@ function openTranslationEditor(blockId) {
 function renderBlocks() {
   const origContainer = document.getElementById("orig-blocks");
   const transContainer = document.getElementById("trans-blocks");
+  const contrastContainer = document.getElementById("contrast-blocks");
   const pages = blockGroupsByPage();
 
   origContainer.innerHTML = pages.map(([page, blocks]) => renderPage(page, blocks, false)).join("");
   transContainer.innerHTML = pages.map(([page, blocks]) => renderPage(page, blocks, true)).join("");
+  contrastContainer.innerHTML = pages.map(([page, blocks]) => renderContrastPage(page, blocks)).join("");
   bindPdfPreviewControls();
   observePdfPreviewPages(pdfPreviewGeneration);
 
@@ -2381,15 +2482,15 @@ function setBlockTranslationAction(blockId, label) {
 }
 
 function setTranslationPlaceholder(blockId, message, retryable = false) {
-  const target = document.getElementById(`trans-text-${blockId}`);
-  if (!target) return;
-  if (retryable) {
-    target.textContent = message;
-    target.classList.add("trans-empty-tip");
-  } else {
-    target.innerHTML = `<span class="trans-loading">${escapeHtml(message)}</span>`;
-    target.classList.remove("trans-empty-tip");
-  }
+  translationTextElements(blockId).forEach((target) => {
+    if (retryable) {
+      target.textContent = message;
+      target.classList.add("trans-empty-tip");
+    } else {
+      target.innerHTML = `<span class="trans-loading">${escapeHtml(message)}</span>`;
+      target.classList.remove("trans-empty-tip");
+    }
+  });
 }
 
 function citationTextForBlock(block, selected = "") {
@@ -2570,7 +2671,7 @@ function handleTextSelection() {
   selectedText = text;
   selectedContext = node.textContent.trim();
   selectedBlockId = node.getAttribute("data-id") || selectedBlockId;
-  selectedFromTranslation = Boolean(node.closest("#trans-pane"));
+  selectedFromTranslation = Boolean(node.closest("[data-translation-block]"));
 
   const range = selection.getRangeAt(0);
   const rect = range.getBoundingClientRect();

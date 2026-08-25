@@ -276,16 +276,18 @@ test("precise progress persists reading mode scroll positions drafts and search 
     blockId: "mineru_p1_b2",
     page: 1,
     percent: 21,
-    readingMode: "translation",
+    readingMode: "contrast",
     originalScrollTop: 120,
     translationScrollTop: 340,
+    contrastScrollTop: 560,
     noteDraft: { note: "unfinished", noteType: "question" },
     searchState: { query: "water", scope: "section", language: "both", types: ["body"] },
   });
   const progress = workspace.getProgress(hash);
-  assert.equal(progress.readingMode, "translation");
+  assert.equal(progress.readingMode, "contrast");
   assert.equal(progress.originalScrollTop, 120);
   assert.equal(progress.translationScrollTop, 340);
+  assert.equal(progress.contrastScrollTop, 560);
   assert.equal(progress.noteDraft.note, "unfinished");
   assert.equal(progress.searchState.scope, "section");
 });

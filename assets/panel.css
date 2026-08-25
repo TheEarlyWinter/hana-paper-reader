@@ -454,13 +454,20 @@ html, body, #root {
 }
 
 .reader-container[data-reading-mode="original"] .pane.original,
-.reader-container[data-reading-mode="translation"] .pane.translation {
+.reader-container[data-reading-mode="translation"] .pane.translation,
+.reader-container[data-reading-mode="contrast"] .pane.contrast {
   flex: 1 1 100%;
   border: 0;
 }
 
 .reader-container[data-reading-mode="original"] .pane.translation,
-.reader-container[data-reading-mode="translation"] .pane.original {
+.reader-container[data-reading-mode="translation"] .pane.original,
+.reader-container[data-reading-mode="contrast"] .pane.original,
+.reader-container[data-reading-mode="contrast"] .pane.translation {
+  display: none;
+}
+
+.reader-container:not([data-reading-mode="contrast"]) .pane.contrast {
   display: none;
 }
 
@@ -480,6 +487,17 @@ html, body, #root {
 
 .pane.translation {
   background: var(--bg-card);
+}
+
+.pane.contrast {
+  background: var(--bg);
+}
+
+.pane.contrast > .pane-header,
+#contrast-blocks {
+  width: min(100%, 980px);
+  margin-left: auto;
+  margin-right: auto;
 }
 
 .pane-header {
@@ -614,6 +632,65 @@ html, body, #root {
 
 .single-page .block:last-child {
   margin-bottom: 8px;
+}
+
+.contrast-page-flow {
+  display: grid;
+  gap: 22px;
+}
+
+.contrast-pair {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--bg-card);
+  box-shadow: 0 2px 12px rgba(42, 38, 34, 0.045);
+}
+
+.contrast-part {
+  position: relative;
+}
+
+.contrast-original {
+  background: var(--bg);
+}
+
+.contrast-translation {
+  border-top: 1px solid var(--border);
+  background: var(--bg-card);
+}
+
+.contrast-language-label {
+  padding: 10px 14px 0;
+  color: var(--text-muted);
+  font: 600 0.65rem/1.35 var(--font-ui);
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+.contrast-translation .contrast-language-label {
+  color: var(--accent);
+  text-transform: none;
+}
+
+.contrast-pair .block {
+  margin: 0;
+  padding: 9px 14px 16px;
+  border: 0;
+  border-radius: 0;
+}
+
+.contrast-pair .block:hover,
+.contrast-pair .block.highlight {
+  border-color: transparent;
+}
+
+.contrast-pair .block.heading {
+  margin-top: 0;
+}
+
+.contrast-source-only .contrast-original {
+  padding-bottom: 2px;
 }
 
 /* 段落与标题样式 */

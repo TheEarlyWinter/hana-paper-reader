@@ -2,11 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { parsePdfWithMineru, readMineruAsset } from "../lib/mineru.js";
-import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.6.1-r1";
-import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.6.1-r1";
+import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.6.2-r1";
+import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.6.2-r1";
 
 const AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
-const PLUGIN_API_VERSION = "0.6.1";
+const PLUGIN_API_VERSION = "0.6.2";
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 const MAX_LEGACY_BASE64_CHARS = Math.ceil(MAX_PDF_BYTES / 3) * 4;
 const MAX_LEGACY_JSON_BYTES = MAX_LEGACY_BASE64_CHARS + 1024 * 1024;
@@ -644,7 +644,7 @@ function publicCachedPaper(paper) {
     resources: Array.isArray(paper.resources) ? paper.resources : [],
     translations: paper.translations || {},
     translationStates: paper.translationStates || {},
-    readingMode: ["original", "bilingual", "translation"].includes(paper.readingMode) ? paper.readingMode : "bilingual",
+    readingMode: ["original", "bilingual", "translation", "contrast"].includes(paper.readingMode) ? paper.readingMode : "bilingual",
     structureDetached: paper.structureDetached === true || paper.parser?.structureDetached === true,
     translationGlossaryVersion: Number.isInteger(Number(paper.translationGlossaryVersion)) ? Number(paper.translationGlossaryVersion) : 0,
     createdAt: paper.createdAt || null,
