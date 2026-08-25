@@ -1,6 +1,6 @@
 const PROTOCOL = "hana.plugin.ui";
 const VERSION = 1;
-const UI_VERSION = "0.6.2";
+const UI_VERSION = "0.6.3";
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 let seq = 0;
 
@@ -175,6 +175,9 @@ const blockTranslationRunIds = new Map();
 let selectedText = "";
 let selectedContext = "";
 let selectedFromTranslation = false;
+let sessionTargets = [];
+let selectedSessionTargetId = null;
+let sessionPickerBusy = false;
 const THINKING_LEVEL_ORDER = ["off", "low", "medium", "high", "max"];
 const THINKING_LEVEL_LABELS = {
   off: "无",
@@ -388,8 +391,31 @@ function initLayout() {
         <button id="btn-ask-formula" class="tool-btn">📐 公式拆解</button>
         <button id="btn-ask-explain" class="tool-btn">🔍 概念解析</button>
         <button id="btn-create-note" class="tool-btn">📝 创建研究笔记</button>
-        <button id="btn-send-session" class="tool-btn">✉️ 发送到会话</button>
+        <button id="btn-send-session" class="tool-btn">✉️ 选择对话…</button>
         <button id="btn-copy-quote" class="tool-btn">📋 复制</button>
+      </div>
+
+      <!-- 会话目标选择器 -->
+      <div id="session-target-modal" class="session-target-modal" aria-hidden="true">
+        <div class="session-target-backdrop" data-close-session-targets></div>
+        <section class="session-target-dialog" role="dialog" aria-modal="true" aria-labelledby="session-target-title">
+          <div class="session-target-header">
+            <div>
+              <h2 id="session-target-title">发送到对话</h2>
+              <p id="session-target-summary">选择一个已有对话接收这段论文引用。</p>
+            </div>
+            <button id="btn-close-session-targets" class="icon-button" type="button" aria-label="关闭对话选择">✕</button>
+          </div>
+          <div id="session-target-status" class="session-target-status" role="status"></div>
+          <div id="session-target-list" class="session-target-list"></div>
+          <div class="session-target-footer">
+            <button id="btn-create-session-and-send" class="btn small">新建对话并发送</button>
+            <div class="session-target-footer-actions">
+              <button id="btn-cancel-session-targets" class="btn small" type="button">取消</button>
+              <button id="btn-confirm-session-target" class="btn primary small" type="button" disabled>发送到所选对话</button>
+            </div>
+          </div>
+        </section>
       </div>
 
       <!-- 右侧滑出解答抽屉 -->
@@ -409,7 +435,7 @@ function initLayout() {
           <div id="drawer-content" class="drawer-content">正在认真研读并分析文献要点...</div>
         </div>
         <div class="drawer-footer">
-          <button id="btn-drawer-send-chat" class="btn small primary">✉️ 发送到主聊天</button>
+          <button id="btn-drawer-send-chat" class="btn small primary">✉️ 选择对话…</button>
           <span style="font-size:0.7rem;color:var(--text-muted)">Hana Paper Companion</span>
         </div>
       </div>
@@ -442,6 +468,12 @@ function bindEvents() {
   const dragOverlay = document.getElementById("drag-overlay");
   const btnCloseDrawer = document.getElementById("btn-close-drawer");
   const btnDrawerSendChat = document.getElementById("btn-drawer-send-chat");
+  const sessionTargetModal = document.getElementById("session-target-modal");
+  const sessionTargetList = document.getElementById("session-target-list");
+  const btnCloseSessionTargets = document.getElementById("btn-close-session-targets");
+  const btnCancelSessionTargets = document.getElementById("btn-cancel-session-targets");
+  const btnConfirmSessionTarget = document.getElementById("btn-confirm-session-target");
+  const btnCreateSessionAndSend = document.getElementById("btn-create-session-and-send");
 
   btnOpenFile.addEventListener("click", () => fileInput.click());
   btnEmptyImport.addEventListener("click", () => fileInput.click());
@@ -469,9 +501,12 @@ function bindEvents() {
   document.getElementById("btn-save-mineru-settings").addEventListener("click", saveMineruSettings);
   document.getElementById("btn-clear-mineru-token").addEventListener("click", clearMineruToken);
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && document.getElementById("mineru-settings-modal")?.classList.contains("open")) {
+    if (event.key !== "Escape") return;
+    if (document.getElementById("mineru-settings-modal")?.classList.contains("open")) {
       closeMineruSettings(true);
+      return;
     }
+    if (sessionTargetModal?.classList.contains("open")) closeSessionTargetPicker();
   });
   thinkingLevelSelect.addEventListener("change", () => {
     currentThinkingLevel = normalizeThinkingLevel(thinkingLevelSelect.value);
@@ -523,13 +558,22 @@ function bindEvents() {
   document.getElementById("btn-ask-formula").addEventListener("click", () => askAgentQuestion("formula"));
   document.getElementById("btn-ask-explain").addEventListener("click", () => askAgentQuestion("explain"));
   document.getElementById("btn-create-note").addEventListener("click", () => void createNoteFromSelection());
-  document.getElementById("btn-send-session").addEventListener("click", sendQuoteToSession);
+  document.getElementById("btn-send-session").addEventListener("click", () => void openSessionTargetPicker());
   document.getElementById("btn-copy-quote").addEventListener("click", copyQuoteText);
 
   btnCloseDrawer.addEventListener("click", () => {
     document.getElementById("answer-drawer").classList.remove("open");
   });
-  btnDrawerSendChat.addEventListener("click", sendQuoteToSession);
+  btnDrawerSendChat.addEventListener("click", () => void openSessionTargetPicker());
+  btnCloseSessionTargets.addEventListener("click", closeSessionTargetPicker);
+  btnCancelSessionTargets.addEventListener("click", closeSessionTargetPicker);
+  document.querySelector("[data-close-session-targets]").addEventListener("click", closeSessionTargetPicker);
+  sessionTargetList.addEventListener("click", (event) => {
+    const option = event.target.closest("[data-session-target-id]");
+    if (option) selectSessionTarget(option.dataset.sessionTargetId);
+  });
+  btnConfirmSessionTarget.addEventListener("click", () => void confirmSelectedSessionTarget());
+  btnCreateSessionAndSend.addEventListener("click", () => void createSessionAndSend());
 
   // 双栏两侧独立滚动；「对照」模式使用自己的单栏滚动位置。
   const origPane = document.getElementById("original-pane");
@@ -2729,36 +2773,197 @@ async function askAgentQuestion(questionType = "default") {
   }
 }
 
-async function sendQuoteToSession() {
-  document.getElementById("selection-toolbar").style.display = "none";
+function sessionQuotePayload() {
   const selectedBlock = currentPaper.blocks.find((block) => block.id === selectedBlockId) || null;
   const citation = selectedBlock ? `Page ${Number(selectedBlock.page || 1)} / block ${selectedBlock.id}` : "";
-  const textToCopy = `【论文划选研讨】\n论文：${currentPaper.title}\n${citation ? `来源：${citation}\n` : ""}选中文本：${selectedText}\n上下文：${selectedContext}`;
-  let copied = false;
-  copied = await copyTextToClipboard(textToCopy);
+  return {
+    agentId: currentAgent.id,
+    quote: selectedText,
+    context: `${selectedContext}${citation ? `\n来源：${citation}` : ""}`,
+    paperTitle: currentPaper.title,
+    paperHash: currentPaper.paperHash,
+    blockId: selectedBlock?.id || null,
+    page: selectedBlock?.page || null,
+    thinkingLevel: currentThinkingLevel,
+    citation,
+  };
+}
 
-  try {
-    const res = await pluginApiFetch("/api/send-to-session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        agentId: currentAgent.id,
-        quote: selectedText,
-        context: `${selectedContext}${citation ? `\n来源：${citation}` : ""}`,
-        paperTitle: currentPaper.title,
-        paperHash: currentPaper.paperHash,
-        blockId: selectedBlock?.id || null,
-        page: selectedBlock?.page || null,
-        thinkingLevel: currentThinkingLevel,
-      })
-    });
-    const data = await res.json();
-    applyEffectiveThinkingLevel(data);
-    if (!data.ok) throw new Error(data.error || "send failed");
-    await safeToast({ message: copied ? "已发送到助手会话，引用也已复制" : "已发送到助手会话", type: "success" });
-  } catch (err) {
-    await safeToast({ message: copied ? "已复制引用；会话发送失败，请稍后重试" : "会话发送失败，请稍后重试", type: "error" });
+function sessionQuoteForClipboard(payload) {
+  return `【论文划选研讨】\n论文：${currentPaper.title}\n${payload.citation ? `来源：${payload.citation}\n` : ""}选中文本：${selectedText}\n上下文：${selectedContext}`;
+}
+
+function formatSessionTargetDate(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", { dateStyle: "short", timeStyle: "short" });
+}
+
+function setSessionTargetStatus(message, tone = "") {
+  const status = document.getElementById("session-target-status");
+  if (!status) return;
+  status.textContent = String(message || "");
+  status.dataset.tone = tone;
+}
+
+function renderSessionTargets() {
+  const list = document.getElementById("session-target-list");
+  const confirm = document.getElementById("btn-confirm-session-target");
+  if (!list || !confirm) return;
+  confirm.disabled = sessionPickerBusy || !selectedSessionTargetId;
+  if (!sessionTargets.length) {
+    list.innerHTML = `<div class="session-target-empty">没有可选的已有对话。你可以新建一个对话并发送。</div>`;
+    return;
   }
+  list.innerHTML = sessionTargets.map((target) => {
+    const selected = target.targetId === selectedSessionTargetId;
+    const agent = target.agentName || target.agentId || "Hana 助手";
+    const modified = formatSessionTargetDate(target.modified);
+    const meta = [agent, modified, Number(target.messageCount) > 0 ? `${target.messageCount} 条消息` : ""].filter(Boolean).join(" · ");
+    return `<button type="button" class="session-target-option${selected ? " selected" : ""}" data-session-target-id="${escapeAttr(target.targetId)}" aria-pressed="${selected}">
+      <span class="session-target-option-main">
+        <strong>${escapeHtml(target.title || "未命名对话")}</strong>
+        <span>${escapeHtml(meta || "公开对话")}</span>
+      </span>
+      <span class="session-target-option-mark" aria-hidden="true">${selected ? "✓" : ""}</span>
+    </button>`;
+  }).join("");
+}
+
+function closeSessionTargetPicker(force = false) {
+  const modal = document.getElementById("session-target-modal");
+  if (!modal || (sessionPickerBusy && !force)) return;
+  modal.classList.remove("open");
+  modal.setAttribute("aria-hidden", "true");
+  selectedSessionTargetId = null;
+  setSessionTargetStatus("");
+}
+
+function selectSessionTarget(targetId) {
+  if (sessionPickerBusy) return;
+  const target = sessionTargets.find((item) => item.targetId === targetId);
+  if (!target) return;
+  selectedSessionTargetId = target.targetId;
+  setSessionTargetStatus(`已选择：${target.title || "未命名对话"}`);
+  renderSessionTargets();
+}
+
+async function openSessionTargetPicker() {
+  document.getElementById("selection-toolbar").style.display = "none";
+  if (!selectedText || selectedText.length < 2) {
+    await safeToast({ message: "请先划选一段原文或译文", type: "error" });
+    return;
+  }
+  const modal = document.getElementById("session-target-modal");
+  if (!modal || sessionPickerBusy) return;
+  modal.classList.add("open");
+  modal.setAttribute("aria-hidden", "false");
+  selectedSessionTargetId = null;
+  sessionTargets = [];
+  setSessionTargetStatus("正在读取可选对话…", "loading");
+  renderSessionTargets();
+  sessionPickerBusy = true;
+  renderSessionTargets();
+  try {
+    const res = await pluginApiFetch("/api/session-targets");
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || "无法读取对话列表");
+    sessionTargets = Array.isArray(data.sessions) ? data.sessions.filter((item) => item?.targetId) : [];
+    setSessionTargetStatus(sessionTargets.length ? "请选择一个已有对话。" : "没有可选的已有对话。", sessionTargets.length ? "" : "empty");
+    renderSessionTargets();
+  } catch (error) {
+    sessionTargets = [];
+    setSessionTargetStatus(error?.message || "无法读取对话列表，请稍后重试。", "error");
+    renderSessionTargets();
+  } finally {
+    sessionPickerBusy = false;
+    renderSessionTargets();
+  }
+}
+
+async function postSessionQuote(route, extra = {}) {
+  const payload = sessionQuotePayload();
+  const res = await pluginApiFetch(route, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...payload, ...extra }),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.ok) {
+    const error = new Error(data.error || "发送失败");
+    error.code = data.code || null;
+    error.status = res.status;
+    throw error;
+  }
+  return { data, payload };
+}
+
+async function confirmSelectedSessionTarget() {
+  if (sessionPickerBusy || !selectedSessionTargetId) return;
+  sessionPickerBusy = true;
+  setSessionTargetStatus("正在发送到所选对话…", "loading");
+  renderSessionTargets();
+  try {
+    const result = await postSessionQuote("/api/send-to-session", { targetId: selectedSessionTargetId });
+    const verifiedPayload = { ...result.payload, citation: typeof result.data.citation === "string" ? result.data.citation : "" };
+    const copied = await copyTextToClipboard(sessionQuoteForClipboard(verifiedPayload));
+    const title = result.data.session?.title || "所选对话";
+    closeSessionTargetPicker(true);
+    await safeToast({ message: copied ? `已发送到“${title}”，引用也已复制` : `已发送到“${title}”`, type: "success" });
+  } catch (error) {
+    setSessionTargetStatus(error?.message || "发送失败，请稍后重试。", "error");
+    if (error?.code === "session_target_expired") {
+      sessionTargets = [];
+      selectedSessionTargetId = null;
+      await reloadSessionTargetsInPicker();
+    }
+  } finally {
+    sessionPickerBusy = false;
+    renderSessionTargets();
+  }
+}
+
+async function reloadSessionTargetsInPicker() {
+  if (!document.getElementById("session-target-modal")?.classList.contains("open")) return;
+  sessionPickerBusy = true;
+  setSessionTargetStatus("正在刷新对话列表…", "loading");
+  renderSessionTargets();
+  try {
+    const res = await pluginApiFetch("/api/session-targets");
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || "无法读取对话列表");
+    sessionTargets = Array.isArray(data.sessions) ? data.sessions.filter((item) => item?.targetId) : [];
+    setSessionTargetStatus("请选择一个已有对话。", "");
+  } catch (error) {
+    setSessionTargetStatus(error?.message || "无法读取对话列表，请稍后重试。", "error");
+  } finally {
+    sessionPickerBusy = false;
+    renderSessionTargets();
+  }
+}
+
+async function createSessionAndSend() {
+  if (sessionPickerBusy) return;
+  sessionPickerBusy = true;
+  setSessionTargetStatus("正在新建对话并发送…", "loading");
+  renderSessionTargets();
+  try {
+    const result = await postSessionQuote("/api/create-session-and-send");
+    const verifiedPayload = { ...result.payload, citation: typeof result.data.citation === "string" ? result.data.citation : "" };
+    const copied = await copyTextToClipboard(sessionQuoteForClipboard(verifiedPayload));
+    closeSessionTargetPicker(true);
+    await safeToast({ message: copied ? "已新建对话并发送，引用也已复制" : "已新建对话并发送", type: "success" });
+  } catch (error) {
+    setSessionTargetStatus(error?.message || "新建对话失败，请稍后重试。", "error");
+  } finally {
+    sessionPickerBusy = false;
+    renderSessionTargets();
+  }
+}
+
+async function sendQuoteToSession() {
+  await openSessionTargetPicker();
 }
 
 async function copyQuoteText() {

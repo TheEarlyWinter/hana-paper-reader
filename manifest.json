@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "id": "hana-paper-reader",
   "name": "Hana Paper Reader",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "证据驱动的学术论文精读工作台，支持四类证据型笔记、可解释论文内检索、图表证据区、每篇论文独立存储、数据分项清理与备份恢复。",
   "minAppVersion": "0.358.0",
   "trust": "full-access",

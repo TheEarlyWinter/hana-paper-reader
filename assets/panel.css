@@ -1180,6 +1180,168 @@ mark[data-hpr-search] {
   background: var(--accent-hover);
 }
 
+/* 会话目标选择器 */
+.session-target-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 2100;
+  display: none;
+  place-items: center;
+  padding: 18px;
+}
+
+.session-target-modal.open {
+  display: grid;
+}
+
+.session-target-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(42, 38, 34, 0.45);
+  backdrop-filter: blur(2px);
+}
+
+.session-target-dialog {
+  position: relative;
+  width: min(620px, 100%);
+  max-height: min(720px, calc(100vh - 36px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-card);
+  box-shadow: 0 20px 60px rgba(42, 38, 34, 0.24);
+}
+
+.session-target-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 22px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-target-header h2 {
+  color: var(--text);
+  font: 600 1.2rem/1.25 var(--font-serif);
+}
+
+.session-target-header p {
+  margin-top: 5px;
+  color: var(--text-muted);
+  font: 0.76rem/1.5 var(--font-ui);
+}
+
+.session-target-status {
+  min-height: 22px;
+  padding: 10px 22px 0;
+  color: var(--text-muted);
+  font: 0.78rem/1.4 var(--font-ui);
+}
+
+.session-target-status[data-tone="error"] {
+  color: var(--danger, #a14d4d);
+}
+
+.session-target-status[data-tone="loading"] {
+  color: var(--accent);
+}
+
+.session-target-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 120px;
+  max-height: min(470px, calc(100vh - 230px));
+  padding: 12px 22px 18px;
+  overflow-y: auto;
+}
+
+.session-target-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.session-target-option:hover,
+.session-target-option.selected {
+  border-color: var(--accent);
+  background: var(--accent-light);
+}
+
+.session-target-option:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.session-target-option-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.session-target-option-main strong,
+.session-target-option-main span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-target-option-main strong {
+  font: 600 0.86rem/1.3 var(--font-ui);
+}
+
+.session-target-option-main span {
+  color: var(--text-muted);
+  font: 0.72rem/1.3 var(--font-ui);
+}
+
+.session-target-option-mark {
+  flex: 0 0 20px;
+  color: var(--accent);
+  font-weight: 700;
+  text-align: center;
+}
+
+.session-target-empty {
+  display: grid;
+  min-height: 100px;
+  place-items: center;
+  padding: 20px;
+  border: 1px dashed var(--border);
+  color: var(--text-muted);
+  font: 0.8rem/1.5 var(--font-ui);
+  text-align: center;
+}
+
+.session-target-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px 22px 18px;
+  border-top: 1px solid var(--border);
+}
+
+.session-target-footer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* 侧边滑出解答抽屉 */
 .answer-drawer {
   position: absolute;
@@ -1354,6 +1516,10 @@ mark[data-hpr-search] {
     max-width: calc(100vw - 20px);
     overflow-x: auto;
   }
+
+  .session-target-dialog {
+    width: min(100%, 620px);
+  }
 }
 
 @media (max-width: 520px) {
@@ -1417,6 +1583,35 @@ mark[data-hpr-search] {
   .settings-dialog-footer {
     align-items: stretch;
     flex-direction: column-reverse;
+  }
+
+  .session-target-modal {
+    padding: 10px;
+  }
+
+  .session-target-dialog {
+    max-height: calc(100vh - 20px);
+  }
+
+  .session-target-header,
+  .session-target-status,
+  .session-target-list,
+  .session-target-footer {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .session-target-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .session-target-footer-actions {
+    width: 100%;
+  }
+
+  .session-target-footer-actions .btn {
+    flex: 1;
   }
 
   .settings-footer-actions {

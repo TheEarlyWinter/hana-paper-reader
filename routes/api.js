@@ -1,12 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { randomUUID } from "node:crypto";
 import { parsePdfWithMineru, readMineruAsset } from "../lib/mineru.js";
-import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.6.2-r1";
-import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.6.2-r1";
+import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.6.3-r1";
+import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.6.3-r1";
 
 const AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
-const PLUGIN_API_VERSION = "0.6.2";
+const PLUGIN_API_VERSION = "0.6.3";
+const MAX_SESSION_TARGETS = 200;
+const MAX_SESSION_ID_LENGTH = 256;
+const MAX_SESSION_TARGET_ID_LENGTH = 96;
+const SESSION_TARGET_TTL_MS = 15 * 60 * 1000;
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 const MAX_LEGACY_BASE64_CHARS = Math.ceil(MAX_PDF_BYTES / 3) * 4;
 const MAX_LEGACY_JSON_BYTES = MAX_LEGACY_BASE64_CHARS + 1024 * 1024;
@@ -19,6 +24,7 @@ const DEFAULT_THINKING_LEVEL = "max";
 const HIDDEN_AGENT_IDS = new Set(["one", "one-2", "one-3", "image2", "agent-mqz22q9q"]);
 const agentSessionCache = new Map();
 const agentTurnLocks = new Map();
+const sessionTargetStore = new Map();
 const MINERU_MODELS = new Set(["vlm", "pipeline"]);
 const MINERU_LANGUAGES = new Set(["ch", "en", "japan", "latin"]);
 const researchWorkspaceCache = new WeakMap();
@@ -34,6 +40,15 @@ class PdfRequestError extends Error {
   }
 }
 
+class SessionTargetError extends Error {
+  constructor(message, status = 400, code = "session_target_invalid") {
+    super(message);
+    this.name = "SessionTargetError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
 function getHanaHomeDir() {
   return process.env.HANA_HOME || path.join(os.homedir(), ".hanako");
 }
@@ -44,6 +59,13 @@ function getRequestRuntime(c, ctx) {
     bus: requestContext?.bus || ctx.bus,
     requestContext,
   };
+}
+
+function sessionTargetScope(requestContext) {
+  const principalId = requestContext?.principal?.principalId
+    || requestContext?.principal?.id
+    || "local";
+  return String(principalId).slice(0, 256);
 }
 
 function isAgentId(value) {
@@ -357,37 +379,192 @@ async function runAgentTurn(bus, ctx, agentId, text, options = {}) {
   });
 }
 
-async function sendAgentMessage(bus, ctx, agentId, text, thinkingLevel) {
-  const visibility = "public";
-  const namespace = "send";
-  const lockKey = `${namespace}:${visibility}:${agentId}`;
-  return withAgentTurnLock(lockKey, async () => {
-    let { target, cacheKey } = await getAgentSession(
-      bus,
-      ctx,
-      agentId,
-      visibility,
-      namespace,
-      true,
-      thinkingLevel,
-    );
+function normalizeSessionId(value) {
+  const sessionId = typeof value === "string" ? value.trim() : "";
+  return sessionId && sessionId.length <= MAX_SESSION_ID_LENGTH ? sessionId : "";
+}
+
+function normalizeSessionRecord(session) {
+  if (!session || typeof session !== "object") return null;
+  const sessionId = normalizeSessionId(session.sessionId);
+  const sessionPath = typeof session.path === "string" && session.path.trim() ? session.path.trim() : null;
+  const visibility = String(session.visibility || session.sessionVisibility || "public").trim().toLowerCase();
+  const kind = String(session.kind || session.sessionKind || "").trim().toLowerCase();
+  if ((!sessionId && !sessionPath) || session.agentDeleted === true || session.readOnlyReason || visibility === "private" || visibility === "plugin_private" || kind === "sub-chat") {
+    return null;
+  }
+  const firstMessage = typeof session.firstMessage === "string" ? session.firstMessage.trim().slice(0, 240) : "";
+  const title = typeof session.title === "string" ? session.title.trim().slice(0, 240) : "";
+  const modifiedValue = session.modified instanceof Date
+    ? session.modified.getTime()
+    : typeof session.modified === "string" || typeof session.modified === "number"
+      ? new Date(session.modified).getTime()
+      : NaN;
+  const modified = Number.isFinite(modifiedValue) ? new Date(modifiedValue).toISOString() : null;
+  return {
+    sessionId: sessionId || null,
+    path: sessionPath,
+    title: title || firstMessage || "未命名对话",
+    firstMessage,
+    agentId: typeof session.agentId === "string" ? session.agentId : null,
+    agentName: typeof session.agentName === "string" && session.agentName.trim() ? session.agentName.trim() : null,
+    modified,
+    messageCount: Number.isFinite(Number(session.messageCount)) ? Number(session.messageCount) : 0,
+    kind: typeof session.kind === "string" ? session.kind : null,
+    visibility,
+  };
+}
+
+function publicSessionRecord(session) {
+  const { path: _path, sessionId: _sessionId, ...publicRecord } = session;
+  return publicRecord;
+}
+
+function purgeExpiredSessionTargets() {
+  const now = Date.now();
+  for (const [targetId, target] of sessionTargetStore) {
+    if (!target || target.expiresAt <= now) sessionTargetStore.delete(targetId);
+  }
+}
+
+function issueSessionTarget(pluginId, record, scope, namespace) {
+  purgeExpiredSessionTargets();
+  const targetId = `st_${randomUUID()}`;
+  sessionTargetStore.set(targetId, {
+    pluginId,
+    scope,
+    namespace,
+    targetId,
+    sessionId: record.sessionId,
+    path: record.path,
+    record,
+    expiresAt: Date.now() + SESSION_TARGET_TTL_MS,
+  });
+  while (sessionTargetStore.size > MAX_SESSION_TARGETS * 4) {
+    const oldest = sessionTargetStore.keys().next().value;
+    if (!oldest) break;
+    sessionTargetStore.delete(oldest);
+  }
+  return { targetId, ...publicSessionRecord(record) };
+}
+
+async function listSelectableSessions(bus) {
+  const result = await bus.request("session:list", {});
+  const records = Array.isArray(result) ? result : result?.sessions;
+  if (!Array.isArray(records)) return [];
+  return records.map(normalizeSessionRecord).filter(Boolean).slice(0, MAX_SESSION_TARGETS);
+}
+
+function targetFromRecord(record, targetId = null) {
+  if (!record?.sessionId && !record?.path) {
+    throw new SessionTargetError("目标对话身份不可用", 404, "session_target_unavailable");
+  }
+  return {
+    targetId,
+    sessionId: record.sessionId || null,
+    sessionRef: {
+      ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+      ...(record.path ? { sessionPath: record.path } : {}),
+    },
+    record,
+  };
+}
+
+function normalizeSessionTargetId(value) {
+  const targetId = typeof value === "string" ? value.trim() : "";
+  return targetId && targetId.length <= MAX_SESSION_TARGET_ID_LENGTH && /^st_[A-Za-z0-9-]+$/.test(targetId)
+    ? targetId
+    : "";
+}
+
+async function resolveStoredSessionTarget(bus, stored, targetId) {
+  const lookup = stored.sessionId
+    ? { sessionId: stored.sessionId }
+    : stored.path
+      ? { sessionPath: stored.path }
+      : null;
+  if (!lookup) throw new SessionTargetError("目标对话身份不可用", 404, "session_target_unavailable");
+  try {
+    const result = await bus.request("session:get", lookup);
+    const record = normalizeSessionRecord(result?.session || result);
+    if (record) return targetFromRecord(record, targetId);
+  } catch {}
+  throw new SessionTargetError("目标对话已不存在或不可发送，请重新选择", 409, "session_target_expired");
+}
+
+async function resolveExistingSessionTarget(bus, input, pluginId, scope, namespace) {
+  purgeExpiredSessionTargets();
+  const rawTargetId = typeof input?.targetId === "string" ? input.targetId.trim() : "";
+  if (rawTargetId) {
+    const targetId = normalizeSessionTargetId(rawTargetId);
+    if (!targetId) {
+      throw new SessionTargetError("目标对话选择无效，请重新选择", 400, "session_target_invalid");
+    }
+    const stored = sessionTargetStore.get(targetId);
+    if (!stored || stored.pluginId !== pluginId || stored.scope !== scope || stored.namespace !== namespace) {
+      throw new SessionTargetError("目标对话选择已失效，请重新选择", 409, "session_target_expired");
+    }
+    return resolveStoredSessionTarget(bus, stored, targetId);
+  }
+
+  const sessionRef = input?.sessionRef && typeof input.sessionRef === "object" ? input.sessionRef : null;
+  const sessionId = normalizeSessionId(input?.sessionId || sessionRef?.sessionId);
+  const sessionPath = typeof sessionRef?.sessionPath === "string" && sessionRef.sessionPath.trim()
+    ? sessionRef.sessionPath.trim()
+    : "";
+  if (!sessionId && !sessionPath) {
+    throw new SessionTargetError("请选择一个目标对话", 400, "session_target_required");
+  }
+
+  let record = (await listSelectableSessions(bus)).find((item) => (
+    sessionId && item.sessionId === sessionId
+  ) || (
+    !sessionId && sessionPath && item.path === sessionPath
+  )) || null;
+  if (!record) {
     try {
-      await updateAgentSessionThinkingLevel(bus, target, thinkingLevel);
-      try {
-        await sendToTarget(bus, target, text);
-      } catch (error) {
-        if (!String(error?.message || "").includes("session_busy")) throw error;
-        agentSessionCache.delete(cacheKey);
-        target = await createAgentSession(bus, ctx, agentId, visibility, thinkingLevel);
-        agentSessionCache.set(cacheKey, target);
-        await sendToTarget(bus, target, text);
-      }
+      const result = await bus.request("session:get", sessionId ? { sessionId } : { sessionPath });
+      record = normalizeSessionRecord(result?.session || result);
+    } catch {}
+  }
+  if (!record) {
+    throw new SessionTargetError("目标对话不存在或不可发送", 404, "session_target_unavailable");
+  }
+  return targetFromRecord(record);
+}
+
+async function sendToExistingSession(bus, target, text) {
+  const lockKey = `send-target:${target.sessionId || target.sessionRef?.sessionPath}`;
+  return withAgentTurnLock(lockKey, async () => {
+    try {
+      await sendToTarget(bus, target, text);
       return target;
     } catch (error) {
-      if (agentSessionCache.get(cacheKey) === target) agentSessionCache.delete(cacheKey);
+      if (String(error?.message || "").includes("session_busy")) {
+        error.status = 409;
+        error.code = "session_busy";
+      }
       throw error;
     }
   });
+}
+
+async function createAndSendAgentMessage(bus, ctx, agentId, text, thinkingLevel) {
+  const target = await createAgentSession(bus, ctx, agentId, "public", thinkingLevel);
+  await sendToTarget(bus, target, text);
+  return target;
+}
+
+function quoteSessionPayload(workspace, body) {
+  const quote = typeof body?.quote === "string" ? body.quote.trim() : "";
+  if (!quote || quote.length > MAX_TEXT_CHARS) {
+    throw new SessionTargetError("选中文本为空或过长", 400, "quote_invalid");
+  }
+  const evidence = verifiedQuoteEvidence(workspace, body);
+  const citation = evidence ? `Page ${evidence.page} / block ${evidence.blockId}` : "";
+  const context = withoutClientCitation(body.context);
+  const text = `【文献划词研讨】\n论文：${String(body.paperTitle || "当前阅读论文").slice(0, 500)}\n${citation ? `已核验来源：${citation}\n` : ""}选中文本：${quote}\n上下文：${context}\n\n请在这个助手会话中继续分析这段内容。${citation ? `回答时请保留来源标记：${citation}。` : ""}`;
+  return { quote, evidence, citation, text };
 }
 
 function parseJsonArray(text) {
@@ -1196,6 +1373,7 @@ function registerResearchRoutes(app, ctx, workspace) {
 export { recentWorkspacePaper };
 
 export default function registerApiRoutes(app, ctx) {
+  const sessionTargetNamespace = `route_${randomUUID()}`;
   const researchWorkspace = getResearchWorkspace(ctx);
   registerResearchRoutes(app, ctx, researchWorkspace);
   app.get("/api/mineru-settings", (c) => c.json(publicMineruSettings(ctx)));
@@ -1382,32 +1560,76 @@ export default function registerApiRoutes(app, ctx) {
     }
   });
 
+  app.get("/api/session-targets", async (c) => {
+    try {
+      const { bus, requestContext } = getRequestRuntime(c, ctx);
+      const scope = sessionTargetScope(requestContext);
+      const sessions = await listSelectableSessions(bus);
+      return c.json({
+        ok: true,
+        sessions: sessions.map((record) => issueSessionTarget(ctx.pluginId, record, scope, sessionTargetNamespace)),
+        source: null,
+      });
+    } catch (error) {
+      ctx.log?.error?.("list session targets error:", error);
+      return c.json({ ok: false, error: "无法读取可选对话列表", sessions: [] }, 502);
+    }
+  });
+
   app.post("/api/send-to-session", async (c) => {
+    try {
+      const { bus, requestContext } = getRequestRuntime(c, ctx);
+      const body = await c.req.json();
+      const payload = quoteSessionPayload(researchWorkspace, body);
+      const target = await resolveExistingSessionTarget(
+        bus,
+        body,
+        ctx.pluginId,
+        sessionTargetScope(requestContext),
+        sessionTargetNamespace,
+      );
+      await sendToExistingSession(bus, target, payload.text);
+      return c.json({
+        ok: true,
+        accepted: true,
+        citation: payload.citation || null,
+        evidence: payload.evidence,
+        targetId: target.targetId || null,
+        session: publicSessionRecord(target.record),
+        message: "已发送到所选对话",
+      });
+    } catch (error) {
+      if (error instanceof SessionTargetError) {
+        return c.json({ ok: false, error: error.message, code: error.code }, error.status);
+      }
+      ctx.log?.error?.("send to session error:", error);
+      const status = Number.isInteger(error?.status) && error.status >= 400 && error.status < 500 ? error.status : 502;
+      return c.json({ ok: false, error: status === 409 ? "目标对话正在回复，请稍后重试" : "发送会话失败，请稍后重试", code: error?.code || null }, status);
+    }
+  });
+
+  app.post("/api/create-session-and-send", async (c) => {
     try {
       const { bus } = getRequestRuntime(c, ctx);
       const body = await c.req.json();
       const agent = await resolveAgent(bus, body?.agentId);
       if (!agent) return c.json({ ok: false, error: "未找到指定助手" }, 400);
-      const quote = typeof body.quote === "string" ? body.quote.trim() : "";
-      if (!quote || quote.length > MAX_TEXT_CHARS) return c.json({ ok: false, error: "选中文本为空或过长" }, 400);
-
-      const evidence = verifiedQuoteEvidence(researchWorkspace, body);
-      const citation = evidence ? `Page ${evidence.page} / block ${evidence.blockId}` : "";
-      const context = withoutClientCitation(body.context);
-      const text = `【文献划词研讨】\n论文：${String(body.paperTitle || "当前阅读论文").slice(0, 500)}\n${citation ? `已核验来源：${citation}\n` : ""}选中文本：${quote}\n上下文：${context}\n\n请在这个助手会话中继续分析这段内容。${citation ? `回答时请保留来源标记：${citation}。` : ""}`;
-      const target = await sendAgentMessage(bus, ctx, agent.id, text, body.thinkingLevel);
+      const payload = quoteSessionPayload(researchWorkspace, body);
+      const target = await createAndSendAgentMessage(bus, ctx, agent.id, payload.text, body.thinkingLevel);
       return c.json({
         ok: true,
         accepted: true,
-        citation: citation || null,
-        evidence,
+        citation: payload.citation || null,
+        evidence: payload.evidence,
         sessionId: target.sessionId,
-        thinkingLevel: target.thinkingLevel || target.requestedThinkingLevel,
-        message: "已发送到该助手的文献研讨会话",
+        message: "已新建对话并发送",
       });
     } catch (error) {
-      ctx.log?.error?.("send to session error:", error);
-      return c.json({ ok: false, error: "发送会话失败，请稍后重试" }, 502);
+      if (error instanceof SessionTargetError) {
+        return c.json({ ok: false, error: error.message, code: error.code }, error.status);
+      }
+      ctx.log?.error?.("create and send session error:", error);
+      return c.json({ ok: false, error: "新建对话失败，请稍后重试" }, 502);
     }
   });
 }
