@@ -149,11 +149,18 @@ test("schema 1 data migrates with a backup and Evidence relations", async () => 
   assert.ok(fs.readdirSync(tempDir).some((name) => name.startsWith("paper-workspace.json.schema-v1-") && name.endsWith(".backup")));
 });
 
-test("translation cache is keyed by paper, block and glossary version", async () => {
+test("translation cache is keyed by paper, block, glossary version, agent and model", async () => {
   await workspace.upsertPaper(fixture());
-  await workspace.putTranslation({ paperHash: hash, blockId: "mineru_p1_b2", glossaryVersion: 1, source: "Water stress", translation: "水分胁迫" });
-  assert.equal(workspace.getTranslation(hash, "mineru_p1_b2", 1).translation, "水分胁迫");
-  assert.equal(workspace.getTranslation(hash, "mineru_p1_b2", 2), null);
+  await workspace.putTranslation({ paperHash: hash, blockId: "mineru_p1_b2", glossaryVersion: 1, agentId: "hakimi", modelRef: "fixture/model-a", source: "Water stress", translation: "水分胁迫 A" });
+  await workspace.putTranslation({ paperHash: hash, blockId: "mineru_p1_b2", glossaryVersion: 1, agentId: "hakimi", modelRef: "fixture/model-b", source: "Water stress", translation: "水分胁迫 B" });
+  assert.equal(workspace.getTranslation(hash, "mineru_p1_b2", 1, { agentId: "hakimi", modelRef: "fixture/model-a" }).translation, "水分胁迫 A");
+  assert.equal(workspace.getTranslation(hash, "mineru_p1_b2", 1, { agentId: "hakimi", modelRef: "fixture/model-b" }).translation, "水分胁迫 B");
+  assert.equal(workspace.getTranslation(hash, "mineru_p1_b2", 1, { agentId: "other", modelRef: "fixture/model-a" }), null);
+  assert.equal(workspace.getTranslation(hash, "mineru_p1_b2", 2, { agentId: "hakimi", modelRef: "fixture/model-a" }), null);
+
+  // 旧版未带模型上下文的缓存仍可被旧调用方读取。
+  await workspace.putTranslation({ paperHash: hash, blockId: "mineru_p1_b2", glossaryVersion: 3, source: "Water stress", translation: "旧版缓存" });
+  assert.equal(workspace.getTranslation(hash, "mineru_p1_b2", 3).translation, "旧版缓存");
 });
 
 test("snapshot is bounded and corrupted storage is recovered", async () => {

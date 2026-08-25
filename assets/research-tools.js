@@ -871,6 +871,7 @@ export function createResearchTools(options = {}) {
             blockId: selected?.id || null,
             selectedBlockId: selected?.id || null,
             agentId: state.paper?.agentId || null,
+            modelRef: state.paper?.modelRef || "agent-default",
             thinkingLevel: state.paper?.thinkingLevel || "max",
           }),
         });

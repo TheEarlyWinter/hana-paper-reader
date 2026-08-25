@@ -3,11 +3,13 @@ import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { parsePdfWithMineru, readMineruAsset } from "../lib/mineru.js";
-import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.6.3-r1";
-import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.6.3-r1";
+import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.7.0-r1";
+import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.7.0-r1";
 
 const AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
-const PLUGIN_API_VERSION = "0.6.3";
+const MODEL_REF_RE = /^[^/\x00-\x20]{1,160}\/[^\x00-\x20]{1,240}$/u;
+const MODEL_CATALOG_TTL_MS = 5000;
+const PLUGIN_API_VERSION = "0.7.0";
 const MAX_SESSION_TARGETS = 200;
 const MAX_SESSION_ID_LENGTH = 256;
 const MAX_SESSION_TARGET_ID_LENGTH = 96;
@@ -21,9 +23,9 @@ const MAX_BATCH_CHARS = 50000;
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const THINKING_LEVELS = new Set(["off", "low", "medium", "high", "max"]);
 const DEFAULT_THINKING_LEVEL = "max";
-const HIDDEN_AGENT_IDS = new Set(["one", "one-2", "one-3", "image2", "agent-mqz22q9q"]);
 const agentSessionCache = new Map();
 const agentTurnLocks = new Map();
+const modelCatalogCache = new WeakMap();
 const sessionTargetStore = new Map();
 const MINERU_MODELS = new Set(["vlm", "pipeline"]);
 const MINERU_LANGUAGES = new Set(["ch", "en", "japan", "latin"]);
@@ -69,16 +71,20 @@ function sessionTargetScope(requestContext) {
 }
 
 function isAgentId(value) {
-  return typeof value === "string" && AGENT_ID_RE.test(value) && !HIDDEN_AGENT_IDS.has(value);
+  return typeof value === "string" && AGENT_ID_RE.test(value);
 }
 
 function parseConfig(raw) {
+  const clean = (value) => value?.trim().replace(/^["']|["']$/g, "") || null;
   const nameMatch = raw.match(/^\s{2}name:\s*([^\r\n#]+)/m);
-  const chatBlock = raw.match(/(?:^|\r?\n)\s{2}chat:\s*\r?\n([\s\S]*?)(?=\r?\n\s{2}[A-Za-z_][\w-]*:\s|$)/m);
+  const chatBlock = raw.match(/(?:^|\r?\n)\s{2}chat:\s*\r?\n([\s\S]*?)(?=\r?\n\s{2}[A-Za-z_][\w-]*:\s|\r?\n[A-Za-z_][\w-]*:\s|$)/m);
   const modelMatch = (chatBlock?.[1] || "").match(/^\s{4}id:\s*([^\r\n#]+)/m);
+  const providerMatch = (chatBlock?.[1] || "").match(/^\s{4}provider:\s*([^\r\n#]+)/m);
+  const modelId = clean(modelMatch?.[1]);
+  const provider = clean(providerMatch?.[1]);
   return {
-    name: nameMatch?.[1]?.trim().replace(/^["']|["']$/g, "") || null,
-    model: modelMatch?.[1]?.trim().replace(/^["']|["']$/g, "") || null,
+    name: clean(nameMatch?.[1]),
+    model: provider && modelId ? `${provider}/${modelId}` : modelId,
   };
 }
 
@@ -86,9 +92,122 @@ function modelFromProfile(profile) {
   const chat = profile?.models?.chat;
   if (typeof chat === "string" && chat.trim()) return chat.trim();
   if (chat && typeof chat === "object") {
-    return chat.id || chat.modelId || chat.model || "默认模型";
+    const provider = chat.provider || chat.providerId;
+    const id = chat.id || chat.modelId || chat.model;
+    if (provider && id) return `${provider}/${id}`;
+    return id || "默认模型";
   }
   return "默认模型";
+}
+
+function normalizeModelRef(value) {
+  const ref = typeof value === "string" ? value.trim() : "";
+  return MODEL_REF_RE.test(ref) ? ref : "";
+}
+
+function splitModelRef(value) {
+  const ref = normalizeModelRef(value);
+  if (!ref) return null;
+  const slash = ref.indexOf("/");
+  return { ref, provider: ref.slice(0, slash), id: ref.slice(slash + 1) };
+}
+
+function modelRefFromEntry(entry) {
+  const provider = typeof (entry?.provider || entry?.providerId) === "string"
+    ? String(entry.provider || entry.providerId).trim()
+    : "";
+  const id = typeof entry?.id === "string" && entry.id.trim()
+    ? entry.id.trim()
+    : typeof entry?.modelId === "string" && entry.modelId.trim()
+      ? entry.modelId.trim()
+      : typeof entry?.model === "string" && entry.model.trim()
+        ? entry.model.trim()
+        : "";
+  return normalizeModelRef(`${provider}/${id}`);
+}
+
+async function listConfiguredChatModels(bus, { forceRefresh = false } = {}) {
+  if (!bus || typeof bus.request !== "function") return { ok: false, models: [], reason: "provider bus unavailable" };
+  const now = Date.now();
+  const cached = modelCatalogCache.get(bus);
+  if (!forceRefresh && cached && cached.expiresAt > now) return cached.value;
+  const pending = (async () => {
+    try {
+      const result = await bus.request("provider:models-by-type", { type: "chat" });
+      const unique = new Map();
+      for (const entry of Array.isArray(result?.models) ? result.models : []) {
+        const ref = modelRefFromEntry(entry);
+        if (!ref || unique.has(ref)) continue;
+        const split = splitModelRef(ref);
+        unique.set(ref, {
+          ref,
+          provider: split.provider,
+          id: split.id,
+          name: typeof entry?.name === "string" && entry.name.trim()
+            ? entry.name.trim()
+            : typeof entry?.displayName === "string" && entry.displayName.trim()
+              ? entry.displayName.trim()
+              : split.id,
+        });
+      }
+      return { ok: true, models: [...unique.values()].sort((a, b) => a.name.localeCompare(b.name, "zh-CN") || a.ref.localeCompare(b.ref)) };
+    } catch (error) {
+      return { ok: false, models: [], reason: error?.message || String(error) };
+    }
+  })();
+  if (!forceRefresh) {
+    const value = pending.then((result) => {
+      modelCatalogCache.set(bus, { value: result, expiresAt: Date.now() + MODEL_CATALOG_TTL_MS });
+      return result;
+    }).catch((error) => {
+      modelCatalogCache.delete(bus);
+      throw error;
+    });
+    modelCatalogCache.set(bus, { value, expiresAt: now + MODEL_CATALOG_TTL_MS });
+    return value;
+  }
+  return pending;
+}
+
+async function resolveSelectedModel(bus, modelRef, agent) {
+  const requested = typeof modelRef === "string" ? modelRef.trim() : "";
+  if (!requested || requested === "agent-default") return { mode: "agent-default", ref: null, model: null, label: agent?.model || "跟随 Agent" };
+  const ref = normalizeModelRef(requested);
+  if (!ref) throw new SessionTargetError("模型选择无效，请重新选择", 400, "model_invalid");
+  const catalog = await listConfiguredChatModels(bus, { forceRefresh: true });
+  if (!catalog.ok) throw new SessionTargetError("无法读取当前聊天模型列表，请稍后重试", 503, "model_catalog_unavailable");
+  const selected = catalog.models.find((entry) => entry.ref === ref);
+  if (!selected) throw new SessionTargetError("所选模型当前不可用，请重新选择", 409, "model_unavailable");
+  const parts = splitModelRef(ref);
+  return { mode: "selected", ref, model: { provider: parts.provider, id: parts.id }, label: selected.name, provider: parts.provider, id: parts.id };
+}
+
+function modelSelectionKey(selection) {
+  return selection?.ref || "agent-default";
+}
+
+function publicModelSelection(selection, agent) {
+  const selected = selection?.mode === "selected" && selection?.ref;
+  return {
+    mode: selected ? "selected" : "agent-default",
+    ref: selected ? selection.ref : null,
+    provider: selected ? selection.provider || selection.model?.provider || null : null,
+    id: selected ? selection.id || selection.model?.id || null : null,
+    label: selected ? selection.label || selection.ref : "跟随 Agent",
+    effective: selected ? selection.ref : agent?.model || null,
+  };
+}
+
+function hasExplicitModelRef(value) {
+  const requested = typeof value === "string" ? value.trim() : "";
+  return Boolean(requested && requested !== "agent-default");
+}
+
+async function resolveAgentModelSelection(bus, body, agent) {
+  if (hasExplicitModelRef(body?.modelRef) && !agent) {
+    throw new SessionTargetError("选择模型时必须同时选择助手", 400, "model_agent_required");
+  }
+  return resolveSelectedModel(bus, body?.modelRef, agent);
 }
 
 function readLocalAgent(agentId, profile = null) {
@@ -128,7 +247,7 @@ function readLocalAgent(agentId, profile = null) {
 async function listAgents(bus) {
   const records = new Map();
   try {
-    const result = await bus?.request?.("agent:list", {});
+    const result = await bus?.request?.("agent:list", { includePluginPrivate: true });
     const hostAgents = Array.isArray(result) ? result : (result?.agents || []);
     for (const agent of hostAgents) {
       if (isAgentId(agent?.id)) records.set(agent.id, { id: agent.id, name: agent.name || null });
@@ -144,15 +263,24 @@ async function listAgents(bus) {
     }
   } catch {}
 
-  const agents = [...records.values()].map(({ id, name }) => {
-    const local = readLocalAgent(id);
-    return local || { id, name: name || id, model: "默认模型", description: "", avatarUrl: null };
-  });
-
-  for (const agent of agents) {
-    const record = records.get(agent.id);
-    if (record?.name && agent.name === agent.id) agent.name = record.name;
-  }
+  const agents = await Promise.all([...records.values()].map(async ({ id, name }) => {
+    let profile = null;
+    try {
+      const result = await bus?.request?.("agent:profile", { agentId: id });
+      profile = result?.profile || result?.agent || null;
+    } catch {}
+    const local = readLocalAgent(id, profile);
+    const agent = local || {
+      id,
+      name: profile?.name || name || id,
+      model: modelFromProfile(profile),
+      description: profile?.description || profile?.identity || "",
+      avatarUrl: null,
+    };
+    if (name && agent.name === id) agent.name = name;
+    const modelRef = normalizeModelRef(agent.model);
+    return { ...agent, modelRef: modelRef || null };
+  }));
 
   const priorityOrder = ["hakimi", "agent-mqb7zal0", "cixiaogui", "beishu", "hanako"];
   agents.sort((a, b) => {
@@ -161,7 +289,7 @@ async function listAgents(bus) {
     if (ia !== -1 && ib !== -1) return ia - ib;
     if (ia !== -1) return -1;
     if (ib !== -1) return 1;
-    return String(a.name).localeCompare(String(b.name));
+    return String(a.name).localeCompare(String(b.name), "zh-CN") || String(a.id).localeCompare(String(b.id));
   });
   return agents;
 }
@@ -241,7 +369,7 @@ async function withAgentTurnLock(key, task) {
   }
 }
 
-async function createAgentSession(bus, ctx, agentId, visibility, thinkingLevel = DEFAULT_THINKING_LEVEL) {
+async function createAgentSession(bus, ctx, agentId, visibility, thinkingLevel = DEFAULT_THINKING_LEVEL, modelSelection = null) {
   const requestedThinkingLevel = normalizeThinkingLevel(thinkingLevel);
   const basePayload = {
     agentId,
@@ -249,6 +377,7 @@ async function createAgentSession(bus, ctx, agentId, visibility, thinkingLevel =
     visibility,
     kind: "paper-reader",
     memoryEnabled: false,
+    ...(modelSelection?.model ? { model: modelSelection.model } : {}),
   };
   let created;
   try {
@@ -267,6 +396,7 @@ async function createAgentSession(bus, ctx, agentId, visibility, thinkingLevel =
     sessionRef: created.sessionRef || { sessionId: created.sessionId, sessionPath: created.sessionPath || null },
     thinkingLevel: created.thinkingLevel || null,
     requestedThinkingLevel,
+    modelSelection: modelSelection || { mode: "agent-default", ref: null, model: null, label: "跟随 Agent" },
   };
 }
 
@@ -287,10 +417,11 @@ async function updateAgentSessionThinkingLevel(bus, target, thinkingLevel) {
   return target;
 }
 
-async function getAgentSession(bus, ctx, agentId, visibility, namespace, reuse, thinkingLevel) {
-  const cacheKey = `${namespace}:${visibility}:${agentId}`;
+async function getAgentSession(bus, ctx, agentId, visibility, namespace, reuse, thinkingLevel, modelSelection) {
+  const modelKey = modelSelectionKey(modelSelection);
+  const cacheKey = `${namespace}:${visibility}:${agentId}:${modelKey}`;
   if (reuse && agentSessionCache.has(cacheKey)) return { target: agentSessionCache.get(cacheKey), cacheKey };
-  const target = await createAgentSession(bus, ctx, agentId, visibility, thinkingLevel);
+  const target = await createAgentSession(bus, ctx, agentId, visibility, thinkingLevel, modelSelection);
   if (reuse) agentSessionCache.set(cacheKey, target);
   return { target, cacheKey };
 }
@@ -308,7 +439,9 @@ async function runAgentTurn(bus, ctx, agentId, text, options = {}) {
   const visibility = options.visibility || "plugin_private";
   const namespace = options.namespace || "reader";
   const reuse = options.reuse !== false;
-  const lockKey = `${namespace}:${visibility}:${agentId}`;
+  const modelSelection = options.modelSelection || { mode: "agent-default", ref: null, model: null, label: "跟随 Agent" };
+  const modelKey = modelSelectionKey(modelSelection);
+  const lockKey = `${namespace}:${visibility}:${agentId}:${modelKey}`;
 
   return withAgentTurnLock(lockKey, async () => {
     let { target, cacheKey } = await getAgentSession(
@@ -319,6 +452,7 @@ async function runAgentTurn(bus, ctx, agentId, text, options = {}) {
       namespace,
       reuse,
       options.thinkingLevel,
+      modelSelection,
     );
     try {
       await updateAgentSessionThinkingLevel(bus, target, options.thinkingLevel);
@@ -336,7 +470,7 @@ async function runAgentTurn(bus, ctx, agentId, text, options = {}) {
       } catch (error) {
         if (!reuse || !String(error?.message || "").includes("session_busy")) throw error;
         agentSessionCache.delete(cacheKey);
-        target = await createAgentSession(bus, ctx, agentId, visibility, options.thinkingLevel);
+        target = await createAgentSession(bus, ctx, agentId, visibility, options.thinkingLevel, modelSelection);
         agentSessionCache.set(cacheKey, target);
         baselineCount = 0;
         await sendToTarget(bus, target, text);
@@ -549,8 +683,8 @@ async function sendToExistingSession(bus, target, text) {
   });
 }
 
-async function createAndSendAgentMessage(bus, ctx, agentId, text, thinkingLevel) {
-  const target = await createAgentSession(bus, ctx, agentId, "public", thinkingLevel);
+async function createAndSendAgentMessage(bus, ctx, agentId, text, thinkingLevel, modelSelection) {
+  const target = await createAgentSession(bus, ctx, agentId, "public", thinkingLevel, modelSelection);
   await sendToTarget(bus, target, text);
   return target;
 }
@@ -809,6 +943,16 @@ function researchPaperHash(c, body = null) {
 
 function researchJsonError(c, error, status = 400) {
   return c.json({ ok: false, error: String(error?.message || error || "研究工作区请求失败").slice(0, 500) }, status);
+}
+
+function agentJsonError(c, error, fallback, defaultStatus = 502) {
+  if (error instanceof SessionTargetError) {
+    return c.json({ ok: false, error: error.message, code: error.code }, error.status);
+  }
+  const status = Number.isInteger(error?.status) && error.status >= 400 && error.status < 600
+    ? error.status
+    : defaultStatus;
+  return c.json({ ok: false, error: fallback, code: error?.code || null }, status);
 }
 
 function publicCachedPaper(paper) {
@@ -1254,7 +1398,9 @@ function registerResearchRoutes(app, ctx, workspace) {
       const paperHash = researchPaperHash(c);
       const blockId = requestQuery(c, "blockId");
       const glossaryVersion = requestQuery(c, "glossaryVersion");
-      const translation = workspace.getTranslation(paperHash, blockId, glossaryVersion);
+      const agentId = requestQuery(c, "agentId");
+      const modelRef = requestQuery(c, "modelRef");
+      const translation = workspace.getTranslation(paperHash, blockId, glossaryVersion, { agentId, modelRef });
       return c.json({ ok: true, hit: Boolean(translation), translation });
     } catch (error) {
       return researchJsonError(c, error);
@@ -1262,7 +1408,8 @@ function registerResearchRoutes(app, ctx, workspace) {
   });
   app.post("/api/research/translation-cache", async (c) => {
     try {
-      return c.json({ ok: true, translation: await workspace.putTranslation(await c.req.json()) });
+      const body = await c.req.json();
+      return c.json({ ok: true, translation: await workspace.putTranslation(body) });
     } catch (error) {
       return researchJsonError(c, error);
     }
@@ -1336,16 +1483,26 @@ function registerResearchRoutes(app, ctx, workspace) {
       const { bus } = getRequestRuntime(c, ctx);
       const agent = await resolveAgent(bus, body?.agentId);
       if (!agent) return c.json({ ok: false, error: "未找到指定助手" }, 400);
+      const modelSelection = await resolveAgentModelSelection(bus, body, agent);
       const result = await runAgentTurn(bus, ctx, agent.id, evidencePrompt(paper, evidence, question), {
         reuse: true,
         namespace: "research-evidence",
         thinkingLevel: body.thinkingLevel,
+        modelSelection,
       });
       const answer = enforceEvidenceCitations(result.text, evidence);
-      return c.json({ ok: true, answer, evidence, model: agent.model, sessionId: result.target.sessionId, thinkingLevel: result.target.thinkingLevel || result.target.requestedThinkingLevel });
+      return c.json({
+        ok: true,
+        answer,
+        evidence,
+        model: modelSelection.ref || agent.model,
+        modelSelection: publicModelSelection(modelSelection, agent),
+        sessionId: result.target.sessionId,
+        thinkingLevel: result.target.thinkingLevel || result.target.requestedThinkingLevel,
+      });
     } catch (error) {
       ctx.log?.error?.("research evidence error:", error);
-      return c.json({ ok: false, error: "论文证据问答失败，请稍后重试" }, 502);
+      return agentJsonError(c, error, "论文证据问答失败，请稍后重试");
     }
   });
 
@@ -1412,10 +1569,24 @@ export default function registerApiRoutes(app, ctx) {
   app.get("/api/agents", async (c) => {
     try {
       const { bus } = getRequestRuntime(c, ctx);
-      return c.json({ ok: true, agents: await listAgents(bus) });
+      return c.json({ ok: true, agents: await listAgents(bus), apiVersion: PLUGIN_API_VERSION });
     } catch (error) {
       ctx.log?.error?.("get agents error:", error);
       return c.json({ ok: false, error: "无法读取本机助手列表", agents: [] }, 500);
+    }
+  });
+
+  app.get("/api/models", async (c) => {
+    try {
+      const { bus } = getRequestRuntime(c, ctx);
+      const catalog = await listConfiguredChatModels(bus);
+      if (!catalog.ok) {
+        return c.json({ ok: false, error: "无法读取当前聊天模型列表，请稍后重试", code: "model_catalog_unavailable", models: [] }, 503);
+      }
+      return c.json({ ok: true, models: catalog.models, apiVersion: PLUGIN_API_VERSION });
+    } catch (error) {
+      ctx.log?.error?.("get chat models error:", error);
+      return c.json({ ok: false, error: "无法读取当前聊天模型列表，请稍后重试", code: "model_catalog_unavailable", models: [] }, 503);
     }
   });
 
@@ -1496,26 +1667,32 @@ export default function registerApiRoutes(app, ctx) {
       if (body?.agentId) {
         const agent = await resolveAgent(bus, body.agentId);
         if (!agent) return c.json({ ok: false, error: "未找到指定助手" }, 400);
+        const modelSelection = await resolveAgentModelSelection(bus, body, agent);
         const prompt = `请翻译下面的学术英文。只返回 JSON 字符串数组，数组长度必须为 ${list.length}，不要输出解释。${glossaryInstruction(body.glossaryTerms)}\n${JSON.stringify(list)}`;
         const result = await runAgentTurn(bus, ctx, agent.id, prompt, {
           reuse: true,
           namespace: "translation",
           thinkingLevel: body.thinkingLevel,
+          modelSelection,
         });
         const translations = parseJsonArray(result.text);
         if (!translations || translations.length !== list.length) return c.json({ ok: false, error: "翻译模型返回格式无效" }, 502);
         return c.json({
           ok: true,
           translations,
-          model: agent.model,
+          model: modelSelection.ref || agent.model,
+          modelSelection: publicModelSelection(modelSelection, agent),
           thinkingLevel: result.target.thinkingLevel || result.target.requestedThinkingLevel,
         });
       }
 
+      if (hasExplicitModelRef(body?.modelRef)) {
+        throw new SessionTargetError("选择模型时必须同时选择助手", 400, "model_agent_required");
+      }
       return c.json({ ok: true, translations: await runUtilityTranslation(bus, list, body?.glossaryTerms), model: "utility" });
     } catch (error) {
       ctx.log?.error?.("translate error:", error);
-      return c.json({ ok: false, error: "翻译失败，请稍后重试" }, 502);
+      return agentJsonError(c, error, "翻译失败，请稍后重试");
     }
   });
 
@@ -1525,6 +1702,7 @@ export default function registerApiRoutes(app, ctx) {
       const body = await c.req.json();
       const agent = await resolveAgent(bus, body?.agentId);
       if (!agent) return c.json({ ok: false, error: "未找到指定助手" }, 400);
+      const modelSelection = await resolveAgentModelSelection(bus, body, agent);
       const quote = typeof body.quote === "string" ? body.quote.trim() : "";
       const context = withoutClientCitation(body.context);
       if (!quote || quote.length > MAX_TEXT_CHARS) return c.json({ ok: false, error: "选中文本为空或过长" }, 400);
@@ -1543,6 +1721,7 @@ export default function registerApiRoutes(app, ctx) {
         reuse: true,
         namespace: "reader",
         thinkingLevel: body.thinkingLevel,
+        modelSelection,
       });
       const answer = enforceVerifiedCitation(result.text, citation);
       return c.json({
@@ -1550,13 +1729,14 @@ export default function registerApiRoutes(app, ctx) {
         answer,
         citation: citation || null,
         evidence,
-        model: agent.model,
+        model: modelSelection.ref || agent.model,
+        modelSelection: publicModelSelection(modelSelection, agent),
         sessionId: result.target.sessionId,
         thinkingLevel: result.target.thinkingLevel || result.target.requestedThinkingLevel,
       });
     } catch (error) {
       ctx.log?.error?.("ask agent error:", error);
-      return c.json({ ok: false, error: "助手响应失败或超时，请稍后重试" }, 502);
+      return agentJsonError(c, error, "助手响应失败或超时，请稍后重试");
     }
   });
 
@@ -1614,14 +1794,17 @@ export default function registerApiRoutes(app, ctx) {
       const body = await c.req.json();
       const agent = await resolveAgent(bus, body?.agentId);
       if (!agent) return c.json({ ok: false, error: "未找到指定助手" }, 400);
+      const modelSelection = await resolveAgentModelSelection(bus, body, agent);
       const payload = quoteSessionPayload(researchWorkspace, body);
-      const target = await createAndSendAgentMessage(bus, ctx, agent.id, payload.text, body.thinkingLevel);
+      const target = await createAndSendAgentMessage(bus, ctx, agent.id, payload.text, body.thinkingLevel, modelSelection);
       return c.json({
         ok: true,
         accepted: true,
         citation: payload.citation || null,
         evidence: payload.evidence,
         sessionId: target.sessionId,
+        model: modelSelection.ref || agent.model,
+        modelSelection: publicModelSelection(modelSelection, agent),
         message: "已新建对话并发送",
       });
     } catch (error) {

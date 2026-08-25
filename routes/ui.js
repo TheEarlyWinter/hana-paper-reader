@@ -1,4 +1,4 @@
-const ASSET_VERSION = "0.6.3-r1";
+const ASSET_VERSION = "0.7.0-r2";
 
 export default function registerPluginUiRoutes(app, ctx) {
   app.get("/card", (c) => c.html(renderShell(c, ctx, "card")));

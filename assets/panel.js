@@ -1,6 +1,6 @@
 const PROTOCOL = "hana.plugin.ui";
 const VERSION = 1;
-const UI_VERSION = "0.6.3";
+const UI_VERSION = "0.7.0";
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 let seq = 0;
 
@@ -143,7 +143,57 @@ let agentsList = [
   { id: "beishu", name: "背书小助手", model: "deepseek-v4-flash", description: "考点抽背与精准纠错", avatarUrl: null },
   { id: "hanako", name: "小鲸鱼", model: "deepseek-v4-flash-0731", description: "全科陪伴助手", avatarUrl: null }
 ];
+let chatModels = [];
+let modelCatalogReady = false;
+let modelCatalogError = "";
+let modelPreferences = {};
 let currentAgent = agentsList[0];
+const AGENT_DEFAULT_MODEL = "agent-default";
+try {
+  const stored = JSON.parse(localStorage.getItem("hana-paper-reader-model-preferences") || "{}");
+  if (stored && typeof stored === "object" && !Array.isArray(stored)) modelPreferences = stored;
+} catch {}
+
+function normalizeModelRef(value) {
+  const ref = typeof value === "string" ? value.trim() : "";
+  return /^[^/\x00-\x20]{1,160}\/[^\x00-\x20]{1,240}$/u.test(ref) ? ref : "";
+}
+
+function modelByRef(ref) {
+  return chatModels.find((model) => model?.ref === ref) || null;
+}
+
+function selectedModelRefForAgent(agent = currentAgent) {
+  const saved = typeof modelPreferences?.[agent?.id] === "string" ? modelPreferences[agent.id].trim() : "";
+  return saved || AGENT_DEFAULT_MODEL;
+}
+
+function selectedModelForAgent(agent = currentAgent) {
+  const ref = selectedModelRefForAgent(agent);
+  return ref === AGENT_DEFAULT_MODEL ? null : modelByRef(ref);
+}
+
+function persistModelPreferences() {
+  try { localStorage.setItem("hana-paper-reader-model-preferences", JSON.stringify(modelPreferences)); } catch {}
+}
+
+function setModelPreference(agentId, modelRef) {
+  if (!agentId) return;
+  const ref = typeof modelRef === "string" && modelRef.trim() ? modelRef.trim() : AGENT_DEFAULT_MODEL;
+  modelPreferences = { ...modelPreferences, [agentId]: ref };
+  persistModelPreferences();
+}
+
+function modelDisplayLabel(agent = currentAgent) {
+  const ref = selectedModelRefForAgent(agent);
+  if (ref === AGENT_DEFAULT_MODEL) {
+    const configured = normalizeModelRef(agent?.model);
+    return configured ? `跟随 · ${configured}` : "跟随 Agent";
+  }
+  const model = modelByRef(ref);
+  return model ? `${model.name} · ${model.ref}` : `不可用 · ${ref}`;
+}
+
 let currentPaper = {
   title: "未导入文献",
   paperHash: null,
@@ -443,7 +493,7 @@ function initLayout() {
   `;
 
   bindEvents();
-  loadAgentsList();
+  void loadAgentsAndModels();
   void loadMineruSettings();
   void initializeResearchTools();
   void restoreRecentPaper();
@@ -530,7 +580,18 @@ function bindEvents() {
     e.stopPropagation();
     agentDropdown.classList.toggle("show");
   });
-  window.addEventListener("click", () => agentDropdown.classList.remove("show"));
+  agentDropdown.addEventListener("pointerdown", (event) => event.stopPropagation());
+  agentDropdown.addEventListener("mousedown", (event) => event.stopPropagation());
+  agentDropdown.addEventListener("click", (event) => event.stopPropagation());
+  const closeAgentDropdownOnOutside = (event) => {
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    const selectorWrap = document.querySelector(".agent-selector-wrap");
+    if (path.includes(agentDropdown) || path.includes(selectorWrap)) return;
+    if (event.target?.closest?.(".agent-selector-wrap")) return;
+    agentDropdown.classList.remove("show");
+  };
+  document.addEventListener("pointerdown", closeAgentDropdownOnOutside);
+  document.addEventListener("mousedown", closeAgentDropdownOnOutside);
 
   // 全局拖拽事件处理
   window.addEventListener("dragenter", (e) => {
@@ -799,6 +860,7 @@ function researchPaperView() {
       translatedText: currentPaper.translations?.[block.id] || "",
     })),
     agentId: currentAgent?.id || null,
+    modelRef: selectedModelRefForAgent(currentAgent),
     thinkingLevel: currentThinkingLevel,
     glossaryTerms: currentPaper.glossaryTerms || {},
     translationStates: currentPaper.translationStates || {},
@@ -1237,6 +1299,8 @@ async function getCachedBlockTranslation(block, sourceText, allowCache = true) {
       paperHash: currentPaper.paperHash,
       blockId: block.id,
       glossaryVersion: String(currentPaper.glossaryVersion || 0),
+      agentId: currentAgent?.id || "",
+      modelRef: selectedModelRefForAgent(currentAgent),
     });
     const response = await pluginApiFetch(`/api/research/translation-cache?${query}`);
     const data = await response.json();
@@ -1258,6 +1322,8 @@ async function cacheBlockTranslation(block, source, translation) {
         paperHash: currentPaper.paperHash,
         blockId: block.id,
         glossaryVersion: currentPaper.glossaryVersion || 0,
+        agentId: currentAgent?.id || "",
+        modelRef: selectedModelRefForAgent(currentAgent),
         source,
         translation,
       }),
@@ -1456,20 +1522,62 @@ function renderAvatar(agent, size = 22) {
   return `<div class="agent-avatar-placeholder" style="width:${size}px;height:${size}px;font-size:${size * 0.5}px">${initial}</div>`;
 }
 
-async function loadAgentsList() {
-  try {
-    const res = await pluginApiFetch("/api/agents");
-    const data = await res.json();
-    if (data.ok && Array.isArray(data.agents) && data.agents.length > 0) {
-      agentsList = data.agents;
-      // 优先将哈基米设为默认助手
-      const foundHakimi = agentsList.find(a => a.id === "hakimi");
-      currentAgent = foundHakimi || agentsList[0];
-      updateAgentUI();
+async function loadAgentsAndModels() {
+  const previousAgentId = currentAgent?.id;
+  const [agentsResult, modelsResult] = await Promise.allSettled([
+    pluginApiFetch("/api/agents"),
+    pluginApiFetch("/api/models"),
+  ]);
+
+  if (agentsResult.status === "fulfilled") {
+    try {
+      const response = agentsResult.value;
+      const data = await response.json();
+      if (response.ok && data.ok && Array.isArray(data.agents)) {
+        agentsList = data.agents;
+        currentAgent = agentsList.find((agent) => agent.id === previousAgentId)
+          || agentsList.find((agent) => agent.id === "hakimi")
+          || agentsList[0]
+          || null;
+      } else {
+        console.log("agents load fallback:", data?.error || "无法读取助手列表");
+      }
+    } catch (error) {
+      console.log("agents load fallback:", error);
     }
-  } catch (err) {
-    console.log("agents load fallback:", err);
+  } else {
+    console.log("agents load fallback:", agentsResult.reason);
   }
+
+  if (modelsResult.status === "fulfilled") {
+    try {
+      const response = modelsResult.value;
+      const data = await response.json();
+      if (response.ok && data.ok && Array.isArray(data.models)) {
+        chatModels = data.models.filter((model) => model?.ref && normalizeModelRef(model.ref));
+        modelCatalogReady = true;
+        modelCatalogError = "";
+      } else {
+        chatModels = [];
+        modelCatalogReady = false;
+        modelCatalogError = data?.error || "无法读取聊天模型列表";
+      }
+    } catch (error) {
+      chatModels = [];
+      modelCatalogReady = false;
+      modelCatalogError = error?.message || "无法读取聊天模型列表";
+    }
+  } else {
+    chatModels = [];
+    modelCatalogReady = false;
+    modelCatalogError = modelsResult.reason?.message || "无法读取聊天模型列表";
+  }
+
+  updateAgentUI();
+}
+
+async function loadAgentsList() {
+  return loadAgentsAndModels();
 }
 
 function updateAgentUI() {
@@ -1482,65 +1590,107 @@ function updateAgentUI() {
   const agentAvatarSlot = document.getElementById("agent-avatar-slot");
   const drawerAvatarSlot = document.getElementById("drawer-avatar-slot");
   const quickAvatarsSlot = document.getElementById("quick-agent-avatars");
+  if (!agentDropdown) return;
+  if (!currentAgent) {
+    if (agentNameText) agentNameText.textContent = "暂无可用助手";
+    if (agentModelBadge) {
+      agentModelBadge.textContent = "模型不可用";
+      agentModelBadge.title = "Hana 当前没有可用 Agent";
+    }
+    if (toolAgentText) toolAgentText.textContent = "暂无助手";
+    if (drawerAgentName) drawerAgentName.textContent = "暂无可用助手";
+    if (drawerAgentModel) drawerAgentModel.textContent = "模型不可用";
+    if (agentAvatarSlot) agentAvatarSlot.replaceChildren();
+    if (drawerAvatarSlot) drawerAvatarSlot.replaceChildren();
+    if (quickAvatarsSlot) quickAvatarsSlot.replaceChildren();
+    agentDropdown.innerHTML = `<div class="agent-menu-empty">未发现可用 Agent</div>`;
+    return;
+  }
 
   const displayName = currentAgent.name || currentAgent.id;
+  const modelLabel = modelDisplayLabel(currentAgent);
   agentNameText.textContent = displayName;
-  agentModelBadge.textContent = currentAgent.model || "默认模型";
+  agentModelBadge.textContent = modelLabel;
+  agentModelBadge.title = modelLabel;
   toolAgentText.textContent = `问${displayName.split(" ")[0]}`;
   drawerAgentName.textContent = displayName;
-  drawerAgentModel.textContent = currentAgent.model || "默认模型";
+  drawerAgentModel.textContent = modelLabel;
+  drawerAgentModel.title = modelLabel;
 
   agentAvatarSlot.innerHTML = renderAvatar(currentAgent, 22);
   drawerAvatarSlot.innerHTML = renderAvatar(currentAgent, 24);
 
-  // 划词浮窗中的多助手快捷头像按钮
   if (quickAvatarsSlot) {
-    quickAvatarsSlot.innerHTML = agentsList.slice(0, 4).map(a => `
-      <div class="quick-agent-btn ${a.id === currentAgent.id ? 'active' : ''}" data-id="${escapeAttr(a.id)}" title="点击切换并向 ${escapeAttr(a.name || a.id)} 提问" style="cursor:pointer;border-radius:50%;padding:1px;border:1.5px solid ${a.id === currentAgent.id ? 'var(--accent)' : 'transparent'}">
-        ${renderAvatar(a, 20)}
+    quickAvatarsSlot.innerHTML = agentsList.slice(0, 8).map((agent) => `
+      <div class="quick-agent-btn ${agent.id === currentAgent.id ? "active" : ""}" data-id="${escapeAttr(agent.id)}" title="点击切换并向 ${escapeAttr(agent.name || agent.id)} 提问" style="cursor:pointer;border-radius:50%;padding:1px;border:1.5px solid ${agent.id === currentAgent.id ? "var(--accent)" : "transparent"}">
+        ${renderAvatar(agent, 20)}
       </div>
     `).join("");
-
-    quickAvatarsSlot.querySelectorAll(".quick-agent-btn").forEach(el => {
-      el.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const targetId = el.getAttribute("data-id");
-        const found = agentsList.find(a => a.id === targetId);
-        if (found) {
-          currentAgent = found;
-          effectiveThinkingLevel = null;
-          updateAgentUI();
-          askAgentQuestion("default");
-        }
+    quickAvatarsSlot.querySelectorAll(".quick-agent-btn").forEach((element) => {
+      element.addEventListener("click", (event) => {
+        event.stopPropagation();
+        const found = agentsList.find((agent) => agent.id === element.dataset.id);
+        if (!found) return;
+        currentAgent = found;
+        effectiveThinkingLevel = null;
+        updateAgentUI();
+        void askAgentQuestion("default");
       });
     });
   }
 
-  // 渲染完整下拉菜单
-  agentDropdown.innerHTML = agentsList.map(a => `
-    <div class="agent-menu-item ${a.id === currentAgent.id ? 'active' : ''}" data-id="${escapeAttr(a.id)}">
-      ${renderAvatar(a, 26)}
-      <div style="flex:1;overflow:hidden">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <span style="font-weight:600">${escapeHtml(a.name || a.id)}</span>
-          <span class="agent-model-tag" style="font-size:0.65rem">${escapeHtml(a.model || "")}</span>
-        </div>
-        <div style="font-size:0.7rem;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(a.description ? a.description.slice(0, 20) + '...' : 'Hanako 助手')}</div>
-      </div>
-    </div>
-  `).join("");
+  const catalogOptions = modelCatalogReady
+    ? [
+      `<option value="${AGENT_DEFAULT_MODEL}">跟随 Agent${currentAgent.model ? ` · ${escapeHtml(currentAgent.model)}` : ""}</option>`,
+      ...chatModels.map((model) => `<option value="${escapeAttr(model.ref)}">${escapeHtml(model.name)} · ${escapeHtml(model.ref)}</option>`),
+    ].join("")
+    : `<option value="${AGENT_DEFAULT_MODEL}">${modelCatalogError ? "模型列表暂不可用" : "正在读取模型列表…"}</option>`;
+  const selectedRef = selectedModelRefForAgent(currentAgent);
+  const staleOption = selectedRef !== AGENT_DEFAULT_MODEL && !modelByRef(selectedRef)
+    ? `<option value="${escapeAttr(selectedRef)}">不可用 · ${escapeHtml(selectedRef)}</option>`
+    : "";
 
-  agentDropdown.querySelectorAll(".agent-menu-item").forEach(el => {
-    el.addEventListener("click", () => {
-      const targetId = el.getAttribute("data-id");
-      const found = agentsList.find(a => a.id === targetId);
-      if (found) {
-        currentAgent = found;
-        effectiveThinkingLevel = null;
-        updateAgentUI();
-      }
+  agentDropdown.innerHTML = agentsList.map((agent) => {
+    const agentSelectedRef = selectedModelRefForAgent(agent);
+    const agentOptions = agent.id === currentAgent.id ? `${staleOption}${catalogOptions}` : "";
+    return `<div class="agent-menu-item ${agent.id === currentAgent.id ? "active" : ""}" data-id="${escapeAttr(agent.id)}">
+      ${renderAvatar(agent, 26)}
+      <div class="agent-menu-copy">
+        <div class="agent-menu-heading">
+          <span class="agent-menu-name">${escapeHtml(agent.name || agent.id)}</span>
+          <span class="agent-model-tag" style="font-size:0.65rem">${escapeHtml(agent.model || "默认模型")}</span>
+        </div>
+        <div class="agent-menu-description">${escapeHtml(agent.description ? `${agent.description.slice(0, 48)}${agent.description.length > 48 ? "…" : ""}` : "Hana 助手")}</div>
+        ${agent.id === currentAgent.id ? `<label class="agent-model-control"><span>模型</span><select class="agent-model-select" aria-label="${escapeAttr(agent.name || agent.id)} 的聊天模型">${agentOptions}</select></label>` : `<div class="agent-menu-preference">${escapeHtml(agentSelectedRef === AGENT_DEFAULT_MODEL ? "跟随 Agent" : modelDisplayLabel(agent))}</div>`}
+      </div>
+    </div>`;
+  }).join("");
+
+  agentDropdown.querySelectorAll(".agent-menu-item").forEach((element) => {
+    element.addEventListener("click", (event) => {
+      if (event.target.closest("select")) return;
+      const found = agentsList.find((agent) => agent.id === element.dataset.id);
+      if (!found) return;
+      currentAgent = found;
+      effectiveThinkingLevel = null;
+      updateAgentUI();
     });
   });
+  const modelSelect = agentDropdown.querySelector(".agent-model-select");
+  if (modelSelect) {
+    modelSelect.value = selectedRef;
+    modelSelect.addEventListener("change", (event) => {
+      event.stopPropagation();
+      const value = event.target.value || AGENT_DEFAULT_MODEL;
+      if (value !== AGENT_DEFAULT_MODEL && !modelByRef(value)) {
+        setSessionTargetStatus("所选模型当前不可用，请重新加载模型列表。", "error");
+        return;
+      }
+      setModelPreference(currentAgent.id, value);
+      effectiveThinkingLevel = null;
+      updateAgentUI();
+    });
+  }
 }
 
 function resetPdfPreview() {
@@ -2587,6 +2737,7 @@ async function translateSingleBlock(blockId) {
       body: JSON.stringify({
         text: sourceText,
         agentId: currentAgent.id,
+        modelRef: selectedModelRefForAgent(currentAgent),
         thinkingLevel: currentThinkingLevel,
         glossaryTerms: currentPaper.glossaryTerms || {},
       }),
@@ -2660,6 +2811,7 @@ async function startFullTranslation() {
           body: JSON.stringify({
             texts,
             agentId: currentAgent.id,
+            modelRef: selectedModelRefForAgent(currentAgent),
             thinkingLevel: currentThinkingLevel,
             glossaryTerms: currentPaper.glossaryTerms || {},
           }),
@@ -2752,6 +2904,7 @@ async function askAgentQuestion(questionType = "default") {
         paperHash: currentPaper.paperHash,
         blockId: selectedBlock?.id || null,
         page: selectedBlock?.page || null,
+        modelRef: selectedModelRefForAgent(currentAgent),
         thinkingLevel: currentThinkingLevel,
         glossaryTerms: currentPaper.glossaryTerms || {},
       })
@@ -2784,6 +2937,7 @@ function sessionQuotePayload() {
     paperHash: currentPaper.paperHash,
     blockId: selectedBlock?.id || null,
     page: selectedBlock?.page || null,
+    modelRef: selectedModelRefForAgent(currentAgent),
     thinkingLevel: currentThinkingLevel,
     citation,
   };
