@@ -3,14 +3,14 @@ import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { parsePdfWithMineru, readMineruAsset } from "../lib/mineru.js";
-import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.7.0-r1";
-import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.7.0-r1";
+import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.7.1-r1";
+import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.7.1-r1";
 
 const AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const DELETED_AGENT_TOMBSTONE = ".deleted-agent.json";
 const MODEL_REF_RE = /^[^/\x00-\x20]{1,160}\/[^\x00-\x20]{1,240}$/u;
 const MODEL_CATALOG_TTL_MS = 5000;
-const PLUGIN_API_VERSION = "0.7.0";
+const PLUGIN_API_VERSION = "0.7.1";
 const MAX_SESSION_TARGETS = 200;
 const MAX_SESSION_ID_LENGTH = 256;
 const MAX_SESSION_TARGET_ID_LENGTH = 96;

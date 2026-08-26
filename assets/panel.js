@@ -1,6 +1,6 @@
 const PROTOCOL = "hana.plugin.ui";
 const VERSION = 1;
-const UI_VERSION = "0.7.0";
+const UI_VERSION = "0.7.1";
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 let seq = 0;
 
