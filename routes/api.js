@@ -7,6 +7,7 @@ import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.7.0-r1";
 import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.7.0-r1";
 
 const AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+const DELETED_AGENT_TOMBSTONE = ".deleted-agent.json";
 const MODEL_REF_RE = /^[^/\x00-\x20]{1,160}\/[^\x00-\x20]{1,240}$/u;
 const MODEL_CATALOG_TTL_MS = 5000;
 const PLUGIN_API_VERSION = "0.7.0";
@@ -210,6 +211,13 @@ async function resolveAgentModelSelection(bus, body, agent) {
   return resolveSelectedModel(bus, body?.modelRef, agent);
 }
 
+function isDeletedAgentDir(agentsDir, agentId) {
+  if (!isAgentId(agentId)) return false;
+  const agentDir = path.join(agentsDir, agentId);
+  if (path.basename(agentDir) !== agentId) return false;
+  return fs.existsSync(path.join(agentDir, DELETED_AGENT_TOMBSTONE));
+}
+
 function readLocalAgent(agentId, profile = null) {
   if (!isAgentId(agentId)) return null;
   const agentDir = path.join(getHanaHomeDir(), "agents", agentId);
@@ -246,18 +254,25 @@ function readLocalAgent(agentId, profile = null) {
 
 async function listAgents(bus) {
   const records = new Map();
+  const agentsDir = path.join(getHanaHomeDir(), "agents");
   try {
     const result = await bus?.request?.("agent:list", { includePluginPrivate: true });
     const hostAgents = Array.isArray(result) ? result : (result?.agents || []);
     for (const agent of hostAgents) {
-      if (isAgentId(agent?.id)) records.set(agent.id, { id: agent.id, name: agent.name || null });
+      if (isAgentId(agent?.id) && !isDeletedAgentDir(agentsDir, agent.id)) {
+        records.set(agent.id, { id: agent.id, name: agent.name || null });
+      }
     }
   } catch {}
 
-  const agentsDir = path.join(getHanaHomeDir(), "agents");
   try {
     for (const entry of fs.readdirSync(agentsDir, { withFileTypes: true })) {
-      if (entry.isDirectory() && isAgentId(entry.name) && fs.existsSync(path.join(agentsDir, entry.name, "config.yaml"))) {
+      if (
+        entry.isDirectory()
+        && isAgentId(entry.name)
+        && !isDeletedAgentDir(agentsDir, entry.name)
+        && fs.existsSync(path.join(agentsDir, entry.name, "config.yaml"))
+      ) {
         if (!records.has(entry.name)) records.set(entry.name, { id: entry.name, name: null });
       }
     }
@@ -296,6 +311,8 @@ async function listAgents(bus) {
 
 async function resolveAgent(bus, agentId) {
   if (!isAgentId(agentId)) return null;
+  const agentsDir = path.join(getHanaHomeDir(), "agents");
+  if (isDeletedAgentDir(agentsDir, agentId)) return null;
   let profile = null;
   try {
     const result = await bus?.request?.("agent:profile", { agentId });

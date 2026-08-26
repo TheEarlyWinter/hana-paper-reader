@@ -46,6 +46,14 @@ test("paper reader sends only to an explicit selected session and never creates 
   process.env.HANA_HOME = tempDir;
   fs.mkdirSync(path.join(tempDir, "agents", "local-agent"), { recursive: true });
   fs.writeFileSync(path.join(tempDir, "agents", "local-agent", "config.yaml"), "agent:\n  name: 本地 Agent\nmodels:\n  chat:\n    id: selected-model\n    provider: fixture\n", "utf8");
+  fs.mkdirSync(path.join(tempDir, "agents", "deleted-agent"), { recursive: true });
+  fs.writeFileSync(path.join(tempDir, "agents", "deleted-agent", "config.yaml"), "agent:\n  name: 已删除 Agent\n", "utf8");
+  fs.writeFileSync(path.join(tempDir, "agents", "deleted-agent", ".deleted-agent.json"), JSON.stringify({
+    version: 1,
+    agentId: "deleted-agent",
+    agentName: "已删除 Agent",
+    deletedAt: "2026-08-22T12:00:00.000Z",
+  }), "utf8");
   const createdPayloads = [];
   let created = 0;
   const ctx = {
@@ -62,10 +70,13 @@ test("paper reader sends only to an explicit selected session and never creates 
           sent.push(payload);
           return { accepted: true };
         }
-        if (type === "agent:list") return { agents: [{ id: "dynamic-agent", name: "动态 Agent" }] };
+        if (type === "agent:list") return { agents: [
+          { id: "dynamic-agent", name: "动态 Agent" },
+          { id: "deleted-agent", name: "已删除 Agent" },
+        ] };
         if (type === "agent:profile") {
           const agentId = payload?.agentId;
-          return { profile: { id: agentId, name: agentId === "dynamic-agent" ? "动态 Agent" : "哈基米", models: { chat: { id: "selected-model", provider: "fixture" } } } };
+          return { profile: { id: agentId, name: agentId === "dynamic-agent" ? "动态 Agent" : agentId === "deleted-agent" ? "已删除 Agent" : "哈基米", models: { chat: { id: "selected-model", provider: "fixture" } } } };
         }
         if (type === "provider:models-by-type") return {
           models: [
@@ -104,6 +115,7 @@ test("paper reader sends only to an explicit selected session and never creates 
     const agents = await listAgents(requestContext());
     assert.equal(agents.status, 200);
     assert.deepEqual(agents.value.agents.map((agent) => agent.id).sort(), ["dynamic-agent", "local-agent"]);
+    assert.equal(agents.value.agents.some((agent) => agent.id === "deleted-agent"), false, "deleted Agent tombstones must never appear in the picker");
     assert.ok(calls.some(({ type, payload }) => type === "agent:list" && payload.includePluginPrivate === true));
 
     const models = await listModels(requestContext());
