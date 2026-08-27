@@ -1,6 +1,6 @@
 const PROTOCOL = "hana.plugin.ui";
 const VERSION = 1;
-const UI_VERSION = "0.7.1";
+const UI_VERSION = "0.8.0-r1";
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 let seq = 0;
 
@@ -46,26 +46,55 @@ function request(type, payload, timeoutMs = 10000) {
   });
 }
 
-function currentPluginId() {
-  const match = /^\/api\/plugins\/([^/]+)(?:\/|$)/.exec(window.location.pathname || "");
-  return match ? decodeURIComponent(match[1]) : "hana-paper-reader";
+function pluginApiUrl(path, { withSurfaceSession = false } = {}) {
+  const cleanPath = String(path || "").replace(/^\/+/, "");
+  if (window.hana?.api?.url) {
+    try {
+      const resolved = new URL(window.hana.api.url(cleanPath), window.location.href);
+      if (withSurfaceSession) {
+        const surfaceSession = new URLSearchParams(window.location.search).get("pluginSurfaceSession");
+        if (surfaceSession) resolved.searchParams.set("pluginSurfaceSession", surfaceSession);
+      }
+      return resolved.toString();
+    } catch {}
+  }
+  // Direct-iframe fallback: append the plugin route to the already-loaded
+  // surface root. The normal path is hana.api.url above.
+  const routeBase = new URL("./", window.location.href);
+  const url = new URL(`${routeBase.pathname.replace(/\/+$/, "")}/${cleanPath}`, routeBase.origin);
+  if (withSurfaceSession) {
+    const surfaceSession = new URLSearchParams(window.location.search).get("pluginSurfaceSession");
+    if (surfaceSession) url.searchParams.set("pluginSurfaceSession", surfaceSession);
+  }
+  return url.toString();
 }
 
 function pluginApiFetch(path, init = {}) {
-  const base = `/api/plugins/${encodeURIComponent(currentPluginId())}`;
-  const cleanPath = path.startsWith("/") ? path : `/${path}`;
-  const url = `${window.location.origin}${base}${cleanPath}`;
+  if (window.hana?.api?.fetch) {
+    const cleanPath = String(path || "").replace(/^\/+/, "");
+    const headers = new Headers(init.headers || {});
+    headers.set("X-Hana-Paper-Reader-UI-Version", UI_VERSION);
+    return window.hana.api.fetch(cleanPath, { ...init, headers });
+  }
   const surfaceSession = new URLSearchParams(window.location.search).get("pluginSurfaceSession");
   const headers = new Headers(init.headers || {});
   if (surfaceSession) headers.set("X-Hana-Plugin-Surface-Session", surfaceSession);
   headers.set("X-Hana-Paper-Reader-UI-Version", UI_VERSION);
-  return fetch(url, { ...init, headers });
+  return fetch(pluginApiUrl(path), { ...init, headers });
 }
 
-const hana = {
+const hanaBridge = {
   ready: () => event("hana.ready"),
   ui: { resize: (size) => event("ui.resize", size) },
   toast: { show: (input) => request("toast.show", input) },
+  resources: {
+    open: (input) => {
+      if (typeof window.hana?.resources?.open === "function") return window.hana.resources.open(input);
+      // A missing capability handler should fall back quickly so the older
+      // native-anchor path is not separated from the user's click by 10s.
+      return request("resource.open", input, 1500);
+    },
+  },
 };
 
 async function copyTextToClipboard(text) {
@@ -201,6 +230,7 @@ let currentPaper = {
   translations: {},
   translationStates: {},
   glossaryVersion: 0,
+  glossaryTerms: {},
   translationGlossaryVersion: 0,
 };
 let mineruConfigured = false;
@@ -262,6 +292,7 @@ let activeParseTask = null;
 let progressSyncTimer = null;
 let researchSyncTimer = null;
 let researchStateRevision = 0;
+let glossaryRequestId = 0;
 let restoredResearchUiState = { searchState: {}, noteDraft: null };
 let activeSearchQuery = "";
 
@@ -280,6 +311,26 @@ const SAMPLE_PAPER = {
 };
 
 const root = document.getElementById("root");
+let panelNoticeTimer = null;
+
+function showPanelNotice(input = {}) {
+  const notice = document.getElementById("panel-notice");
+  if (!notice) return;
+  const message = String(input?.message || "").trim();
+  if (panelNoticeTimer !== null) window.clearTimeout(panelNoticeTimer);
+  notice.textContent = message;
+  notice.dataset.type = String(input?.type || "info");
+  notice.hidden = !message;
+  if (!message) {
+    panelNoticeTimer = null;
+    return;
+  }
+  panelNoticeTimer = window.setTimeout(() => {
+    notice.hidden = true;
+    notice.textContent = "";
+    panelNoticeTimer = null;
+  }, 7000);
+}
 
 function initLayout() {
   if (!root) return;
@@ -332,6 +383,7 @@ function initLayout() {
     </header>
 
     <div class="main-layout">
+      <div id="panel-notice" class="panel-notice" role="status" aria-live="polite" hidden></div>
       <!-- 拖拽提示遮罩 -->
       <div id="drag-overlay" class="drag-overlay">
         <div class="drag-icon">📑</div>
@@ -907,6 +959,8 @@ async function initializeResearchTools() {
       root: mount,
       document,
       apiFetch: pluginApiFetch,
+      apiUrl: pluginApiUrl,
+      resourceOpen: hanaBridge.resources.open,
       getPaper: researchPaperView,
       getSelectedBlock: selectedResearchBlock,
       getProgress: currentReadingProgress,
@@ -914,8 +968,18 @@ async function initializeResearchTools() {
       onLocateBlock: locateResearchBlock,
       onSearchHighlight: highlightSearchInReader,
       onUiStateChanged: (uiState) => { restoredResearchUiState = uiState; scheduleProgressSync(); },
-      onPaperStateChanged: (change) => {
-        if (change?.kind === "glossary") void refreshGlossaryState();
+      onPaperStateChanged: async (change) => {
+        if (change?.kind === "glossary") {
+          const changedPaperHash = String(change.paperHash || "");
+          if (changedPaperHash && changedPaperHash !== currentPaper.paperHash) return;
+          const glossary = change.glossary || change.data?.glossary;
+          if (glossary) {
+            const applied = applyGlossaryRecord(glossary, { paperHash: changedPaperHash || currentPaper.paperHash });
+            if (applied) await refreshGlossaryState();
+          } else {
+            await refreshGlossaryState({ paperHash: changedPaperHash || currentPaper.paperHash });
+          }
+        }
         researchTools?.refresh();
       },
       onPaperDataChanged: (change) => {
@@ -964,7 +1028,7 @@ function clearCurrentPaperView(message = "未载入文献") {
   cancelActiveParse();
   resetPdfPreview();
   currentPdfFile = null;
-  currentPaper = { title: "未导入文献", paperHash: null, blocks: [], translations: {}, translationStates: {}, glossaryVersion: 0, translationGlossaryVersion: 0 };
+  currentPaper = { title: "未导入文献", paperHash: null, blocks: [], translations: {}, translationStates: {}, glossaryVersion: 0, glossaryTerms: {}, translationGlossaryVersion: 0 };
   selectedBlockId = null;
   paperRevision += 1;
   document.getElementById("reader-container").style.display = "none";
@@ -1180,14 +1244,14 @@ async function ensureResearchPaper() {
   const remoteBlockTranslations = Object.fromEntries(remoteBlocks
     .filter((block) => block?.id && typeof block.translatedText === "string" && block.translatedText.trim())
     .map((block) => [block.id, block.translatedText.trim()]));
-  if (stateRevision === researchStateRevision) {
-    currentPaper.translations = { ...remoteBlockTranslations, ...remoteTranslations };
-    currentPaper.translationStates = data.paper?.translationStates && typeof data.paper.translationStates === "object"
-      ? { ...data.paper.translationStates }
-      : {};
-  } else {
+  if (stateRevision !== researchStateRevision) {
     scheduleResearchSync();
+    return data.paper;
   }
+  currentPaper.translations = { ...remoteBlockTranslations, ...remoteTranslations };
+  currentPaper.translationStates = data.paper?.translationStates && typeof data.paper.translationStates === "object"
+    ? { ...data.paper.translationStates }
+    : {};
   if (remoteBlocks.length) {
     const localById = new Map(currentPaper.blocks.map((block) => [block.id, block]));
     currentPaper.blocks = remoteBlocks.map((block) => {
@@ -1197,7 +1261,7 @@ async function ensureResearchPaper() {
   }
   currentPaper.translationGlossaryVersion = Number(data.paper?.translationGlossaryVersion || currentPaper.translationGlossaryVersion || 0);
   currentPaper.replaceTranslations = false;
-  await refreshGlossaryState();
+  await refreshGlossaryState({ revision, paperHash });
   researchTools?.refresh();
   return data.paper;
 }
@@ -1237,38 +1301,54 @@ async function restorePaperProgress(revision = paperRevision) {
   } catch {}
 }
 
-async function refreshGlossaryState() {
-  if (!isPaperHash(currentPaper.paperHash)) return false;
-  try {
-    const response = await pluginApiFetch(`/api/research/glossary?paperHash=${encodeURIComponent(currentPaper.paperHash)}`);
-    const data = await response.json();
-    if (!response.ok || !data.ok) return false;
-    const nextVersion = Number(data.glossary?.version || 0);
-    const previousTranslationVersion = Number(currentPaper.translationGlossaryVersion || 0);
-    currentPaper.glossaryVersion = nextVersion;
-    currentPaper.glossaryTerms = data.glossary?.terms && typeof data.glossary.terms === "object" ? data.glossary.terms : {};
-    if (nextVersion !== previousTranslationVersion) {
-      const finalTranslations = {};
-      const finalStates = {};
-      let invalidated = 0;
-      for (const [blockId, translation] of Object.entries(currentPaper.translations || {})) {
-        if (isFinalTranslation(blockId)) {
-          finalTranslations[blockId] = translation;
-          finalStates[blockId] = currentPaper.translationStates[blockId];
-        } else {
-          invalidated += 1;
-        }
-      }
-      currentPaper.translations = finalTranslations;
-      currentPaper.translationStates = finalStates;
-      researchStateRevision += 1;
-      currentPaper.translationGlossaryVersion = nextVersion;
-      currentPaper.replaceTranslations = true;
-      renderBlocks();
-      scheduleResearchSync();
-      if (invalidated) void safeToast({ message: `术语已更新：${invalidated} 段 AI 译文待重译，用户定稿已保留`, type: "success" });
-      return true;
+function applyGlossaryRecord(record, options = {}) {
+  const revision = options.revision === undefined ? paperRevision : options.revision;
+  const paperHash = String(options.paperHash || currentPaper.paperHash || "");
+  if (revision !== paperRevision || paperHash !== currentPaper.paperHash || !isPaperHash(paperHash)) return false;
+  const nextVersion = Math.max(0, Number.isInteger(Number(record?.version)) ? Number(record.version) : 0);
+  const nextTerms = record?.terms && typeof record.terms === "object" && !Array.isArray(record.terms)
+    ? Object.fromEntries(Object.entries(record.terms).filter(([source, target]) => String(source).trim() && typeof target === "string" && target.trim()))
+    : {};
+  const previousTranslationVersion = Number(currentPaper.translationGlossaryVersion || 0);
+  currentPaper.glossaryVersion = nextVersion;
+  currentPaper.glossaryTerms = nextTerms;
+  glossaryRequestId += 1;
+  if (nextVersion === previousTranslationVersion) return true;
+
+  const finalTranslations = {};
+  const finalStates = {};
+  let invalidated = 0;
+  for (const [blockId, translation] of Object.entries(currentPaper.translations || {})) {
+    if (isFinalTranslation(blockId)) {
+      finalTranslations[blockId] = translation;
+      finalStates[blockId] = currentPaper.translationStates?.[blockId];
+    } else {
+      invalidated += 1;
     }
+  }
+  currentPaper.translations = finalTranslations;
+  currentPaper.translationStates = finalStates;
+  researchStateRevision += 1;
+  currentPaper.translationGlossaryVersion = nextVersion;
+  currentPaper.replaceTranslations = true;
+  renderBlocks();
+  scheduleResearchSync();
+  if (invalidated && options.notifyInvalidated !== false) {
+    void safeToast({ message: `术语已更新：${invalidated} 段 AI 译文待重译，用户定稿已保留`, type: "success" });
+  }
+  return true;
+}
+
+async function refreshGlossaryState(options = {}) {
+  const revision = options.revision === undefined ? paperRevision : options.revision;
+  const paperHash = String(options.paperHash || currentPaper.paperHash || "");
+  if (revision !== paperRevision || paperHash !== currentPaper.paperHash || !isPaperHash(paperHash)) return false;
+  const requestId = ++glossaryRequestId;
+  try {
+    const response = await pluginApiFetch(`/api/research/glossary?paperHash=${encodeURIComponent(paperHash)}`, { cache: "no-store" });
+    const data = await response.json();
+    if (revision !== paperRevision || paperHash !== currentPaper.paperHash || requestId !== glossaryRequestId || !response.ok || !data.ok) return false;
+    return applyGlossaryRecord(data.glossary, { revision, paperHash, notifyInvalidated: options.notifyInvalidated !== false });
   } catch {}
   return false;
 }
@@ -3132,7 +3212,14 @@ async function copyQuoteText() {
 }
 
 async function safeToast(input) {
-  try { await hana.toast.show(input); } catch {}
+  showPanelNotice(input);
+  try {
+    return await hanaBridge.toast.show(input);
+  } catch (error) {
+    // Keep an in-panel fallback visible when the host toast bridge is missing,
+    // delayed, or rejected by an older renderer.
+    return { shown: false, error: String(error?.message || "宿主提示不可用") };
+  }
 }
 
 function escapeHtml(text) {
@@ -3159,4 +3246,4 @@ function formatMarkdown(text) {
 }
 
 initLayout();
-hana.ready();
+hanaBridge.ready();

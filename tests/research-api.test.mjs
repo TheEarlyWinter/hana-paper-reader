@@ -87,6 +87,7 @@ test("registers research routes without changing the existing MinerU route surfa
       "POST /api/research/cleanup",
       "DELETE /api/research/paper",
       "POST /api/research/backup",
+      "GET /api/research/backup",
       "POST /api/research/restore",
       "GET /api/research/search",
       "GET /api/research/evidence",
@@ -112,6 +113,7 @@ test("registers research routes without changing the existing MinerU route surfa
       "POST /api/research/parse-status/tasks/:taskId/update",
       "POST /api/research/parse-status/tasks/:taskId/cancel",
       "POST /api/research/export",
+      "GET /api/research/export",
       "POST /api/research/evidence",
       "GET /api/research/parse-cache/check",
     ]) assert.equal(typeof app.routes.get(route), "function", `missing ${route}`);
@@ -238,6 +240,9 @@ test("research CRUD routes persist paper data and serve bounded read APIs", asyn
     const glossary = await app.routes.get("POST /api/research/glossary")(requestContext({ paperHash, terms: { "water stress": "水分胁迫" } }));
     assert.equal(glossary.value.glossary.version, 1);
     assert.equal(app.routes.get("GET /api/research/glossary")(requestContext({}, { paperHash })).value.glossary.terms["water stress"], "水分胁迫");
+    const paperWithGlossary = app.routes.get("GET /api/research/paper")(requestContext({}, { paperHash }));
+    assert.equal(paperWithGlossary.value.paper.glossaryVersion, 1);
+    assert.equal(paperWithGlossary.value.paper.glossaryTerms["water stress"], "水分胁迫");
     const deletedTerm = await app.routes.get("DELETE /api/research/glossary")(requestContext({}, { paperHash, term: "water stress" }));
     assert.equal(deletedTerm.value.deleted, true);
 
@@ -268,6 +273,15 @@ test("research CRUD routes persist paper data and serve bounded read APIs", asyn
     const backup = JSON.parse(backupText.text);
     assert.equal(backup.format, "hana-paper-reader-backup");
     assert.equal(backup.paperHash, paperHash);
+    assert.match(backupResponse.headers.get("content-disposition"), /attachment/);
+    assert.match(backupResponse.headers.get("content-disposition"), /filename\*=UTF-8''/);
+
+    const nativeBackup = await app.routes.get("GET /api/research/backup")(requestContext({}, { paperHash, includeAssets: "false" }));
+    assert.equal(nativeBackup.status, 200);
+    assert.equal(JSON.parse(await nativeBackup.text()).paperHash, paperHash);
+    assert.match(nativeBackup.headers.get("content-disposition"), /hana-paper-reader-cccccccccccc\.backup\.json/);
+    assert.equal(nativeBackup.headers.get("cache-control"), "private, no-store");
+    assert.equal(nativeBackup.headers.get("x-paper-hash"), paperHash);
 
     const cleared = await app.routes.get("POST /api/research/cleanup")(requestContext({ paperHash, action: "ai-translations" }));
     assert.equal(cleared.value.ok, true);
@@ -277,6 +291,55 @@ test("research CRUD routes persist paper data and serve bounded read APIs", asyn
     assert.equal(restored.value.paper.paperHash, paperHash);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("saveToDisk export and backup use an isolated Downloads directory and avoid overwrites", async () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "research-api-downloads-"));
+  const previousUserProfile = process.env.USERPROFILE;
+  const previousHome = process.env.HOME;
+  process.env.USERPROFILE = tempHome;
+  process.env.HOME = tempHome;
+  const app = makeApp();
+  const ctx = {
+    pluginId: "hana-paper-reader",
+    dataDir: path.join(tempHome, "plugin-data"),
+    config: { get: () => "", setMany() {} },
+    log: { error() {}, warn() {} },
+    bus: { request: async () => { throw new Error("model must not run"); } },
+    network: { fetch: async () => { throw new Error("network must not run"); } },
+  };
+  try {
+    registerApiRoutes(app, ctx);
+    await app.routes.get("POST /api/research/paper")(requestContext({
+      ...paperInput(),
+      metadata: { ...paperInput().metadata, title: "Research: API? fixture" },
+    }));
+    const exportRoute = app.routes.get("POST /api/research/export");
+    const firstExport = await exportRoute(requestContext({ paperHash, saveToDisk: true }));
+    const secondExport = await exportRoute(requestContext({ paperHash, saveToDisk: true }));
+    const backupRoute = app.routes.get("POST /api/research/backup");
+    const firstBackup = await backupRoute(requestContext({ paperHash, includeAssets: false, saveToDisk: true }));
+    const secondBackup = await backupRoute(requestContext({ paperHash, includeAssets: false, saveToDisk: true }));
+    const downloads = path.join(tempHome, "Downloads");
+    assert.equal(firstExport.value.saved, true);
+    assert.equal(firstExport.value.fileName, "Research_ API_ fixture.md");
+    assert.equal(secondExport.value.fileName, "Research_ API_ fixture (1).md");
+    assert.equal(firstBackup.value.fileName, `hana-paper-reader-${paperHash.slice(0, 12)}.backup.json`);
+    assert.equal(secondBackup.value.fileName, `hana-paper-reader-${paperHash.slice(0, 12)}.backup (1).json`);
+    for (const result of [firstExport, secondExport, firstBackup, secondBackup]) {
+      assert.equal(path.dirname(result.value.filePath), downloads);
+      assert.equal(fs.existsSync(result.value.filePath), true);
+      assert.equal(result.value.size, fs.statSync(result.value.filePath).size);
+    }
+    assert.match(fs.readFileSync(firstExport.value.filePath, "utf8"), /Research: API\? fixture/);
+    assert.equal(JSON.parse(fs.readFileSync(firstBackup.value.filePath, "utf8")).paperHash, paperHash);
+  } finally {
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    fs.rmSync(tempHome, { recursive: true, force: true });
   }
 });
 
@@ -322,7 +385,15 @@ test("export and evidence routes stay local except for the explicitly mocked age
     const exported = await app.routes.get("POST /api/research/export")(requestContext({ paperHash }));
     const markdown = await readResponse(exported);
     assert.match(markdown.contentType, /^text\/markdown/);
+    assert.match(exported.headers.get("content-disposition"), /attachment/);
+    assert.match(exported.headers.get("content-disposition"), /Research API fixture\.md/);
     assert.match(markdown.text, /Research API fixture/);
+
+    const nativeExport = await app.routes.get("GET /api/research/export")(requestContext({}, { paperHash }));
+    assert.equal(nativeExport.status, 200);
+    const nativeMarkdown = await readResponse(nativeExport);
+    assert.match(nativeMarkdown.text, /Research API fixture/);
+    assert.match(nativeExport.headers.get("content-disposition"), /Research API fixture\.md/);
     assert.match(markdown.text, /水分胁迫降低作物产量/);
     assert.match(markdown.text, /page:1 block:b-water evidence:ev-/);
     assert.match(markdown.text, /AI 译文/);

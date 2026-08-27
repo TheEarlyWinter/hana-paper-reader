@@ -3,14 +3,14 @@ import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { parsePdfWithMineru, readMineruAsset } from "../lib/mineru.js";
-import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.7.1-r1";
-import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.7.1-r1";
+import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.8.0-r1";
+import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.8.0-r1";
 
 const AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const DELETED_AGENT_TOMBSTONE = ".deleted-agent.json";
 const MODEL_REF_RE = /^[^/\x00-\x20]{1,160}\/[^\x00-\x20]{1,240}$/u;
 const MODEL_CATALOG_TTL_MS = 5000;
-const PLUGIN_API_VERSION = "0.7.1";
+const PLUGIN_API_VERSION = "0.8.0";
 const MAX_SESSION_TARGETS = 200;
 const MAX_SESSION_ID_LENGTH = 256;
 const MAX_SESSION_TARGET_ID_LENGTH = 96;
@@ -962,6 +962,107 @@ function researchJsonError(c, error, status = 400) {
   return c.json({ ok: false, error: String(error?.message || error || "研究工作区请求失败").slice(0, 500) }, status);
 }
 
+function downloadFileName(value, extension, fallback) {
+  const suffix = String(extension || "");
+  const raw = String(value || "")
+    .replace(/[\\/:*?"<>|\r\n]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+  const base = raw || fallback;
+  return base.toLowerCase().endsWith(suffix.toLowerCase()) ? base : `${base}${suffix}`;
+}
+
+function contentDispositionAttachment(fileName) {
+  const safeName = String(fileName || "download").replace(/[\r\n"\\]/g, "_");
+  const asciiName = safeName.replace(/[^\x20-\x7e]/g, "_") || "download";
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`;
+}
+
+function getDownloadsDirectory() {
+  const home = process.env.USERPROFILE || process.env.HOME || (typeof os.homedir === "function" ? os.homedir() : "");
+  if (home) {
+    const downloads = path.join(home, "Downloads");
+    if (fs.existsSync(downloads)) return downloads;
+    try {
+      fs.mkdirSync(downloads, { recursive: true });
+      return downloads;
+    } catch {}
+  }
+  return null;
+}
+
+function saveFileToDisk(content, preferredFileName, fallbackDir = null) {
+  let targetDir = getDownloadsDirectory();
+  if (!targetDir && fallbackDir) targetDir = fallbackDir;
+  if (!targetDir) {
+    targetDir = path.join(process.cwd(), "exports");
+  }
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  const ext = path.extname(preferredFileName);
+  const baseName = path.basename(preferredFileName, ext);
+  let finalName = preferredFileName;
+  let targetPath = path.join(targetDir, finalName);
+  let counter = 1;
+
+  while (fs.existsSync(targetPath)) {
+    finalName = `${baseName} (${counter})${ext}`;
+    targetPath = path.join(targetDir, finalName);
+    counter++;
+  }
+
+  fs.writeFileSync(targetPath, content, typeof content === "string" ? "utf-8" : undefined);
+  const size = Buffer.byteLength(content, typeof content === "string" ? "utf-8" : undefined);
+  return { filePath: targetPath, fileName: finalName, size, directory: targetDir };
+}
+
+function buildResearchMarkdown(workspace, paperHash, body = {}) {
+  const paper = workspace.getPaper(paperHash);
+  if (!paper) return null;
+  const markdown = generatePaperMarkdown({
+    metadata: paper.metadata,
+    blocks: paper.blocks,
+    translations: body.translations ?? paper.translations ?? Object.fromEntries(paper.blocks.map((block) => [block.id, block.translatedText]).filter(([, value]) => value)),
+    translationStates: body.translationStates ?? paper.translationStates ?? {},
+    notes: workspace.listItems("notes", paperHash),
+    bookmarks: workspace.listItems("bookmarks", paperHash),
+    progress: workspace.getProgress(paperHash),
+    glossary: workspace.getGlossary(paperHash).terms,
+    assets: paper.resources,
+    options: body.options,
+  });
+  return { paper, markdown };
+}
+
+function markdownDownloadResponse(markdown, paper, paperHash) {
+  const title = paper?.metadata?.title || "paper";
+  const fileName = downloadFileName(title, ".md", "paper.md");
+  return new Response(markdown, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/markdown; charset=utf-8",
+      "Content-Disposition": contentDispositionAttachment(fileName),
+      "Cache-Control": "private, no-store",
+      "X-Paper-Hash": paperHash,
+    },
+  });
+}
+
+function backupDownloadResponse(workspace, paperHash, includeAssets = true) {
+  const backup = workspace.exportBackup(paperHash, { includeAssets });
+  const fileName = `hana-paper-reader-${paperHash.slice(0, 12)}.backup.json`;
+  return new Response(JSON.stringify(backup), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Disposition": contentDispositionAttachment(fileName),
+      "Cache-Control": "private, no-store",
+      "X-Paper-Hash": paperHash,
+    },
+  });
+}
+
 function agentJsonError(c, error, fallback, defaultStatus = 502) {
   if (error instanceof SessionTargetError) {
     return c.json({ ok: false, error: error.message, code: error.code }, error.status);
@@ -972,8 +1073,9 @@ function agentJsonError(c, error, fallback, defaultStatus = 502) {
   return c.json({ ok: false, error: fallback, code: error?.code || null }, status);
 }
 
-function publicCachedPaper(paper) {
+function publicCachedPaper(paper, glossary = null) {
   if (!paper) return null;
+  const glossaryRecord = glossary && typeof glossary === "object" && !Array.isArray(glossary) ? glossary : null;
   return {
     paperHash: paper.paperHash,
     metadata: paper.metadata || {},
@@ -984,6 +1086,8 @@ function publicCachedPaper(paper) {
     translationStates: paper.translationStates || {},
     readingMode: ["original", "bilingual", "translation", "contrast"].includes(paper.readingMode) ? paper.readingMode : "bilingual",
     structureDetached: paper.structureDetached === true || paper.parser?.structureDetached === true,
+    glossaryVersion: Number.isInteger(Number(glossaryRecord?.version)) ? Number(glossaryRecord.version) : 0,
+    glossaryTerms: glossaryRecord?.terms && typeof glossaryRecord.terms === "object" && !Array.isArray(glossaryRecord.terms) ? glossaryRecord.terms : {},
     translationGlossaryVersion: Number.isInteger(Number(paper.translationGlossaryVersion)) ? Number(paper.translationGlossaryVersion) : 0,
     createdAt: paper.createdAt || null,
     updatedAt: paper.updatedAt || null,
@@ -1177,7 +1281,8 @@ function recentWorkspacePaper(workspace) {
 function registerResearchRoutes(app, ctx, workspace) {
   app.get("/api/research/recent", (c) => {
     try {
-      return c.json({ ok: true, paper: publicCachedPaper(recentWorkspacePaper(workspace)) });
+      const paper = recentWorkspacePaper(workspace);
+      return c.json({ ok: true, paper: publicCachedPaper(paper, paper ? workspace.getGlossary(paper.paperHash) : null) });
     } catch (error) {
       return researchJsonError(c, error);
     }
@@ -1186,7 +1291,8 @@ function registerResearchRoutes(app, ctx, workspace) {
   app.get("/api/research/paper", (c) => {
     try {
       const paperHash = researchPaperHash(c);
-      const paper = publicCachedPaper(workspace.getPaper(paperHash));
+      const stored = workspace.getPaper(paperHash);
+      const paper = publicCachedPaper(stored, stored ? workspace.getGlossary(stored.paperHash) : null);
       return paper ? c.json({ ok: true, paper }) : c.json({ ok: false, error: "论文不存在" }, 404);
     } catch (error) {
       return researchJsonError(c, error);
@@ -1197,7 +1303,7 @@ function registerResearchRoutes(app, ctx, workspace) {
     try {
       const body = await c.req.json();
       const paper = await workspace.upsertPaper(paperPayload(body, workspace.getPaper(body?.paperHash)));
-      return c.json({ ok: true, paper });
+      return c.json({ ok: true, paper: publicCachedPaper(paper, workspace.getGlossary(paper.paperHash)) });
     } catch (error) {
       return researchJsonError(c, error);
     }
@@ -1253,15 +1359,27 @@ function registerResearchRoutes(app, ctx, workspace) {
     try {
       const body = await c.req.json();
       const paperHash = researchPaperHash(c, body);
-      const backup = workspace.exportBackup(paperHash, { includeAssets: body?.includeAssets !== false });
-      return new Response(JSON.stringify(backup), {
-        status: 200,
-        headers: {
-          "Content-Type": "application/json; charset=utf-8",
-          "Content-Disposition": `attachment; filename=hana-paper-reader-${paperHash.slice(0, 12)}.backup.json`,
-          "X-Paper-Hash": paperHash,
-        },
-      });
+      const includeAssets = body?.includeAssets !== false;
+      const backup = workspace.exportBackup(paperHash, { includeAssets });
+      const fileName = `hana-paper-reader-${paperHash.slice(0, 12)}.backup.json`;
+      if (body?.saveToDisk === true) {
+        const saved = saveFileToDisk(JSON.stringify(backup, null, 2), fileName, path.join(ctx.dataDir, "exports"));
+        return c.json({ ok: true, saved: true, filePath: saved.filePath, fileName: saved.fileName, size: saved.size });
+      }
+      return backupDownloadResponse(workspace, paperHash, includeAssets);
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  // The GET variant is intentionally download-friendly: an iframe cannot attach
+  // the surface-session header to a native navigation, while Content-Disposition
+  // lets Chromium handle the file without a Blob URL or a lost user gesture.
+  app.get("/api/research/backup", (c) => {
+    try {
+      const paperHash = researchPaperHash(c);
+      const includeAssets = requestQuery(c, "includeAssets") !== "false";
+      return backupDownloadResponse(workspace, paperHash, includeAssets);
     } catch (error) {
       return researchJsonError(c, error);
     }
@@ -1271,7 +1389,7 @@ function registerResearchRoutes(app, ctx, workspace) {
     try {
       const body = await c.req.json();
       const paper = await workspace.restoreBackup(body);
-      return c.json({ ok: true, paper: publicCachedPaper(paper), storage: workspace.storageStats(paper.paperHash) });
+      return c.json({ ok: true, paper: publicCachedPaper(paper, workspace.getGlossary(paper.paperHash)), storage: workspace.storageStats(paper.paperHash) });
     } catch (error) {
       return researchJsonError(c, error);
     }
@@ -1468,21 +1586,28 @@ function registerResearchRoutes(app, ctx, workspace) {
     try {
       const body = await c.req.json();
       const paperHash = researchPaperHash(c, body);
-      const paper = workspace.getPaper(paperHash);
-      if (!paper) return c.json({ ok: false, error: "论文不存在" }, 404);
-      const markdown = generatePaperMarkdown({
-        metadata: paper.metadata,
-        blocks: paper.blocks,
-        translations: body.translations ?? paper.translations ?? Object.fromEntries(paper.blocks.map((block) => [block.id, block.translatedText]).filter(([, value]) => value)),
-        translationStates: body.translationStates ?? paper.translationStates ?? {},
-        notes: workspace.listItems("notes", paperHash),
-        bookmarks: workspace.listItems("bookmarks", paperHash),
-        progress: workspace.getProgress(paperHash),
-        glossary: workspace.getGlossary(paperHash).terms,
-        assets: paper.resources,
-        options: body.options,
-      });
-      return new Response(markdown, { status: 200, headers: { "Content-Type": "text/markdown; charset=utf-8", "X-Paper-Hash": paperHash } });
+      const result = buildResearchMarkdown(workspace, paperHash, body);
+      if (!result) return c.json({ ok: false, error: "论文不存在" }, 404);
+      if (body?.saveToDisk === true) {
+        const title = result.paper?.metadata?.title || "paper";
+        const fileName = downloadFileName(title, ".md", "paper.md");
+        const saved = saveFileToDisk(result.markdown, fileName, path.join(ctx.dataDir, "exports"));
+        return c.json({ ok: true, saved: true, filePath: saved.filePath, fileName: saved.fileName, size: saved.size });
+      }
+      return markdownDownloadResponse(result.markdown, result.paper, paperHash);
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  // See the backup GET route above. Native navigation preserves the click
+  // gesture and honors the attachment filename in Chromium/Electron.
+  app.get("/api/research/export", (c) => {
+    try {
+      const paperHash = researchPaperHash(c);
+      const result = buildResearchMarkdown(workspace, paperHash, {});
+      if (!result) return c.json({ ok: false, error: "论文不存在" }, 404);
+      return markdownDownloadResponse(result.markdown, result.paper, paperHash);
     } catch (error) {
       return researchJsonError(c, error);
     }
@@ -1528,7 +1653,7 @@ function registerResearchRoutes(app, ctx, workspace) {
       const paperHash = researchPaperHash(c);
       const stored = workspace.getPaper(paperHash);
       const hit = Boolean(stored && Array.isArray(stored.blocks) && stored.blocks.length);
-      const paper = hit ? publicCachedPaper(stored) : null;
+      const paper = hit ? publicCachedPaper(stored, workspace.getGlossary(stored.paperHash)) : null;
       return c.json({
         ok: true,
         paperHash,

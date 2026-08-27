@@ -95,15 +95,103 @@ function highlightFragment(doc, value, query) {
   return fragment;
 }
 
+function scheduleDownloadCleanup(doc, callback, delay = 1000) {
+  const timer = doc?.defaultView?.setTimeout || globalThis.setTimeout;
+  if (typeof timer === "function") timer(callback, delay);
+  else callback();
+}
+
 function downloadBlob(doc, blob, fileName) {
+  const objectUrl = URL.createObjectURL(blob);
   const link = doc.createElement("a");
-  link.href = URL.createObjectURL(blob);
+  link.href = objectUrl;
   link.download = fileName;
   link.rel = "noopener";
-  doc.body?.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(link.href), 0);
+  try {
+    doc.body?.appendChild(link);
+    link.click();
+  } finally {
+    // Chromium/Electron may dispatch the download after click() returns. Keep
+    // the anchor and Blob URL alive for one turn of the host download pipeline.
+    scheduleDownloadCleanup(doc, () => {
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
+    });
+  }
+}
+
+function buildNativeDownloadUrl(doc, path, params = {}, apiUrl) {
+  const cleanPath = String(path || "").replace(/^\/+/, "");
+  const raw = typeof apiUrl === "function"
+    ? apiUrl(path, { withSurfaceSession: true })
+    : `./${cleanPath}`;
+  const base = doc.baseURI || (typeof window !== "undefined" ? window.location.href : "http://hana.local/");
+  const url = new URL(String(raw || path), base);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && String(value) !== "") url.searchParams.set(key, String(value));
+  });
+  return url.toString();
+}
+
+function nativeDownload(doc, path, params = {}, apiUrl) {
+  const link = doc.createElement("a");
+  link.href = buildNativeDownloadUrl(doc, path, params, apiUrl);
+  link.rel = "noopener";
+  link.style.display = "none";
+  try {
+    doc.body?.appendChild(link);
+    link.click();
+  } finally {
+    // Do not synchronously detach a native-navigation anchor: the download
+    // event can be handed to Electron only after the click call unwinds.
+    scheduleDownloadCleanup(doc, () => link.remove());
+  }
+}
+
+async function hostResourceDownload(doc, path, params = {}, apiUrl, resourceOpen) {
+  if (typeof resourceOpen !== "function") return false;
+  const url = buildNativeDownloadUrl(doc, path, params, apiUrl);
+  const result = await resourceOpen({
+    resource: { kind: "url", url },
+    mode: "download",
+  });
+  if (result && result.opened === false) throw new Error("宿主未能打开下载地址");
+  return true;
+}
+
+async function startDownload(doc, path, params = {}, apiUrl, resourceOpen, callApi) {
+  // 1. Direct Node.js filesystem save (Option B - Windows Downloads folder)
+  if (typeof callApi === "function") {
+    try {
+      const result = await callApi(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...params, saveToDisk: true }),
+      });
+      if (result && result.saved && result.filePath) {
+        if (typeof resourceOpen === "function") {
+          try {
+            await resourceOpen({
+              resource: { kind: "local-file", path: result.filePath },
+              mode: "reveal",
+            });
+          } catch {}
+        }
+        return { method: "direct", filePath: result.filePath, fileName: result.fileName };
+      }
+    } catch (err) {
+      console.warn("Direct disk save failed, falling back to host opener:", err);
+    }
+  }
+
+  // 2. Host-mediated opener
+  try {
+    if (await hostResourceDownload(doc, path, params, apiUrl, resourceOpen)) return { method: "host" };
+  } catch {}
+
+  // 3. Fallback: native iframe download anchor
+  nativeDownload(doc, path, params, apiUrl);
+  return { method: "native" };
 }
 
 async function copyText(value) {
@@ -180,12 +268,46 @@ export function createResearchTools(options = {}) {
   workflowNav.setAttribute("aria-label", "研究工作流");
   const nav = makeElement(doc, "nav", "research-tools-nav");
   nav.setAttribute("aria-label", "当前工作流工具");
+  const notice = makeElement(doc, "div", "research-tools-notification");
+  notice.setAttribute("role", "status");
+  notice.setAttribute("aria-live", "polite");
+  notice.hidden = true;
   const body = makeElement(doc, "div", "research-tools-body");
   const empty = makeElement(doc, "div", "research-tools-empty", "当前没有可分析的论文");
   const content = makeElement(doc, "div", "research-tools-content");
   body.append(empty, content);
-  shell.append(header, workflowNav, nav, body);
+  shell.append(header, notice, workflowNav, nav, body);
   root.appendChild(shell);
+
+  let noticeTimer = null;
+  const clearNoticeTimer = () => {
+    if (noticeTimer === null) return;
+    const clearTimer = doc.defaultView?.clearTimeout || globalThis.clearTimeout;
+    if (typeof clearTimer === "function") clearTimer(noticeTimer);
+    noticeTimer = null;
+  };
+
+  function notify(message, type = "info") {
+    const text = String(message || "");
+    clearNoticeTimer();
+    notice.textContent = text;
+    notice.dataset.type = type;
+    notice.hidden = !text;
+    if (text) {
+      const timer = doc.defaultView?.setTimeout || globalThis.setTimeout;
+      if (typeof timer === "function") {
+        noticeTimer = timer(() => {
+          notice.hidden = true;
+          notice.textContent = "";
+          noticeTimer = null;
+        }, 3000);
+      }
+    }
+    try {
+      const pending = options.toast?.({ message: text, type });
+      if (pending && typeof pending.catch === "function") void pending.catch(() => {});
+    } catch {}
+  }
 
   const workflowButtons = new Map();
   for (const [id, label, description] of WORKFLOW_DEFINITIONS) {
@@ -229,10 +351,6 @@ export function createResearchTools(options = {}) {
     view.setAttribute("aria-label", label);
     content.appendChild(view);
     views.set(id, view);
-  }
-
-  function notify(message, type = "info") {
-    try { options.toast?.({ message, type }); } catch {}
   }
 
   async function call(path, init = {}) {
@@ -787,12 +905,29 @@ export function createResearchTools(options = {}) {
       const backupActions = makeElement(doc, "div", "research-tools-actions research-tools-backup-actions");
       const backup = button(doc, "导出完整备份", "research-tools-button-primary");
       addListener(backup, "click", async () => {
+        if (!hash) { notify("当前没有可导出的论文", "error"); return; }
         backup.disabled = true;
         try {
-          const data = await call(endpoints.backup, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ paperHash: hash, includeAssets: true }) });
-          downloadBlob(doc, new Blob([JSON.stringify(data)], { type: "application/json;charset=utf-8" }), `hana-paper-reader-${hash.slice(0, 12)}.backup.json`);
-          notify("论文结构、译文、研究记录与视觉缓存已导出", "success");
-        } finally { backup.disabled = false; }
+          const result = await startDownload(
+            doc,
+            endpoints.backup,
+            { paperHash: hash, includeAssets: "true" },
+            options.apiUrl,
+            options.resourceOpen,
+            call,
+          );
+          if (result?.method === "direct" && result?.filePath) {
+            notify(`✅ 完整备份已保存至下载文件夹：${result.fileName}`, "success");
+          } else if (result?.method === "host") {
+            notify("完整备份已交给宿主下载，请检查下载文件夹", "info");
+          } else {
+            notify("完整备份下载已发起，请检查浏览器下载列表", "info");
+          }
+        } catch (error) {
+          notify(`备份导出失败：${error?.message || "下载地址无效"}`, "error");
+        } finally {
+          window.setTimeout(() => { if (backup.isConnected) backup.disabled = false; }, 500);
+        }
       });
       const restoreInput = makeElement(doc, "input", "");
       restoreInput.type = "file"; restoreInput.accept = ".json,application/json"; restoreInput.hidden = true;
@@ -918,17 +1053,21 @@ export function createResearchTools(options = {}) {
         const target = translation.value.trim();
         if (!source || !target) { notify("请填写原文术语和固定译法", "error"); return; }
         save.disabled = true;
+        const requestPaperHash = hash;
         try {
           const result = await call(endpoints.glossary, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ paperHash: paperHash(), terms: { [source]: target } }),
+            body: JSON.stringify({ paperHash: requestPaperHash, terms: { [source]: target } }),
           });
+          if (!isCurrentRender("glossary", token, requestPaperHash)) return;
           state.glossary = result?.glossary?.terms || state.glossary;
-          options.onPaperStateChanged?.({ kind: "glossary", glossary: result?.glossary });
+          await options.onPaperStateChanged?.({ kind: "glossary", paperHash: requestPaperHash, glossary: result?.glossary });
           notify("术语已保存；后续翻译将使用新版本", "success");
           render();
-        } catch {}
+        } catch (error) {
+          notify(`术语保存失败：${error?.message || "请求失败"}`, "error");
+        }
         finally { save.disabled = false; }
       });
       view.appendChild(form);
@@ -939,12 +1078,16 @@ export function createResearchTools(options = {}) {
         const remove = button(doc, "删除", "research-tools-button-danger");
         addListener(remove, "click", async () => {
           remove.disabled = true;
+          const requestPaperHash = hash;
           try {
-            await call(`${endpoints.glossary}?paperHash=${encodeURIComponent(paperHash())}&term=${encodeURIComponent(source)}`, { method: "DELETE" });
-            options.onPaperStateChanged?.({ kind: "glossary", deletedTerm: source });
+            await call(`${endpoints.glossary}?paperHash=${encodeURIComponent(requestPaperHash)}&term=${encodeURIComponent(source)}`, { method: "DELETE" });
+            if (!isCurrentRender("glossary", token, requestPaperHash)) return;
+            await options.onPaperStateChanged?.({ kind: "glossary", paperHash: requestPaperHash, deletedTerm: source });
             notify("术语已删除", "success");
             render();
-          } catch {} finally { remove.disabled = false; }
+          } catch (error) {
+            notify(`术语删除失败：${error?.message || "请求失败"}`, "error");
+          } finally { remove.disabled = false; }
         });
         row.appendChild(remove);
         list.appendChild(row);
@@ -1052,28 +1195,27 @@ export function createResearchTools(options = {}) {
   }
 
   async function exportMarkdown() {
-    const data = await call(endpoints.export, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ paperHash: paperHash(), translations: state.paper?.translations || {}, options: { attachmentBasePath: "attachments" } }),
-    });
-    const markdown = typeof data === "string" ? data : data?.markdown;
-    if (!markdown) throw new Error("导出接口没有返回 Markdown");
-    const link = doc.createElement("a");
-    link.href = URL.createObjectURL(new Blob([markdown], { type: "text/markdown;charset=utf-8" }));
-    link.download = `${String(state.paper?.title || "paper").replace(/[\\/:*?"<>|]/g, "_")}.md`;
-    link.rel = "noopener";
-    doc.body?.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(link.href), 0);
-    notify("双语 Markdown 已导出", "success");
+    const hash = paperHash();
+    if (!hash) throw new Error("当前没有可导出的论文");
+    const result = await startDownload(doc, endpoints.export, { paperHash: hash }, options.apiUrl, options.resourceOpen, call);
+    if (result?.method === "direct" && result?.filePath) {
+      notify(`✅ 双语 Markdown 已保存至下载文件夹：${result.fileName}`, "success");
+    } else if (result?.method === "host") {
+      notify("双语 Markdown 已交给宿主下载，请检查下载文件夹", "info");
+    } else {
+      notify("双语 Markdown 下载已发起，请检查浏览器下载列表", "info");
+    }
   }
 
   function renderExport(view) {
     view.append(makeElement(doc, "p", "research-tools-muted", "导出当前论文的原文与翻译对照。"));
     const exportButton = button(doc, "导出双语 Markdown", "research-tools-button-primary");
-    addListener(exportButton, "click", () => { exportButton.disabled = true; void exportMarkdown().catch(() => notify("导出失败", "error")).finally(() => { exportButton.disabled = false; }); });
+    addListener(exportButton, "click", async () => {
+      exportButton.disabled = true;
+      try { await exportMarkdown(); }
+      catch (error) { notify(`导出失败：${error?.message || "下载地址无效"}`, "error"); }
+      finally { window.setTimeout(() => { if (exportButton.isConnected) exportButton.disabled = false; }, 500); }
+    });
     view.appendChild(exportButton);
   }
 
@@ -1136,7 +1278,7 @@ export function createResearchTools(options = {}) {
   }
   function uiState() { return { searchState: searchStateSnapshot(), noteDraft: state.noteDraft }; }
   function closeDrawer() { state.open = false; render(); return api; }
-  function destroy() { shell.remove(); state.destroyed = true; }
+  function destroy() { clearNoticeTimer(); shell.remove(); state.destroyed = true; }
   const api = { open, close: closeDrawer, destroy, refresh, restoreUiState, uiState };
   addListener(close, "click", closeDrawer);
   render();

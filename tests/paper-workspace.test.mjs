@@ -234,6 +234,37 @@ test("schema 3 writes each paper to an independent directory", async () => {
   await reopened.close();
 });
 
+test("independent workspace instances preserve glossary writes during stale paper sync", async () => {
+  await workspace.upsertPaper(fixture());
+  const stale = createPaperWorkspace({ dataDir: tempDir });
+  stale.getPaper(hash); // Load a pre-glossary snapshot, as a hot-reloaded route can do.
+  await workspace.putGlossary({ paperHash: hash, terms: { azobenzene: "偶氮苯" } });
+  await stale.upsertPaper({ ...fixture(), metadata: { title: "Updated from stale instance" } });
+  assert.equal(stale.getGlossary(hash).terms.azobenzene, "偶氮苯");
+  const reopened = createPaperWorkspace({ dataDir: tempDir });
+  assert.equal(reopened.getGlossary(hash).terms.azobenzene, "偶氮苯");
+  assert.equal(reopened.getPaper(hash).metadata.title, "Updated from stale instance");
+  await stale.close();
+  await reopened.close();
+});
+
+test("concurrent glossary mutations from separate instances are serialized", async () => {
+  await workspace.upsertPaper(fixture());
+  const first = createPaperWorkspace({ dataDir: tempDir });
+  const second = createPaperWorkspace({ dataDir: tempDir });
+  await Promise.all([
+    first.putGlossary({ paperHash: hash, terms: { alpha: "阿尔法" } }),
+    second.putGlossary({ paperHash: hash, terms: { beta: "贝塔" } }),
+  ]);
+  const reopened = createPaperWorkspace({ dataDir: tempDir });
+  assert.equal(reopened.getGlossary(hash).terms.alpha, "阿尔法");
+  assert.equal(reopened.getGlossary(hash).terms.beta, "贝塔");
+  assert.equal(reopened.getGlossary(hash).version, 2);
+  await first.close();
+  await second.close();
+  await reopened.close();
+});
+
 test("data ownership actions preserve user finals and Evidence-bound notes", async () => {
   await workspace.upsertPaper({
     ...fixture(),

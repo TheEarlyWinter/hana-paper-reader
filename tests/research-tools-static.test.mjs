@@ -8,6 +8,15 @@ const source = read("assets/research-tools.js");
 const css = read("assets/research-tools.css");
 
 assert.match(source, /export function createResearchTools\s*\(/);
+assert.match(source, /function buildNativeDownloadUrl[\s\S]*?withSurfaceSession/);
+assert.match(source, /function scheduleDownloadCleanup[\s\S]*?1000/);
+assert.match(source, /function hostResourceDownload[\s\S]*?mode: "download"/);
+assert.match(source, /function startDownload[\s\S]*?resourceOpen/);
+assert.match(source, /startDownload\(\s*doc,\s*endpoints\.export/);
+assert.match(source, /startDownload\(\s*doc,\s*endpoints\.backup/);
+assert.match(source, /options\.apiUrl/);
+assert.match(source, /options\.resourceOpen/);
+assert.match(source, /}, 3000\);/);
 assert.match(source, /export default createResearchTools/);
 for (const symbol of ["open", "close", "destroy", "refresh", "apiFetch", "getPaper", "getSelectedBlock", "onLocateBlock", "onPaperStateChanged", "toast"]) {
   assert.match(source, new RegExp(symbol));
@@ -43,7 +52,7 @@ assert.match(css, /var\(--accent/);
 const cssClasses = [
   "research-tools-drawer", "research-tools-header", "research-tools-heading", "research-tools-title",
   "research-tools-paper", "research-tools-close", "research-workflow-nav", "research-workflow-button", "research-tools-nav", "research-tools-nav-button",
-  "research-tools-body", "research-tools-empty", "research-tools-content", "research-tools-view",
+  "research-tools-body", "research-tools-empty", "research-tools-content", "research-tools-view", "research-tools-notification",
   "research-tools-form", "research-tools-actions", "research-tools-input", "research-tools-select",
   "research-tools-textarea", "research-tools-context", "research-tools-muted", "research-tools-results",
   "research-tools-result", "research-tools-result-index", "research-tools-result-text", "research-tools-state-row", "research-tools-list",

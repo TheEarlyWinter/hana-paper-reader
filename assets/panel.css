@@ -381,6 +381,46 @@ html, body, #root {
   overflow: hidden;
 }
 
+.panel-notice {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  z-index: 120;
+  max-width: min(720px, calc(100% - 32px));
+  padding: 8px 12px;
+  transform: translateX(-50%);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-input);
+  background: var(--bg-card);
+  box-shadow: 0 6px 20px rgba(42, 38, 34, 0.14);
+  color: var(--text-light);
+  font: 0.78rem/1.45 var(--font-ui);
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+.panel-notice[data-type="success"] {
+  border-left-color: var(--green);
+  background: rgba(74, 107, 74, 0.1);
+}
+
+.panel-notice[data-type="error"] {
+  border-left-color: var(--danger);
+  background: rgba(139, 44, 31, 0.08);
+  color: var(--danger);
+}
+
+.panel-notice[data-type="warning"] {
+  border-left-color: #976125;
+  background: rgba(180, 119, 46, 0.12);
+  color: #976125;
+}
+
+.panel-notice[hidden] {
+  display: none;
+}
+
 /* 全屏拖拽遮罩 */
 .drag-overlay {
   position: absolute;

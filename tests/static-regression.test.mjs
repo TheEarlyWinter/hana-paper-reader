@@ -14,7 +14,7 @@ const cssSource = read("assets/panel.css");
 const mineruSource = read("lib/mineru.js");
 const readme = read("README.md");
 
-assert.equal(manifest.version, "0.7.1");
+assert.equal(manifest.version, "0.8.0");
 assert.equal(manifest.contributes.configuration.properties.mineruApiToken.sensitive, true);
 assert.equal(manifest.contributes.configuration.properties.mineruApiToken.scope, "global");
 assert.ok(manifest.capabilities.includes("network.fetch"));
@@ -35,7 +35,12 @@ for (const forbidden of ["parsePdfBuffer", "getPdfRuntime", "currentParser", "pd
 }
 assert.match(apiSource, /本地解析已移除/);
 assert.match(panelSource, /MinerU 精准解析设置/);
-assert.match(panelSource, /UI_VERSION = "0\.7\.1"/);
+assert.match(panelSource, /UI_VERSION = "0\.8\.0-r1"/);
+assert.match(panelSource, /function pluginApiUrl[\s\S]*?hana\.api\.url/);
+assert.match(panelSource, /id="panel-notice"/);
+assert.match(panelSource, /function showPanelNotice[\s\S]*?panelNoticeTimer/);
+assert.match(panelSource, /hanaBridge\.toast\.show/);
+assert.doesNotMatch(panelSource, /const hana =/);
 for (const mode of ["original", "bilingual", "translation", "contrast"]) assert.match(panelSource, new RegExp(`data-reading-mode=\\"${mode}\\"`));
 assert.match(panelSource, /逐段上下对照/);
 assert.match(panelSource, /renderContrastPair/);
@@ -58,9 +63,9 @@ assert.match(panelSource, /pluginApiFetch\("\/api\/research\/recent"\)/);
 assert.match(panelSource, /revision !== paperRevision \|\| currentPaper\.blocks\.length/);
 assert.match(panelSource, /重新选择同一 PDF 可恢复原页预览/);
 assert.doesNotMatch(panelSource, /readAsDataURL|fileToBase64/);
-assert.match(apiSource, /PLUGIN_API_VERSION = "0\.7\.1"/);
-assert.match(apiSource, /paper-export\.js\?hpr=0\.7\.1-r1/);
-assert.match(apiSource, /paper-workspace\.js\?hpr=0\.7\.1-r1/);
+assert.match(apiSource, /PLUGIN_API_VERSION = "0\.8\.0"/);
+assert.match(apiSource, /paper-export\.js\?hpr=0\.8\.0-r1/);
+assert.match(apiSource, /paper-workspace\.js\?hpr=0\.8\.0-r1/);
 assert.match(apiSource, /provider:models-by-type/);
 assert.match(apiSource, /app\.get\("\/api\/models"/);
 assert.match(panelSource, /modelRef: selectedModelRefForAgent/);
@@ -87,7 +92,7 @@ assert.match(mineruSource, /language:\s*options\.language/);
 assert.doesNotMatch(mineruSource, /file-urls\/batch\?/);
 assert.match(mineruSource, /shouldRetryWithOcr/);
 assert.match(mineruSource, /ocrFallback/);
-assert.match(read("routes/ui.js"), /ASSET_VERSION = "0\.7\.1-r1"/);
+assert.match(read("routes/ui.js"), /ASSET_VERSION = "0\.8\.0-r1"/);
 assert.match(readme, /^# Hana Paper Reader/m);
 assert.match(readme, /MIT License/);
 assert.match(readme, /application\/pdf/);
@@ -174,7 +179,7 @@ assert.equal(typeof routes.get("POST /api/create-session-and-send"), "function")
 
 const publicSettings = getSettings(jsonContext()).value;
 assert.equal(publicSettings.configured, true);
-assert.equal(publicSettings.apiVersion, "0.7.1");
+assert.equal(publicSettings.apiVersion, "0.8.0");
 assert.equal("token" in publicSettings, false);
 assert.equal("mineruApiToken" in publicSettings, false);
 assert.equal(JSON.stringify(publicSettings).includes(configState.mineruApiToken), false);
