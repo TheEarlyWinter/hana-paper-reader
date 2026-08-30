@@ -4,7 +4,7 @@
 
 它不只是把 PDF 翻译成中文，而是把论文转换为一个可以搜索、定位、引用、提问、批注和导出的研究工作区：**MinerU 提取语义结构，PDF.js 保留原始页面证据，Hana 助手负责翻译与解释，稳定的 `Page X / block Y` 锚点把每个结论带回原文。**
 
-- 当前版本：`0.8.0`
+- 当前版本：`0.9.0`
 - 插件 ID：`hana-paper-reader`
 - 最低 Hana 版本：`0.686.15`
 - 许可证：MIT
@@ -23,7 +23,7 @@
 - 同一份 PDF 能否避免重复上传和重复解析？
 - 阅读结果能否离开插件，沉淀为带证据锚点的 Markdown？
 
-0.6.0 将这些能力收束为统一 Evidence 证据对象，以及“定位、核验、沉淀”三条本地优先、证据优先的研究工作流。0.6.1 在此基础上补齐四类证据型笔记、可解释的论文内检索、图表证据区、每篇论文独立存储、数据分项清理、完整备份恢复和可重复发版门禁。0.8.0 进一步解决 Hana WebView 中浏览器下载接口不一定真正落盘的问题：Markdown 与完整备份优先由插件后端写入 Windows `Downloads` 目录，并保留宿主与原生下载回退。
+0.6.0 将这些能力收束为统一 Evidence 证据对象，以及“定位、核验、沉淀”三条本地优先、证据优先的研究工作流。0.6.1 在此基础上补齐四类证据型笔记、可解释的论文内检索、图表证据区、每篇论文独立存储、数据分项清理、完整备份恢复和可重复发版门禁。0.8.0 进一步解决 Hana WebView 中浏览器下载接口不一定真正落盘的问题：Markdown 与完整备份优先由插件后端写入 Windows `Downloads` 目录，并保留宿主与原生下载回退。0.9.0 将这些能力完成为可实机使用的论文库交互：删除确认、CSV 导出、剪贴板降级和公式 LaTeX 复制均有明确反馈，并修复开发版资源会话凭据在 WebView 中丢失导致的加载问题。
 
 ## 核心能力
 
@@ -299,6 +299,15 @@ MinerU 官方 API 文档：<https://mineru.net/apiManage/docs>
 - 单个翻译块后端上限为 12,000 字符；全文翻译按小批次执行。
 - 用户提供的表格 HTML 仅作为代码围栏导出，不在 Markdown 导出过程中执行。
 
+## 0.9.0 更新摘要
+
+- 文库删除按钮改为稳定容器事件委托；确认弹窗移到 `document.body`，取消不会触发删除，确认操作不会重复执行。
+- 新增表格 CSV 导出接口，支持直接落盘、宿主资源下载、Blob 和原生导航回退，并对特殊字符和表格公式注入做安全处理。
+- Markdown、引用和公式复制增加宿主剪贴板、浏览器 Clipboard API 与 `textarea + execCommand` 降级；浏览器拒绝写入时仍给出明确提示。
+- 图表、表格和公式工具的操作入口增加可见文本、`title` 与 `aria-label`；公式块只有文本没有独立图片资源时仍显示“复制 LaTeX”。
+- 修复 WebView 资源基地址清洗误删 `pluginSurfaceSession` 的问题，保留会话凭据并继续拒绝跨源脚本资源。
+- 通过 Windows 10 / HanaAgent 0.769.0 实机回归，目标交互无阻塞；全量 Node 测试 75/75 通过。
+
 ## 0.8.0 更新摘要
 
 - 双语 Markdown 和完整研究备份优先由插件后端直接写入 Windows `Downloads` 目录，返回实际文件名、路径和大小。
@@ -378,7 +387,7 @@ $tests = Get-ChildItem tests -File -Filter *.mjs |
 node --test @tests
 ```
 
-0.8.0 当前测试覆盖：
+0.9.0 当前测试覆盖：
 
 - MinerU 二进制协议与旧 Base64 兼容；
 - OCR fallback 触发边界；
@@ -399,10 +408,10 @@ node --test @tests
 一键执行完整发版门禁：
 
 ```powershell
-./scripts/build-release.ps1 -Version 0.8.0 -OutputDir ../dist
+./scripts/build-release.ps1 -Version 0.9.0 -OutputDir ../dist
 ```
 
-脚本会按固定顺序执行语法检查、源码测试、净目录 ZIP、反向解包、逐文件哈希比对、解包后复测、敏感数据扫描、SHA-256 和 QA 报告。GitHub Release 正文只从仓库内 UTF-8 `RELEASE_NOTES_0.8.0.md` 读取。
+脚本会按固定顺序执行语法检查、源码测试、净目录 ZIP、反向解包、逐文件哈希比对、解包后复测、敏感数据扫描、SHA-256 和 QA 报告。GitHub Release 正文只从仓库内 UTF-8 `RELEASE_NOTES_0.9.0.md` 读取。
 
 ## 开源与第三方软件
 

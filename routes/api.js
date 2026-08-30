@@ -3,14 +3,18 @@ import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { parsePdfWithMineru, readMineruAsset } from "../lib/mineru.js";
-import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.8.0-r1";
-import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.8.0-r1";
+import { generatePaperMarkdown } from "../lib/paper-export.js?hpr=0.9.0-r1";
+import { tableHtmlToCsv } from "../lib/paper-csv.js";
+import { normalizeAuthors, normalizeDisplayText, normalizePaperMetadata, normalizeTags, normalizeYear } from "../lib/paper-metadata.js";
+import { normalizePaperHash, assertPaperHash, isSafePaperHash } from "../lib/paper-identity.js";
+import { createPaperWorkspace, sha256 } from "../lib/paper-workspace.js?hpr=0.9.0-r1";
+import { createQaLogger } from "../lib/qa-log.js";
 
 const AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const DELETED_AGENT_TOMBSTONE = ".deleted-agent.json";
 const MODEL_REF_RE = /^[^/\x00-\x20]{1,160}\/[^\x00-\x20]{1,240}$/u;
 const MODEL_CATALOG_TTL_MS = 5000;
-const PLUGIN_API_VERSION = "0.8.0";
+const PLUGIN_API_VERSION = "0.9.0";
 const MAX_SESSION_TARGETS = 200;
 const MAX_SESSION_ID_LENGTH = 256;
 const MAX_SESSION_TARGET_ID_LENGTH = 96;
@@ -28,6 +32,7 @@ const agentSessionCache = new Map();
 const agentTurnLocks = new Map();
 const modelCatalogCache = new WeakMap();
 const sessionTargetStore = new Map();
+const qaLoggerCache = new WeakMap();
 const MINERU_MODELS = new Set(["vlm", "pipeline"]);
 const MINERU_LANGUAGES = new Set(["ch", "en", "japan", "latin"]);
 const researchWorkspaceCache = new WeakMap();
@@ -712,6 +717,11 @@ function quoteSessionPayload(workspace, body) {
     throw new SessionTargetError("选中文本为空或过长", 400, "quote_invalid");
   }
   const evidence = verifiedQuoteEvidence(workspace, body);
+  if (body?.blockId || body?.evidenceId) {
+    if (!evidence) {
+      throw new SessionTargetError("引文选区与目标论文块不匹配或已失效", 400, "quote_mismatch");
+    }
+  }
   const citation = evidence ? `Page ${evidence.page} / block ${evidence.blockId}` : "";
   const context = withoutClientCitation(body.context);
   const text = `【文献划词研讨】\n论文：${String(body.paperTitle || "当前阅读论文").slice(0, 500)}\n${citation ? `已核验来源：${citation}\n` : ""}选中文本：${quote}\n上下文：${context}\n\n请在这个助手会话中继续分析这段内容。${citation ? `回答时请保留来源标记：${citation}。` : ""}`;
@@ -930,11 +940,24 @@ async function readPdfRequest(c) {
 
 function getResearchWorkspace(ctx) {
   let workspace = researchWorkspaceCache.get(ctx);
-  if (!workspace) {
+  if (!workspace || typeof workspace.listLibrary !== "function") {
     workspace = createPaperWorkspace({ dataDir: ctx.dataDir });
     researchWorkspaceCache.set(ctx, workspace);
   }
   return workspace;
+}
+
+// Route handlers can outlive a hot-reloaded workspace object. Resolve the
+// current instance on every property access so reads and writes always target
+// the same on-disk workspace, rather than a stale closure captured at startup.
+function dynamicResearchWorkspace(ctx, fallback = null) {
+  return new Proxy({}, {
+    get(_target, property) {
+      const target = getResearchWorkspace(ctx) || fallback;
+      const value = target?.[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 function hasOwn(value, key) {
@@ -962,6 +985,20 @@ function researchJsonError(c, error, status = 400) {
   return c.json({ ok: false, error: String(error?.message || error || "研究工作区请求失败").slice(0, 500) }, status);
 }
 
+function qaLogger(ctx) {
+  if (!ctx || typeof ctx !== "object") return null;
+  let logger = qaLoggerCache.get(ctx);
+  if (!logger) {
+    logger = createQaLogger({ dataDir: ctx.dataDir });
+    qaLoggerCache.set(ctx, logger);
+  }
+  return logger;
+}
+
+function logQa(ctx, level, event, details = {}) {
+  try { return qaLogger(ctx)?.write(level, event, details); } catch { return null; }
+}
+
 function downloadFileName(value, extension, fallback) {
   const suffix = String(extension || "");
   const raw = String(value || "")
@@ -979,6 +1016,18 @@ function contentDispositionAttachment(fileName) {
   return `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`;
 }
 
+function csvDownloadResponse(csv, fileName, paperHash) {
+  return new Response(`\uFEFF${csv}`, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": contentDispositionAttachment(fileName),
+      "Cache-Control": "private, no-store",
+      "X-Paper-Hash": paperHash,
+    },
+  });
+}
+
 function getDownloadsDirectory() {
   const home = process.env.USERPROFILE || process.env.HOME || (typeof os.homedir === "function" ? os.homedir() : "");
   if (home) {
@@ -992,8 +1041,11 @@ function getDownloadsDirectory() {
   return null;
 }
 
-function saveFileToDisk(content, preferredFileName, fallbackDir = null) {
-  let targetDir = getDownloadsDirectory();
+function saveFileToDisk(content, preferredFileName, fallbackDir = null, options = {}) {
+  // An explicit fallbackDir is the target for callers such as tests and
+  // isolated exports. Production export routes opt into Downloads preference.
+  let targetDir = options.preferDownloads === true ? getDownloadsDirectory() : fallbackDir;
+  if (!targetDir) targetDir = getDownloadsDirectory();
   if (!targetDir && fallbackDir) targetDir = fallbackDir;
   if (!targetDir) {
     targetDir = path.join(process.cwd(), "exports");
@@ -1004,20 +1056,41 @@ function saveFileToDisk(content, preferredFileName, fallbackDir = null) {
   const baseName = path.basename(preferredFileName, ext);
   let finalName = preferredFileName;
   let targetPath = path.join(targetDir, finalName);
-  let counter = 1;
+  let counter = 0;
+  let fd = null;
 
-  while (fs.existsSync(targetPath)) {
-    finalName = `${baseName} (${counter})${ext}`;
+  while (true) {
+    if (counter === 0) {
+      finalName = preferredFileName;
+    } else {
+      finalName = `${baseName} (${counter})${ext}`;
+    }
     targetPath = path.join(targetDir, finalName);
-    counter++;
+    try {
+      fd = fs.openSync(targetPath, "wx");
+      break;
+    } catch (err) {
+      if (err && err.code === "EEXIST") {
+        counter++;
+        continue;
+      }
+      throw err;
+    }
   }
 
-  fs.writeFileSync(targetPath, content, typeof content === "string" ? "utf-8" : undefined);
-  const size = Buffer.byteLength(content, typeof content === "string" ? "utf-8" : undefined);
-  return { filePath: targetPath, fileName: finalName, size, directory: targetDir };
+  try {
+    const buffer = Buffer.isBuffer(content) ? content : Buffer.from(content, typeof content === "string" ? "utf-8" : undefined);
+    fs.writeSync(fd, buffer, 0, buffer.length, 0);
+    const size = buffer.length;
+    return { filePath: targetPath, fileName: finalName, size, directory: targetDir };
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
 }
 
-function buildResearchMarkdown(workspace, paperHash, body = {}) {
+function buildResearchMarkdown(workspace, paperHash, body = {}, ctx = null) {
   const paper = workspace.getPaper(paperHash);
   if (!paper) return null;
   const markdown = generatePaperMarkdown({
@@ -1078,6 +1151,7 @@ function publicCachedPaper(paper, glossary = null) {
   const glossaryRecord = glossary && typeof glossary === "object" && !Array.isArray(glossary) ? glossary : null;
   return {
     paperHash: paper.paperHash,
+    revision: Number.isInteger(Number(paper.revision)) ? Number(paper.revision) : 0,
     metadata: paper.metadata || {},
     parser: paper.parser || {},
     blocks: Array.isArray(paper.blocks) ? paper.blocks : [],
@@ -1240,10 +1314,26 @@ function enforceEvidenceCitations(answer, evidence) {
   return text;
 }
 
+function normalizeSubstrings(str) {
+  return String(str || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
 function verifiedQuoteEvidence(workspace, body) {
   const hash = typeof body?.paperHash === "string" && /^[a-f0-9]{12,128}$/i.test(body.paperHash) ? body.paperHash : "";
   if (!hash) return null;
-  return workspace.getEvidence(hash, { evidenceId: body?.evidenceId, blockId: body?.blockId }, { usageKind: "selection" });
+  const evidence = workspace.getEvidence(hash, { evidenceId: body?.evidenceId, blockId: body?.blockId }, { usageKind: "selection" });
+  if (!evidence) return null;
+  if (typeof body?.quote === "string" && body.quote.trim()) {
+    const rawQuote = normalizeSubstrings(body.quote);
+    const orig = normalizeSubstrings(evidence.originalQuote || evidence.text);
+    const trans = normalizeSubstrings(evidence.translation || evidence.translatedText);
+    const matchesOrig = orig && orig.includes(rawQuote);
+    const matchesTrans = trans && trans.includes(rawQuote);
+    if (!matchesOrig && !matchesTrans) {
+      return null;
+    }
+  }
+  return evidence;
 }
 
 function verifiedQuoteCitation(workspace, body) {
@@ -1278,12 +1368,198 @@ function recentWorkspacePaper(workspace) {
   return papers[0] || null;
 }
 
+function listWorkspaceLibrary(workspace, options = {}) {
+  if (typeof workspace?.listLibrary === "function") {
+    return workspace.listLibrary(options);
+  }
+  const store = typeof workspace?.load === "function" ? workspace.load() : { papers: {}, progress: {}, notes: {}, bookmarks: {} };
+  const rawPapers = Object.values(store.papers || {}).filter((paper) => paper && typeof paper === "object" && isSafePaperHash(paper.paperHash));
+  const query = String(options.query || options.q || "").trim().toLowerCase();
+  const sortField = String(options.sort || "lastRead").trim();
+  const sortOrder = String(options.order || "desc").toLowerCase();
+  const filterFavorite = options.favorite === true || options.favorite === "true";
+  const filterArchived = options.archived === "all" ? "all" : (options.archived === true || options.archived === "true");
+  const filterTag = String(options.tag || "").trim().toLowerCase();
+
+  const items = rawPapers.map((paper) => {
+    const hash = normalizePaperHash(paper.paperHash);
+    const metadata = normalizePaperMetadata(paper.metadata);
+    const progress = store.progress?.[hash] || null;
+    const notes = Object.values(store.notes || {}).filter((item) => normalizePaperHash(item?.paperHash) === hash);
+    const bookmarks = Object.values(store.bookmarks || {}).filter((item) => normalizePaperHash(item?.paperHash) === hash);
+    const tags = metadata.tags;
+    const favorite = metadata.favorite === true || paper.favorite === true;
+    const archived = metadata.archived === true || paper.archived === true;
+    const lastReadAt = paper.lastReadAt || metadata.lastReadAt || progress?.updatedAt || paper.updatedAt || paper.createdAt || null;
+    const title = metadata.title || "未命名论文";
+    const authors = metadata.authors;
+    const blockCount = Array.isArray(paper.blocks) ? paper.blocks.length : Number(metadata.blockCount || 0);
+
+    return {
+      paperHash: hash,
+      title,
+      authors,
+      doi: metadata.doi || null,
+      year: metadata.year || null,
+      tags,
+      favorite,
+      archived,
+      lastReadAt,
+      createdAt: paper.createdAt || null,
+      updatedAt: paper.updatedAt || null,
+      blockCount,
+      noteCount: notes.length,
+      bookmarkCount: bookmarks.length,
+      hasGlossary: Boolean(paper.glossaryTerms && Object.keys(paper.glossaryTerms).length),
+      readingProgress: {
+        percent: Number(progress?.percent || 0),
+        lastBlockId: progress?.lastBlockId || null,
+        readingMode: progress?.readingMode || "bilingual",
+      },
+    };
+  }).filter((item) => {
+    if (filterFavorite && !item.favorite) return false;
+    if (filterArchived === true && !item.archived) return false;
+    if (filterArchived === false && item.archived) return false;
+    if (filterTag && !item.tags.some((t) => String(t).toLowerCase().includes(filterTag))) return false;
+    if (query) {
+      const matchTitle = String(item.title || "").toLowerCase().includes(query);
+      const matchAuthor = Array.isArray(item.authors) && item.authors.some((a) => String(a).toLowerCase().includes(query));
+      const matchDoi = String(item.doi || "").toLowerCase().includes(query);
+      const matchHash = String(item.paperHash || "").toLowerCase().includes(query);
+      const matchTag = Array.isArray(item.tags) && item.tags.some((t) => String(t).toLowerCase().includes(query));
+      if (!matchTitle && !matchAuthor && !matchDoi && !matchHash && !matchTag) return false;
+    }
+    return true;
+  });
+
+  items.sort((left, right) => {
+    let compare = 0;
+    if (sortField === "title") {
+      compare = String(left.title || "").localeCompare(String(right.title || ""), "zh-CN");
+    } else if (sortField === "created") {
+      compare = String(right.createdAt || "").localeCompare(String(left.createdAt || ""));
+    } else if (sortField === "updated") {
+      compare = String(right.updatedAt || "").localeCompare(String(left.updatedAt || ""));
+    } else {
+      compare = String(right.lastReadAt || "").localeCompare(String(left.lastReadAt || ""));
+    }
+    return sortOrder === "asc" ? -compare : compare;
+  });
+
+  return items;
+}
+
+async function updateWorkspacePaperMetadata(workspace, paperHash, updates = {}) {
+  const hash = normalizePaperHash(paperHash);
+  if (!isSafePaperHash(hash)) throw new Error("缺少有效的 paperHash");
+  if (typeof workspace?.updatePaperMetadata === "function") {
+    return workspace.updatePaperMetadata(hash, updates);
+  }
+  const store = typeof workspace?.load === "function" ? workspace.load() : { papers: {} };
+  const paper = store.papers?.[hash];
+  if (!paper) throw new Error("未找到指定文献");
+  const metadata = { ...normalizePaperMetadata(paper.metadata) };
+  if (paper.favorite === true && metadata.favorite !== true) metadata.favorite = true;
+  if (paper.archived === true && metadata.archived !== true) metadata.archived = true;
+  if (updates.title !== undefined) {
+    const cleanTitle = normalizeDisplayText(updates.title, 500, "");
+    if (cleanTitle) {
+      metadata.title = cleanTitle;
+      paper.title = cleanTitle;
+    }
+  }
+  if (updates.authors !== undefined) metadata.authors = normalizeAuthors(updates.authors);
+  if (updates.tags !== undefined) metadata.tags = normalizeTags(updates.tags);
+  if (updates.favorite !== undefined) {
+    metadata.favorite = Boolean(updates.favorite);
+    paper.favorite = Boolean(updates.favorite);
+  }
+  if (updates.archived !== undefined) {
+    metadata.archived = Boolean(updates.archived);
+    paper.archived = Boolean(updates.archived);
+  }
+  if (updates.lastReadAt !== undefined) {
+    paper.lastReadAt = updates.lastReadAt ? new Date(updates.lastReadAt).toISOString() : new Date().toISOString();
+  }
+  paper.metadata = normalizePaperMetadata(metadata);
+  paper.revision = (Number.isInteger(Number(paper.revision)) ? Number(paper.revision) : 0) + 1;
+  paper.updatedAt = new Date().toISOString();
+  if (typeof workspace.savePaper === "function") {
+    await workspace.savePaper(paper);
+  }
+  return paper;
+}
+
 function registerResearchRoutes(app, ctx, workspace) {
+  workspace = dynamicResearchWorkspace(ctx, workspace);
+  app.post("/api/diagnostics/log", async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const level = ["debug", "info", "warn", "error"].includes(String(body?.level)) ? String(body.level) : "info";
+      const event = String(body?.event || "client.event").slice(0, 160);
+      const details = body?.details && typeof body.details === "object" ? body.details : {};
+      logQa(ctx, level, event, details);
+      return c.json({ ok: true });
+    } catch (error) {
+      return c.json({ ok: false, error: "诊断日志写入失败" }, 500);
+    }
+  });
+  app.get("/api/diagnostics/log", (c) => {
+    try {
+      const limit = Math.max(1, Math.min(1000, Number(requestQuery(c, "limit") || 200)));
+      return c.json({ ok: true, entries: qaLogger(ctx)?.read({ limit }) || [] });
+    } catch (error) {
+      return c.json({ ok: false, error: "诊断日志读取失败", entries: [] }, 500);
+    }
+  });
   app.get("/api/research/recent", (c) => {
     try {
-      const paper = recentWorkspacePaper(workspace);
-      return c.json({ ok: true, paper: publicCachedPaper(paper, paper ? workspace.getGlossary(paper.paperHash) : null) });
+      const activeWorkspace = getResearchWorkspace(ctx) || workspace;
+      const paper = recentWorkspacePaper(activeWorkspace);
+      return c.json({ ok: true, paper: publicCachedPaper(paper, paper ? activeWorkspace.getGlossary(paper.paperHash) : null) });
     } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  app.get("/api/research/library", (c) => {
+    try {
+      const activeWorkspace = getResearchWorkspace(ctx) || workspace;
+      const query = requestQuery(c, "q") || requestQuery(c, "query");
+      const sort = requestQuery(c, "sort");
+      const order = requestQuery(c, "order");
+      const favorite = requestQuery(c, "favorite");
+      const archived = requestQuery(c, "archived");
+      const tag = requestQuery(c, "tag");
+      const items = listWorkspaceLibrary(activeWorkspace, { query, sort, order, favorite, archived, tag });
+      return c.json({ ok: true, items, total: items.length, apiVersion: PLUGIN_API_VERSION });
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  app.post("/api/research/library/metadata", async (c) => {
+    try {
+      const activeWorkspace = getResearchWorkspace(ctx) || workspace;
+      const body = await c.req.json();
+      const paperHash = researchPaperHash(c, body);
+      if (!paperHash) return c.json({ ok: false, error: "缺少 paperHash" }, 400);
+      const updated = await updateWorkspacePaperMetadata(activeWorkspace, paperHash, body);
+      logQa(ctx, "info", "paper.metadata.updated", {
+        paperHash,
+        revision: Number.isInteger(Number(updated.revision)) ? Number(updated.revision) : 0,
+        changed: Object.keys(body || {}).filter((key) => key !== "paperHash"),
+      });
+      return c.json({
+        ok: true,
+        paperHash,
+        revision: Number.isInteger(Number(updated.revision)) ? Number(updated.revision) : 0,
+        metadata: updated.metadata,
+        lastReadAt: updated.lastReadAt,
+      });
+    } catch (error) {
+      logQa(ctx, "error", "paper.metadata.update.failed", { paperHash: "", message: String(error?.message || error) });
       return researchJsonError(c, error);
     }
   });
@@ -1293,8 +1569,10 @@ function registerResearchRoutes(app, ctx, workspace) {
       const paperHash = researchPaperHash(c);
       const stored = workspace.getPaper(paperHash);
       const paper = publicCachedPaper(stored, stored ? workspace.getGlossary(stored.paperHash) : null);
+      logQa(ctx, "info", "paper.get", { paperHash, status: paper ? 200 : 404, blockCount: paper?.blocks?.length || 0 });
       return paper ? c.json({ ok: true, paper }) : c.json({ ok: false, error: "论文不存在" }, 404);
     } catch (error) {
+      logQa(ctx, "error", "paper.get.failed", { paperHash: researchPaperHash(c), message: String(error?.message || error) });
       return researchJsonError(c, error);
     }
   });
@@ -1302,10 +1580,16 @@ function registerResearchRoutes(app, ctx, workspace) {
   app.post("/api/research/paper", async (c) => {
     try {
       const body = await c.req.json();
-      const paper = await workspace.upsertPaper(paperPayload(body, workspace.getPaper(body?.paperHash)));
+      const operation = body?.operation || "autosave";
+      const expectedRevision = body?.expectedRevision ?? body?.revision;
+      const paper = await workspace.upsertPaper(
+        paperPayload(body, workspace.getPaper(body?.paperHash)),
+        { operation, expectedRevision }
+      );
       return c.json({ ok: true, paper: publicCachedPaper(paper, workspace.getGlossary(paper.paperHash)) });
     } catch (error) {
-      return researchJsonError(c, error);
+      const status = error.status || (error.code === "paper_deleted" || error.code === "revision_conflict" ? 409 : 400);
+      return researchJsonError(c, error, status);
     }
   });
 
@@ -1344,13 +1628,16 @@ function registerResearchRoutes(app, ctx, workspace) {
   });
 
   if (typeof app.delete === "function") app.delete("/api/research/paper", async (c) => {
+    let paperHash = "";
     try {
       let body = {};
       if (typeof c.req.json === "function") body = await c.req.json().catch(() => ({}));
-      const paperHash = researchPaperHash(c, body);
+      paperHash = researchPaperHash(c, body);
       const deleted = await workspace.removePaper(paperHash);
+      logQa(ctx, deleted ? "info" : "warn", "paper.delete", { paperHash, status: deleted ? 200 : 404, deleted });
       return deleted ? c.json({ ok: true, deleted: true }) : c.json({ ok: false, error: "论文不存在" }, 404);
     } catch (error) {
+      logQa(ctx, "error", "paper.delete.failed", { paperHash, message: String(error?.message || error) });
       return researchJsonError(c, error);
     }
   });
@@ -1363,11 +1650,14 @@ function registerResearchRoutes(app, ctx, workspace) {
       const backup = workspace.exportBackup(paperHash, { includeAssets });
       const fileName = `hana-paper-reader-${paperHash.slice(0, 12)}.backup.json`;
       if (body?.saveToDisk === true) {
-        const saved = saveFileToDisk(JSON.stringify(backup, null, 2), fileName, path.join(ctx.dataDir, "exports"));
+        const saved = saveFileToDisk(JSON.stringify(backup, null, 2), fileName, path.join(ctx.dataDir, "exports"), { preferDownloads: true });
+        logQa(ctx, "info", "paper.backup.saved", { paperHash, fileName: saved.fileName, size: saved.size, directory: saved.directory, includeAssets });
         return c.json({ ok: true, saved: true, filePath: saved.filePath, fileName: saved.fileName, size: saved.size });
       }
+      logQa(ctx, "info", "paper.backup.response", { paperHash, mode: "response", includeAssets });
       return backupDownloadResponse(workspace, paperHash, includeAssets);
     } catch (error) {
+      logQa(ctx, "error", "paper.backup.failed", { message: String(error?.message || error) });
       return researchJsonError(c, error);
     }
   });
@@ -1380,6 +1670,42 @@ function registerResearchRoutes(app, ctx, workspace) {
       const paperHash = researchPaperHash(c);
       const includeAssets = requestQuery(c, "includeAssets") !== "false";
       return backupDownloadResponse(workspace, paperHash, includeAssets);
+    } catch (error) {
+      return researchJsonError(c, error);
+    }
+  });
+
+  const tableCsvResponse = (c, paperHash, blockId, options = {}) => {
+    const paper = workspace.getPaper(paperHash);
+    if (!paper) return c.json({ ok: false, error: "论文不存在" }, 404);
+    const normalizedBlockId = String(blockId || "").trim();
+    const block = paper.blocks.find((item) => item?.id === normalizedBlockId && String(item?.type || "").toLowerCase() === "table");
+    if (!block?.tableHtml) return c.json({ ok: false, error: "表格不存在" }, 404);
+    const csv = tableHtmlToCsv(block.tableHtml);
+    if (!csv) return c.json({ ok: false, error: "表格没有可导出的单元格" }, 400);
+    const fileName = downloadFileName(normalizedBlockId, ".csv", "table.csv");
+    if (options.saveToDisk === true) {
+      const saved = saveFileToDisk(`\uFEFF${csv}`, fileName, path.join(ctx.dataDir, "exports"), { preferDownloads: true });
+      logQa(ctx, "info", "paper.csv.saved", { paperHash, blockId: normalizedBlockId, fileName: saved.fileName, size: saved.size, directory: saved.directory });
+      return c.json({ ok: true, saved: true, filePath: saved.filePath, fileName: saved.fileName, size: saved.size });
+    }
+    logQa(ctx, "info", "paper.csv.response", { paperHash, blockId: normalizedBlockId, size: Buffer.byteLength(csv, "utf8") });
+    return csvDownloadResponse(csv, fileName, paperHash);
+  };
+
+  app.post("/api/research/csv", async (c) => {
+    try {
+      const body = await c.req.json();
+      return tableCsvResponse(c, researchPaperHash(c, body), body?.blockId, { saveToDisk: body?.saveToDisk === true });
+    } catch (error) {
+      logQa(ctx, "error", "paper.csv.failed", { message: String(error?.message || error) });
+      return researchJsonError(c, error);
+    }
+  });
+
+  app.get("/api/research/csv", (c) => {
+    try {
+      return tableCsvResponse(c, researchPaperHash(c), requestQuery(c, "blockId"));
     } catch (error) {
       return researchJsonError(c, error);
     }
@@ -1471,9 +1797,16 @@ function registerResearchRoutes(app, ctx, workspace) {
     if (typeof app.delete === "function") {
       const deleteItem = async (c) => {
         try {
-          let id = requestParam(c, "id") || requestQuery(c, "id");
-          if (!id && typeof c.req.json === "function") id = (await c.req.json().catch(() => ({}))).id || "";
-          const deleted = await workspace.deleteItem(collection, id);
+          const body = typeof c.req.json === "function" ? await c.req.json().catch(() => ({})) : {};
+          let id = requestParam(c, "id") || requestQuery(c, "id") || body.id || "";
+          let paperHash = researchPaperHash(c, body);
+          if (!paperHash) {
+            return c.json({ ok: false, error: "paperHash is required" }, 400);
+          }
+          if (!id) {
+            return c.json({ ok: false, error: "id is required" }, 400);
+          }
+          const deleted = await workspace.deleteItem(collection, id, paperHash);
           return deleted ? c.json({ ok: true, deleted: true }) : c.json({ ok: false, error: "记录不存在" }, 404);
         } catch (error) {
           return researchJsonError(c, error);
@@ -1570,10 +1903,12 @@ function registerResearchRoutes(app, ctx, workspace) {
   const updateTask = async (c, forcedState = null) => {
     try {
       const body = await c.req.json().catch(() => ({}));
+      const taskId = requestParam(c, "taskId") || requestQuery(c, "taskId") || body.taskId || body.id;
+      const paperHash = researchPaperHash(c, body);
       const patch = {};
       for (const key of ["state", "stage", "progress", "error"]) if (hasOwn(body, key)) patch[key] = body[key];
       if (forcedState) patch.state = forcedState;
-      return c.json({ ok: true, task: await workspace.updateTask(requestParam(c, "taskId") || requestQuery(c, "taskId"), patch) });
+      return c.json({ ok: true, task: await workspace.updateTask(taskId, patch, paperHash || null) });
     } catch (error) {
       return researchJsonError(c, error);
     }
@@ -1591,11 +1926,14 @@ function registerResearchRoutes(app, ctx, workspace) {
       if (body?.saveToDisk === true) {
         const title = result.paper?.metadata?.title || "paper";
         const fileName = downloadFileName(title, ".md", "paper.md");
-        const saved = saveFileToDisk(result.markdown, fileName, path.join(ctx.dataDir, "exports"));
+        const saved = saveFileToDisk(result.markdown, fileName, path.join(ctx.dataDir, "exports"), { preferDownloads: true });
+        logQa(ctx, "info", "paper.export.saved", { paperHash, fileName: saved.fileName, size: saved.size, directory: saved.directory });
         return c.json({ ok: true, saved: true, filePath: saved.filePath, fileName: saved.fileName, size: saved.size });
       }
+      logQa(ctx, "info", "paper.export.response", { paperHash, mode: "response", size: Buffer.byteLength(result.markdown, "utf8") });
       return markdownDownloadResponse(result.markdown, result.paper, paperHash);
     } catch (error) {
+      logQa(ctx, "error", "paper.export.failed", { paperHash: "", message: String(error?.message || error) });
       return researchJsonError(c, error);
     }
   });
@@ -1669,11 +2007,11 @@ function registerResearchRoutes(app, ctx, workspace) {
   });
 }
 
-export { recentWorkspacePaper };
+export { recentWorkspacePaper, saveFileToDisk };
 
 export default function registerApiRoutes(app, ctx) {
   const sessionTargetNamespace = `route_${randomUUID()}`;
-  const researchWorkspace = getResearchWorkspace(ctx);
+  const researchWorkspace = dynamicResearchWorkspace(ctx, getResearchWorkspace(ctx));
   registerResearchRoutes(app, ctx, researchWorkspace);
   app.get("/api/mineru-settings", (c) => c.json(publicMineruSettings(ctx)));
 
@@ -1689,8 +2027,28 @@ export default function registerApiRoutes(app, ctx) {
 
   app.get("/api/mineru-asset", (c) => {
     try {
+      const paperHash = researchPaperHash(c);
       const cacheId = c.req.query("cacheId") || "";
       const assetPath = c.req.query("path") || "";
+      if (!paperHash || !cacheId || !assetPath) {
+        return c.json({ ok: false, error: "MinerU 资源不存在" }, 404);
+      }
+      const paper = researchWorkspace.getPaper(paperHash);
+      if (!paper) {
+        return c.json({ ok: false, error: "MinerU 资源不存在" }, 404);
+      }
+      const normalizedCacheId = cacheId.toLowerCase();
+      const normalizedPath = assetPath.replace(/\\/g, "/").replace(/^\/+/, "");
+      const isReferenced = Array.isArray(paper.blocks) && paper.blocks.some((block) => {
+        const ref = block?.assetRef;
+        if (!ref) return false;
+        const refCache = String(ref.cacheId || "").toLowerCase();
+        const refPath = String(ref.path || "").replace(/\\/g, "/").replace(/^\/+/, "");
+        return refCache === normalizedCacheId && refPath === normalizedPath;
+      });
+      if (!isReferenced) {
+        return c.json({ ok: false, error: "MinerU 资源不存在" }, 404);
+      }
       const asset = readMineruAsset({ ctx, cacheId, assetPath });
       if (!asset) return c.json({ ok: false, error: "MinerU 资源不存在" }, 404);
       return new Response(asset.bytes, {
@@ -1756,6 +2114,7 @@ export default function registerApiRoutes(app, ctx) {
           blockCount: stored.blocks.length,
           blocks: stored.blocks,
           paperHash,
+          revision: Number.isInteger(Number(stored.revision)) ? Number(stored.revision) : 0,
           cached: true,
           apiVersion: PLUGIN_API_VERSION,
           uiVersion: request.uiVersion || null,
@@ -1765,9 +2124,9 @@ export default function registerApiRoutes(app, ctx) {
       const result = await parsePdfWithMineru({
         buffer: request.buffer,
         fileName: request.fileName,
-        ctx,
+        ctx: { ...ctx, workspace: researchWorkspace },
       });
-      await researchWorkspace.upsertPaper({
+      const importedPaper = await researchWorkspace.upsertPaper({
         paperHash,
         metadata: { title: request.fileName },
         parser: {
@@ -1779,10 +2138,11 @@ export default function registerApiRoutes(app, ctx) {
           attemptCount: result.attemptCount,
         },
         blocks: result.blocks,
-      });
+      }, { operation: "import" });
       return c.json({
         ...result,
         paperHash,
+        revision: Number.isInteger(Number(importedPaper?.revision)) ? Number(importedPaper.revision) : 0,
         cached: false,
         apiVersion: PLUGIN_API_VERSION,
         uiVersion: request.uiVersion || null,
@@ -1856,6 +2216,11 @@ export default function registerApiRoutes(app, ctx) {
       if (typeof body.prompt === "string" && body.prompt.trim()) task = body.prompt.trim().slice(0, MAX_TEXT_CHARS);
 
       const evidence = verifiedQuoteEvidence(researchWorkspace, body);
+      if (body?.blockId || body?.evidenceId) {
+        if (!evidence) {
+          return c.json({ ok: false, error: "引文选区与目标论文块不匹配或已失效" }, 400);
+        }
+      }
       const citation = evidence ? `Page ${evidence.page} / block ${evidence.blockId}` : "";
       const sourceLine = citation ? `\n已由论文工作区核验的来源：${citation}` : "";
       const prompt = `论文：${String(body.paperTitle || "当前学术文献").slice(0, 500)}\n上下文：${context}\n选中文本：${quote}${sourceLine}${glossaryInstruction(body.glossaryTerms)}\n\n任务：${task}\n请直接回答，支持 Markdown。${citation ? `关键结论必须引用且只能引用已核验来源：${citation}。` : "不要虚构页码或段落编号。"}`;

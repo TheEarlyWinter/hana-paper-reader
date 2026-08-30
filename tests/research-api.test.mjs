@@ -80,6 +80,8 @@ test("registers research routes without changing the existing MinerU route surfa
     registerApiRoutes(app, ctx);
     for (const route of [
       "GET /api/research/recent",
+      "GET /api/research/library",
+      "POST /api/research/library/metadata",
       "GET /api/research/paper",
       "POST /api/research/paper",
       "GET /api/research/snapshot",
@@ -114,6 +116,8 @@ test("registers research routes without changing the existing MinerU route surfa
       "POST /api/research/parse-status/tasks/:taskId/cancel",
       "POST /api/research/export",
       "GET /api/research/export",
+      "POST /api/research/csv",
+      "GET /api/research/csv",
       "POST /api/research/evidence",
       "GET /api/research/parse-cache/check",
     ]) assert.equal(typeof app.routes.get(route), "function", `missing ${route}`);
@@ -222,6 +226,21 @@ test("research CRUD routes persist paper data and serve bounded read APIs", asyn
     const outline = app.routes.get("GET /api/research/outline")(requestContext({}, { paperHash }));
     assert.equal(outline.value.outline[0].title, "Methods");
 
+    const libraryBeforeMeta = app.routes.get("GET /api/research/library")(requestContext({}));
+    assert.equal(libraryBeforeMeta.value.ok, true);
+    assert.equal(libraryBeforeMeta.value.total, 1);
+    assert.equal(libraryBeforeMeta.value.items[0].paperHash, paperHash);
+    assert.equal(libraryBeforeMeta.value.items[0].favorite, false);
+
+    const metaUpdate = await app.routes.get("POST /api/research/library/metadata")(requestContext({ paperHash, favorite: true, tags: ["important"] }));
+    assert.equal(metaUpdate.value.ok, true);
+    assert.equal(metaUpdate.value.metadata.favorite, true);
+    assert.deepEqual(metaUpdate.value.metadata.tags, ["important"]);
+
+    const libraryAfterMeta = app.routes.get("GET /api/research/library")(requestContext({}, { favorite: "true" }));
+    assert.equal(libraryAfterMeta.value.items.length, 1);
+    assert.equal(libraryAfterMeta.value.items[0].favorite, true);
+
     const note = await app.routes.get("POST /api/research/notes")(requestContext({ paperHash, blockId: "b-water", note: "Verify field result", noteType: "question", tags: ["check"] }));
     const bookmark = await app.routes.get("POST /api/research/bookmarks")(requestContext({ paperHash, blockId: "b-formula", label: "Formula", page: 2 }));
     assert.equal(note.value.note.blockId, "b-water");
@@ -231,7 +250,7 @@ test("research CRUD routes persist paper data and serve bounded read APIs", asyn
     assert.equal(app.routes.get("GET /api/research/notes")(requestContext({}, { paperHash })).value.notes.length, 1);
     assert.equal(app.routes.get("GET /api/research/notes")(requestContext({}, { paperHash, noteType: "question", unresolvedOnly: "true" })).value.notes.length, 1);
     assert.equal(app.routes.get("GET /api/research/bookmarks")(requestContext({}, { paperHash })).value.bookmarks.length, 1);
-    assert.equal((await app.routes.get("DELETE /api/research/notes/:id")(requestContext({}, {}, { id: note.value.note.id }))).value.deleted, true);
+    assert.equal((await app.routes.get("DELETE /api/research/notes/:id")(requestContext({}, { paperHash }, { id: note.value.note.id }))).value.deleted, true);
 
     const progress = await app.routes.get("POST /api/research/progress")(requestContext({ paperHash, page: 2, percent: 50 }));
     assert.equal(progress.value.progress.percent, 50);

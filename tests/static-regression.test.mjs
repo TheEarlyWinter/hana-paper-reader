@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import registerApiRoutes from "../routes/api.js";
+import registerPluginUiRoutes from "../routes/ui.js";
 
 const root = path.resolve(import.meta.dirname, "..");
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
@@ -14,7 +15,7 @@ const cssSource = read("assets/panel.css");
 const mineruSource = read("lib/mineru.js");
 const readme = read("README.md");
 
-assert.equal(manifest.version, "0.8.0");
+assert.equal(manifest.version, "0.9.0");
 assert.equal(manifest.contributes.configuration.properties.mineruApiToken.sensitive, true);
 assert.equal(manifest.contributes.configuration.properties.mineruApiToken.scope, "global");
 assert.ok(manifest.capabilities.includes("network.fetch"));
@@ -35,7 +36,8 @@ for (const forbidden of ["parsePdfBuffer", "getPdfRuntime", "currentParser", "pd
 }
 assert.match(apiSource, /本地解析已移除/);
 assert.match(panelSource, /MinerU 精准解析设置/);
-assert.match(panelSource, /UI_VERSION = "0\.8\.0-r1"/);
+assert.match(panelSource, /UI_VERSION = "0\.9\.0"/);
+assert.match(panelSource, /UI_ASSET_CACHE_VERSION = "0\.9\.0-r1"/);
 assert.match(panelSource, /function pluginApiUrl[\s\S]*?hana\.api\.url/);
 assert.match(panelSource, /id="panel-notice"/);
 assert.match(panelSource, /function showPanelNotice[\s\S]*?panelNoticeTimer/);
@@ -60,12 +62,12 @@ assert.match(panelSource, /"Content-Type": "application\/pdf"/);
 assert.match(panelSource, /body: file/);
 assert.match(panelSource, /restoreRecentPaper\(\)/);
 assert.match(panelSource, /pluginApiFetch\("\/api\/research\/recent"\)/);
-assert.match(panelSource, /revision !== paperRevision \|\| currentPaper\.blocks\.length/);
+assert.match(panelSource, /paperRefIsCurrent\(revision, paperRef\)|paperContextIsCurrent\(hash, revision, paperRef\)/);
 assert.match(panelSource, /重新选择同一 PDF 可恢复原页预览/);
 assert.doesNotMatch(panelSource, /readAsDataURL|fileToBase64/);
-assert.match(apiSource, /PLUGIN_API_VERSION = "0\.8\.0"/);
-assert.match(apiSource, /paper-export\.js\?hpr=0\.8\.0-r1/);
-assert.match(apiSource, /paper-workspace\.js\?hpr=0\.8\.0-r1/);
+assert.match(apiSource, /PLUGIN_API_VERSION = "0\.9\.0"/);
+assert.match(apiSource, /paper-export\.js\?hpr=0\.9\.0-r1/);
+assert.match(apiSource, /paper-workspace\.js\?hpr=0\.9\.0-r1/);
 assert.match(apiSource, /provider:models-by-type/);
 assert.match(apiSource, /app\.get\("\/api\/models"/);
 assert.match(panelSource, /modelRef: selectedModelRefForAgent/);
@@ -92,7 +94,22 @@ assert.match(mineruSource, /language:\s*options\.language/);
 assert.doesNotMatch(mineruSource, /file-urls\/batch\?/);
 assert.match(mineruSource, /shouldRetryWithOcr/);
 assert.match(mineruSource, /ocrFallback/);
-assert.match(read("routes/ui.js"), /ASSET_VERSION = "0\.8\.0-r1"/);
+assert.match(read("routes/ui.js"), /ASSET_CACHE_VERSION = "0\.9\.0-r1"/);
+
+const uiRoutes = new Map();
+registerPluginUiRoutes({ get(route, handler) { uiRoutes.set(route, handler); } }, { pluginId: "hana-paper-reader" });
+const renderUi = (url) => uiRoutes.get("/card")({
+  req: {
+    url,
+    query(name) { return new URL(url).searchParams.get(name) || ""; },
+  },
+  html(value) { return value; },
+});
+const sessionAssetHtml = renderUi("https://hana.test/card?hana-asset-base=%2Fapi%2Fplugins%2Fhana-paper-reader%2Fassets%3FpluginSurfaceSession%3Dfixture-session");
+assert.match(sessionAssetHtml, /api\/plugins\/hana-paper-reader\/assets\/panel\.js\?pluginSurfaceSession=fixture-session&amp;hpr-version=0\.9\.0-r1/);
+const externalAssetHtml = renderUi("https://hana.test/card?hana-asset-base=https%3A%2F%2Fevil.test%2Fassets");
+assert.match(externalAssetHtml, /api\/plugins\/hana-paper-reader\/assets\/panel\.js\?hpr-version=0\.9\.0-r1/);
+assert.doesNotMatch(externalAssetHtml, /evil\.test/);
 assert.match(readme, /^# Hana Paper Reader/m);
 assert.match(readme, /MIT License/);
 assert.match(readme, /application\/pdf/);
@@ -179,7 +196,7 @@ assert.equal(typeof routes.get("POST /api/create-session-and-send"), "function")
 
 const publicSettings = getSettings(jsonContext()).value;
 assert.equal(publicSettings.configured, true);
-assert.equal(publicSettings.apiVersion, "0.8.0");
+assert.equal(publicSettings.apiVersion, "0.9.0");
 assert.equal("token" in publicSettings, false);
 assert.equal("mineruApiToken" in publicSettings, false);
 assert.equal(JSON.stringify(publicSettings).includes(configState.mineruApiToken), false);

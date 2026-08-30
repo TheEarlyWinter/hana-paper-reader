@@ -1,4 +1,4 @@
-const ASSET_VERSION = "0.8.0-r1";
+const ASSET_CACHE_VERSION = "0.9.0-r1";
 
 export default function registerPluginUiRoutes(app, ctx) {
   app.get("/card", (c) => c.html(renderShell(c, ctx, "card")));
@@ -9,7 +9,9 @@ function renderShell(c, ctx, surface) {
   const rawHanaCss = c.req.query("hana-css") || "";
   const hanaCss = sameOriginStylesheet(rawHanaCss, c.req.url);
   const theme = c.req.query("hana-theme") || "inherit";
-  const assetBase = c.req.query("hana-asset-base") || `/api/plugins/${encodeURIComponent(ctx.pluginId)}/assets`;
+  const defaultAssetBase = `/api/plugins/${encodeURIComponent(ctx.pluginId)}/assets`;
+  const rawAssetBase = c.req.query("hana-asset-base") || defaultAssetBase;
+  const assetBase = sanitizeAssetBase(rawAssetBase, c.req.url, defaultAssetBase);
   const panelCssUrl = pluginAssetUrl(assetBase, "panel.css");
   const panelJsUrl = pluginAssetUrl(assetBase, "panel.js");
   const researchToolsCssUrl = pluginAssetUrl(assetBase, "research-tools.css");
@@ -39,6 +41,25 @@ function renderShell(c, ctx, surface) {
 </html>`;
 }
 
+function sanitizeAssetBase(value, requestUrl, defaultBase) {
+  if (!value || typeof value !== "string") return defaultBase;
+  try {
+    const request = new URL(requestUrl);
+    const parsed = new URL(value, requestUrl);
+    if (parsed.origin !== request.origin) return defaultBase;
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return defaultBase;
+    const defaultPath = new URL(defaultBase, requestUrl).pathname.replace(/\/+$/, "");
+    const candidatePath = parsed.pathname.replace(/\/+$/, "");
+    // The host may attach the surface-session credential to the asset base.
+    // Preserve that query string, but never allow a same-origin page/API path
+    // to become the script root.
+    if (candidatePath !== defaultPath) return defaultBase;
+    return `${candidatePath}${parsed.search}`;
+  } catch {
+    return defaultBase;
+  }
+}
+
 function sameOriginStylesheet(value, requestUrl) {
   if (!value) return "";
   try {
@@ -61,7 +82,7 @@ function pluginAssetUrl(assetBase, assetPath) {
   try {
     const parsed = new URL(rawBase, "http://hana.local");
     parsed.pathname = `${parsed.pathname.replace(/\/+$/, "")}/${encodedPath}`;
-    parsed.searchParams.set("hpr-version", ASSET_VERSION);
+    parsed.searchParams.set("hpr-version", ASSET_CACHE_VERSION);
     if (/^https?:\/\//i.test(rawBase)) return parsed.toString();
     return `${parsed.pathname}${parsed.search}`;
   } catch {

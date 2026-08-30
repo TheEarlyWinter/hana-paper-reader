@@ -11,6 +11,7 @@ const DEFAULT_ENDPOINTS = {
   cleanup: "/api/research/cleanup",
   backup: "/api/research/backup",
   restore: "/api/research/restore",
+  csv: "/api/research/csv",
   paper: "/api/research/paper",
   asset: "/api/mineru-asset",
 };
@@ -101,21 +102,44 @@ function scheduleDownloadCleanup(doc, callback, delay = 1000) {
   else callback();
 }
 
-function downloadBlob(doc, blob, fileName) {
-  const objectUrl = URL.createObjectURL(blob);
+function urlApiForDocument(doc) {
+  return doc?.defaultView?.URL || globalThis.URL;
+}
+
+export function normalizeLatex(value) {
+  return String(value || "").replace(/^\s*\$\$|\$\$\s*$/g, "").trim();
+}
+
+export function visualActionLabels(block = {}) {
+  const labels = ["回到正文", "复制带来源 Markdown"];
+  if (block?.tableHtml) labels.push("导出 CSV");
+  const type = String(block?.type || "").toLowerCase();
+  const latex = normalizeLatex(block?.latex || (type === "equation" ? block?.text : ""));
+  if (latex) labels.push("复制 LaTeX");
+  return labels;
+}
+
+export function downloadBlob(doc, blob, fileName) {
+  const urlApi = urlApiForDocument(doc);
+  if (!urlApi || typeof urlApi.createObjectURL !== "function") return false;
+  const objectUrl = urlApi.createObjectURL(blob);
   const link = doc.createElement("a");
   link.href = objectUrl;
   link.download = fileName;
   link.rel = "noopener";
   try {
     doc.body?.appendChild(link);
+    if (typeof link.click !== "function") return false;
     link.click();
+    return true;
+  } catch {
+    return false;
   } finally {
     // Chromium/Electron may dispatch the download after click() returns. Keep
     // the anchor and Blob URL alive for one turn of the host download pipeline.
     scheduleDownloadCleanup(doc, () => {
-      link.remove();
-      URL.revokeObjectURL(objectUrl);
+      link.remove?.();
+      urlApi.revokeObjectURL?.(objectUrl);
     });
   }
 }
@@ -159,55 +183,132 @@ async function hostResourceDownload(doc, path, params = {}, apiUrl, resourceOpen
   return true;
 }
 
-async function startDownload(doc, path, params = {}, apiUrl, resourceOpen, callApi) {
+async function startDownload(doc, path, params = {}, apiUrl, resourceOpen, callApi, diagnosticLog, fallbackDownload = null, allowDirectFallback = false) {
   // 1. Direct Node.js filesystem save (Option B - Windows Downloads folder)
   if (typeof callApi === "function") {
+    let result;
     try {
-      const result = await callApi(path, {
+      result = await callApi(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...params, saveToDisk: true }),
       });
-      if (result && result.saved && result.filePath) {
-        if (typeof resourceOpen === "function") {
-          try {
-            await resourceOpen({
-              resource: { kind: "local-file", path: result.filePath },
-              mode: "reveal",
-            });
-          } catch {}
-        }
-        return { method: "direct", filePath: result.filePath, fileName: result.fileName };
-      }
     } catch (err) {
+      diagnosticLog?.("export.direct-save-failed", { path, message: String(err?.message || err) }, "error");
+      // Preserve validation failures for Markdown/backup exports. The CSV
+      // action may target an older API surface, so it is allowed to continue
+      // to the host and Blob fallbacks after a direct-save rejection.
+      if (!allowDirectFallback && err && (Number(err.status) >= 400 || err.code || /不存在|invalid|required/i.test(err.message))) {
+        throw err;
+      }
       console.warn("Direct disk save failed, falling back to host opener:", err);
+    }
+    if (result && result.saved && result.filePath) {
+      diagnosticLog?.("export.direct-saved", { path, fileName: result.fileName, filePath: result.filePath, size: result.size });
+      if (typeof resourceOpen === "function") {
+        try {
+          await resourceOpen({
+            resource: { kind: "local-file", path: result.filePath },
+            mode: "reveal",
+          });
+        } catch {}
+      }
+      return { method: "direct", filePath: result.filePath, fileName: result.fileName };
     }
   }
 
   // 2. Host-mediated opener
   try {
     if (await hostResourceDownload(doc, path, params, apiUrl, resourceOpen)) return { method: "host" };
-  } catch {}
+  } catch (hostErr) {
+    diagnosticLog?.("export.host-download-failed", { path, message: String(hostErr?.message || hostErr) }, "warn");
+    console.warn("Host opener download failed:", hostErr);
+  }
 
-  // 3. Fallback: native iframe download anchor
+  // 3. Keep the original Blob path as a final fallback for embedded WebViews
+  // that can render the API response but cannot hand a URL to the host.
+  if (typeof fallbackDownload === "function") {
+    try {
+      if (fallbackDownload() === true) return { method: "blob" };
+    } catch (fallbackErr) {
+      diagnosticLog?.("export.blob-download-failed", { path, message: String(fallbackErr?.message || fallbackErr) }, "warn");
+    }
+  }
+
+  // 4. Fallback: native iframe download anchor
   nativeDownload(doc, path, params, apiUrl);
   return { method: "native" };
 }
 
-async function copyText(value) {
+export async function copyTextWithFallback(value, options = {}) {
   const text = String(value || "");
   if (!text) return false;
-  try { await navigator.clipboard.writeText(text); return true; } catch {}
-  return false;
+  const doc = options.document || null;
+  const hostWrite = options.hostWrite;
+  if (typeof hostWrite === "function") {
+    try {
+      const result = await hostWrite(text);
+      if (result === true || result === undefined || (result && result.written !== false)) return true;
+    } catch {}
+  }
+
+  const clipboard = options.clipboard
+    || doc?.defaultView?.navigator?.clipboard
+    || globalThis.navigator?.clipboard;
+  try {
+    if (clipboard?.writeText) {
+      await clipboard.writeText(text);
+      return true;
+    }
+  } catch {}
+
+  let textarea = null;
+  try {
+    textarea = doc?.createElement?.("textarea");
+    if (!textarea) return false;
+    textarea.value = text;
+    textarea.setAttribute?.("readonly", "");
+    if (textarea.style) {
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      textarea.style.pointerEvents = "none";
+    }
+    doc.body?.appendChild?.(textarea);
+    textarea.focus?.();
+    textarea.select?.();
+    return typeof doc.execCommand === "function" && doc.execCommand("copy") === true;
+  } catch {
+    return false;
+  } finally {
+    textarea?.remove?.();
+  }
 }
 
-function tableRowsFromHtml(html) {
-  const parsed = new DOMParser().parseFromString(String(html || ""), "text/html");
-  return [...parsed.querySelectorAll("tr")].map((row) => [...row.querySelectorAll("th,td")].map((cell) => cell.textContent.trim()));
+export async function runConfirmedAction({ message, title, confirmAction, action } = {}) {
+  if (typeof confirmAction !== "function" || typeof action !== "function") return false;
+  if (!(await confirmAction(message, title))) return false;
+  await action();
+  return true;
 }
 
-function csvText(rows) {
-  return rows.map((row) => row.map((value) => `"${String(value || "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
+function tableRowsFromHtml(html, doc = null) {
+  const Parser = doc?.defaultView?.DOMParser || globalThis.DOMParser;
+  const parsed = typeof Parser === "function" ? new Parser().parseFromString(String(html || ""), "text/html") : null;
+  return parsed ? [...parsed.querySelectorAll("tr")].map((row) => [...row.querySelectorAll("th,td")].map((cell) => cell.textContent.trim())) : [];
+}
+
+function safeCsvValue(value) {
+  const text = String(value ?? "");
+  // Keep spreadsheet formulas inert when a paper contains a cell beginning
+  // with a formula operator. Ordinary negative numeric values stay unchanged.
+  const formulaLike = /^[=+@]/.test(text) || (/^-\s*[A-Za-z(]/.test(text) && !/^-\s*\d/.test(text));
+  return formulaLike ? `'${text}` : text;
+}
+
+export function csvText(rows) {
+  return (Array.isArray(rows) ? rows : []).map((row) => (Array.isArray(row) ? row : [])
+    .map((value) => `"${safeCsvValue(value).replace(/"/g, '""')}"`).join(","))
+    .join("\r\n");
 }
 
 async function responseData(response) {
@@ -224,6 +325,10 @@ export function createResearchTools(options = {}) {
   if (typeof options.apiFetch !== "function") throw new TypeError("createResearchTools requires apiFetch");
 
   const endpoints = { ...DEFAULT_ENDPOINTS, ...(options.endpoints || {}) };
+  const confirmAction = async (message, title) => {
+    if (typeof options.confirmAction === "function") return Boolean(await options.confirmAction(message, title));
+    try { return typeof window.confirm === "function" && window.confirm(String(message || "请确认")); } catch { return false; }
+  };
   const state = {
     open: false,
     activeWorkflow: "locate",
@@ -252,6 +357,7 @@ export function createResearchTools(options = {}) {
     tasks: [],
     renderToken: 0,
     destroyed: false,
+    exportBusy: false,
   };
   const addListener = (element, type, handler) => element.addEventListener(type, handler);
 
@@ -354,16 +460,15 @@ export function createResearchTools(options = {}) {
   }
 
   async function call(path, init = {}) {
-    try {
-      const response = await options.apiFetch(path, init);
-      const data = await responseData(response);
-      const errorMessage = typeof data === "string" ? data : data?.error;
-      if (!response.ok) throw new Error(errorMessage || `请求失败 (${response.status})`);
-      return data;
-    } catch (error) {
-      notify(String(error?.message || "研究工具请求失败"), "error");
+    const response = await options.apiFetch(path, init);
+    const data = await responseData(response);
+    const errorMessage = typeof data === "string" ? data : data?.error;
+    if (!response.ok) {
+      const error = new Error(errorMessage || `请求失败 (${response.status})`);
+      error.status = response.status;
       throw error;
     }
+    return data;
   }
 
   function getPaper() {
@@ -410,7 +515,13 @@ export function createResearchTools(options = {}) {
   }
 
   function emitUiState() {
-    try { options.onUiStateChanged?.({ searchState: searchStateSnapshot(), noteDraft: state.noteDraft }); } catch {}
+    try {
+      options.onUiStateChanged?.({
+        paperHash: paperHash(),
+        searchState: searchStateSnapshot(),
+        noteDraft: state.noteDraft,
+      });
+    } catch {}
   }
 
   function renderSearch(view, token) {
@@ -563,7 +674,9 @@ export function createResearchTools(options = {}) {
         if (sectionQuestions) badges.appendChild(makeElement(doc, "span", "research-tools-mini-badge warning", `疑问 ${sectionQuestions}`));
         if (badges.childNodes.length) row.appendChild(badges);
       }
-    }).catch(() => { summary.textContent = "大纲已载入，研究标记暂时不可用"; });
+    }).catch(() => {
+      if (isCurrentRender("outline", token, hash)) summary.textContent = "大纲已载入，研究标记暂时不可用";
+    });
   }
 
   function paperHash() {
@@ -585,15 +698,16 @@ export function createResearchTools(options = {}) {
   }
 
   async function saveNote(kind, value) {
+    const requestPaperHash = paperHash();
     const input = value && typeof value === "object" ? value : { note: value };
     const selected = selectedBlock();
     const block = paperBlocks(state.paper).find((item) => item.id === input.blockId)
       || (input.blockId ? { id: input.blockId, page: input.page, text: input.quote, translatedText: input.translation } : null)
       || selected;
-    if (!paperHash() || !block?.id) throw new Error("当前论文没有可引用的段落");
+    if (!requestPaperHash || !block?.id) throw new Error("当前论文没有可引用的段落");
     const body = kind === "notes"
       ? {
-        paperHash: paperHash(),
+        paperHash: requestPaperHash,
         blockId: block.id,
         page: Number(block.page || 1),
         id: input.id || undefined,
@@ -605,10 +719,12 @@ export function createResearchTools(options = {}) {
         evidenceSnapshot: input.evidenceSnapshot || undefined,
         resolved: input.resolved === true,
       }
-      : { paperHash: paperHash(), blockId: block.id, page: Number(block.page || 1), bbox: block.bbox || null, label: "重点" };
+      : { paperHash: requestPaperHash, blockId: block.id, page: Number(block.page || 1), bbox: block.bbox || null, label: "重点" };
     if (kind === "notes" && !body.note) throw new Error("请先填写用户笔记");
     const data = await call(endpoints[kind], { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    options.onPaperStateChanged?.({ kind, blockId: block.id, value: input, data });
+    if (paperHash() !== requestPaperHash) return null;
+    await options.onPaperStateChanged?.({ kind, paperHash: requestPaperHash, blockId: block.id, value: input, data });
+    if (paperHash() !== requestPaperHash) return null;
     notify(kind === "notes" ? "证据型研究笔记已保存" : "书签已保存", "success");
     return data;
   }
@@ -639,8 +755,11 @@ export function createResearchTools(options = {}) {
   async function deleteAnchoredItem(collection, item) {
     const id = String(item?.id || "");
     if (!id) throw new Error("记录缺少可删除的 ID");
-    await call(`${endpoints[collection]}/${encodeURIComponent(id)}`, { method: "DELETE" });
-    options.onPaperStateChanged?.({ kind: collection, deletedId: id });
+    const requestPaperHash = paperHash();
+    await call(`${endpoints[collection]}/${encodeURIComponent(id)}?paperHash=${encodeURIComponent(requestPaperHash)}`, { method: "DELETE" });
+    if (paperHash() !== requestPaperHash) return;
+    await options.onPaperStateChanged?.({ kind: collection, paperHash: requestPaperHash, deletedId: id });
+    if (paperHash() !== requestPaperHash) return;
     notify(collection === "notes" ? "笔记已删除" : "书签已删除", "success");
     render();
   }
@@ -662,6 +781,7 @@ export function createResearchTools(options = {}) {
   function isCurrentRender(tool, token, hash = paperHash()) {
     return !state.destroyed && state.activeTool === tool && state.renderToken === token && paperHash() === hash;
   }
+
 
   function renderNotes(view, token) {
     const selected = selectedBlock();
@@ -709,6 +829,7 @@ export function createResearchTools(options = {}) {
     addListener(save, "click", () => {
       updateDraft();
       save.disabled = true;
+      const requestPaperHash = paperHash();
       void saveNote("notes", {
         id: activeNote?.id,
         blockId: sourceBlock?.id || activeNote?.blockId,
@@ -720,7 +841,8 @@ export function createResearchTools(options = {}) {
         quote,
         translation,
         resolved: activeNote?.resolved === true,
-      }).then(() => {
+      }).then((result) => {
+        if (!result || state.activeTool !== "notes" || paperHash() !== requestPaperHash) return;
         state.note = ""; state.noteDraft = null; state.editingNoteId = null; emitUiState(); render();
       }).catch((error) => notify(error.message, "error")).finally(() => { save.disabled = false; });
     });
@@ -792,7 +914,14 @@ export function createResearchTools(options = {}) {
         const edit = button(doc, "编辑"); addListener(edit, "click", () => { state.editingNoteId = item.id; render(); }); row.appendChild(edit);
         if (item.noteType === "question") {
           const resolve = button(doc, item.resolved ? "标记未解决" : "标记已解决");
-          addListener(resolve, "click", () => { resolve.disabled = true; void saveNote("notes", { ...item, resolved: !item.resolved }).then(() => render()).finally(() => { resolve.disabled = false; }); });
+          addListener(resolve, "click", () => {
+            resolve.disabled = true;
+            const requestPaperHash = hash;
+            void saveNote("notes", { ...item, resolved: !item.resolved })
+              .then((result) => { if (result && state.activeTool === "notes" && paperHash() === requestPaperHash) render(); })
+              .catch((error) => notify(error?.message || "笔记更新失败", "error"))
+              .finally(() => { resolve.disabled = false; });
+          });
           row.appendChild(resolve);
         }
         const remove = button(doc, "删除", "research-tools-button-danger");
@@ -811,14 +940,22 @@ export function createResearchTools(options = {}) {
     const actions = makeElement(doc, "div", "research-tools-actions");
     const bookmark = button(doc, "添加证据书签", "research-tools-button-primary");
     const progress = button(doc, "同步阅读进度");
+    const hash = paperHash();
     addListener(bookmark, "click", () => {
       bookmark.disabled = true;
       void saveNote("bookmarks", true).catch((error) => notify(error.message, "error")).finally(() => { bookmark.disabled = false; });
     });
     addListener(progress, "click", () => {
       progress.disabled = true;
-      void call(endpoints.progress, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(progressPayload()) })
-        .then((data) => { state.progress = data.progress || state.progress; notify("阅读进度已同步", "success"); render(); })
+      const requestPaperHash = hash;
+      const payload = progressPayload();
+      void call(endpoints.progress, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
+        .then((data) => {
+          if (!isCurrentRender("markers", token, requestPaperHash)) return;
+          state.progress = data.progress || state.progress;
+          notify("阅读进度已同步", "success");
+          render();
+        })
         .catch((error) => notify(error.message, "error"))
         .finally(() => { progress.disabled = false; });
     });
@@ -826,7 +963,6 @@ export function createResearchTools(options = {}) {
     view.append(context, actions);
     const status = makeElement(doc, "p", "research-tools-muted", "正在读取书签与进度…");
     view.appendChild(status);
-    const hash = paperHash();
     void loadAnchoredState(hash).then((anchored) => {
       if (!isCurrentRender("markers", token, hash)) return;
       state.bookmarks = anchored.bookmarks;
@@ -873,31 +1009,51 @@ export function createResearchTools(options = {}) {
       view.appendChild(ownership);
 
       const runCleanup = async (action, message) => {
-        if (!window.confirm(message)) return;
-        const result = await call(endpoints.cleanup, {
-          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ paperHash: hash, action }),
-        });
-        options.onPaperDataChanged?.({ action, ...(result?.result || {}), storage: result?.storage || null });
-        notify("指定范围的数据已处理", "success");
-        render();
+        if (!(await confirmAction(message, "清理论文数据"))) return;
+        let prepared = false;
+        try {
+          await options.onBeforePaperMutation?.({ paperHash: hash, purpose: "清理" });
+          prepared = typeof options.onBeforePaperMutation === "function";
+          const result = await call(endpoints.cleanup, {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ paperHash: hash, action }),
+          });
+          if (!isCurrentRender("parse", token, hash)) return;
+          await options.onPaperDataChanged?.({ action, ...(result?.result || {}), storage: result?.storage || null });
+          if (!isCurrentRender("parse", token, hash)) return;
+          notify("指定范围的数据已处理", "success");
+          render();
+        } finally {
+          if (prepared) await options.onPaperMutationFinished?.({ paperHash: hash });
+        }
       };
       const operations = makeElement(doc, "div", "research-tools-data-actions");
       const clearAssets = button(doc, "仅清理解析缓存");
       clearAssets.title = "删除 MinerU 图片与表格资源缓存；保留论文结构、译文、笔记、书签与用户定稿。视觉本体需重新解析后恢复。";
-      addListener(clearAssets, "click", () => void runCleanup("assets", "将删除当前论文的 MinerU 图片与表格资源缓存。\n\n会保留：论文结构、正文、译文、用户定稿、笔记、书签和阅读进度。\n影响：视觉本体需要重新解析同一 PDF 才能恢复。\n\n确认继续？"));
+      addListener(clearAssets, "click", () => void runCleanup("assets", "将删除当前论文的 MinerU 图片与表格资源缓存。\n\n会保留：论文结构、正文、译文、用户定稿、笔记、书签和阅读进度。\n影响：视觉本体需要重新解析同一 PDF 才能恢复。\n\n确认继续？").catch((error) => notify(error?.message || "清理失败", "error")));
       const clearAi = button(doc, "仅清理 AI 译文");
       clearAi.title = "删除 AI 译文与翻译缓存；保留用户定稿、原文结构、笔记和书签。";
-      addListener(clearAi, "click", () => void runCleanup("ai-translations", "将删除当前论文的所有 AI 译文和翻译缓存。\n\n会保留：用户定稿、论文原文结构、图片缓存、笔记、书签和术语表。\n\n确认继续？"));
+      addListener(clearAi, "click", () => void runCleanup("ai-translations", "将删除当前论文的所有 AI 译文和翻译缓存。\n\n会保留：用户定稿、论文原文结构、图片缓存、笔记、书签和术语表。\n\n确认继续？").catch((error) => notify(error?.message || "清理失败", "error")));
       const detach = button(doc, "保留笔记后删除论文结构", "research-tools-button-danger");
       detach.title = "保留证据快照、研究笔记和术语；删除正文结构、视觉缓存、译文、书签、进度与任务。";
-      addListener(detach, "click", () => void runCleanup("structure-keep-notes", "将删除当前论文的正文结构、视觉缓存、全部译文、书签、阅读进度和解析任务。\n\n只保留：论文标题、基本解析信息、术语表，以及带原文证据快照的研究笔记。\n此操作后阅读正文需要重新导入同一 PDF。\n\n确认继续？"));
+      addListener(detach, "click", () => void runCleanup("structure-keep-notes", "将删除当前论文的正文结构、视觉缓存、全部译文、书签、阅读进度和解析任务。\n\n只保留：论文标题、基本解析信息、术语表，以及带原文证据快照的研究笔记。\n此操作后阅读正文需要重新导入同一 PDF。\n\n确认继续？").catch((error) => notify(error?.message || "清理失败", "error")));
       const removeAll = button(doc, "删除整篇论文及其研究数据", "research-tools-button-danger");
       removeAll.title = "删除论文结构、视觉缓存、全部译文、用户定稿、笔记、书签、进度、术语和任务。";
       addListener(removeAll, "click", async () => {
-        if (!window.confirm("将永久删除当前论文及其全部研究数据：\n\n论文结构、图片与表格缓存、AI 译文、用户定稿、笔记、书签、阅读进度、术语和任务记录。\n\n建议先导出备份。确认继续？")) return;
-        await call(`${endpoints.paper}?paperHash=${encodeURIComponent(hash)}`, { method: "DELETE" });
-        options.onPaperDeleted?.({ paperHash: hash });
-        notify("整篇论文及其研究数据已删除", "success");
+        if (!(await confirmAction("将永久删除当前论文及其全部研究数据：\n\n论文结构、图片与表格缓存、AI 译文、用户定稿、笔记、书签、阅读进度、术语和任务记录。\n\n建议先导出备份。确认继续？", "删除论文"))) return;
+        removeAll.disabled = true;
+        try {
+          await options.onBeforePaperDeleted?.({ paperHash: hash });
+          await call(`${endpoints.paper}?paperHash=${encodeURIComponent(hash)}`, { method: "DELETE" });
+          // Cleanup must run even when the user switched papers while the
+          // DELETE request was in flight; only the toast is render-scoped.
+          await options.onPaperDeleted?.({ paperHash: hash });
+          if (isCurrentRender("parse", token, hash)) notify("整篇论文及其研究数据已删除", "success");
+        } catch (error) {
+          await options.onPaperDeletionFailed?.({ paperHash: hash, error });
+          notify(error?.message || "删除论文失败", "error");
+        } finally {
+          removeAll.disabled = false;
+        }
       });
       operations.append(clearAssets, clearAi, detach, removeAll);
       view.appendChild(operations);
@@ -915,6 +1071,7 @@ export function createResearchTools(options = {}) {
             options.apiUrl,
             options.resourceOpen,
             call,
+            options.diagnosticLog,
           );
           if (result?.method === "direct" && result?.filePath) {
             notify(`✅ 完整备份已保存至下载文件夹：${result.fileName}`, "success");
@@ -937,16 +1094,26 @@ export function createResearchTools(options = {}) {
         const file = restoreInput.files?.[0]; restoreInput.value = "";
         if (!file) return;
         if (file.size > 256 * 1024 * 1024) { notify("备份文件超过 256 MB，拒绝读取", "error"); return; }
-        if (!window.confirm("恢复会用备份内容替换同一论文当前的结构、译文、笔记、书签、术语和任务数据。其他论文不受影响。确认继续？")) return;
+        if (!(await confirmAction("恢复会用备份内容替换同一论文当前的结构、译文、笔记、书签、术语和任务数据。其他论文不受影响。确认继续？", "恢复备份"))) return;
         restore.disabled = true;
+        let prepared = false;
         try {
           const parsed = JSON.parse(await file.text());
+          const backupHash = String(parsed?.paperHash || parsed?.paper?.paperHash || "").toLowerCase();
+          if (!backupHash || backupHash !== hash) throw new Error("备份不属于当前论文");
+          await options.onBeforePaperMutation?.({ paperHash: hash, purpose: "恢复备份" });
+          prepared = typeof options.onBeforePaperMutation === "function";
           const data = await call(endpoints.restore, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(parsed) });
-          options.onPaperDataChanged?.({ action: "restore", ...data });
+          if (!isCurrentRender("parse", token, hash)) return;
+          await options.onPaperDataChanged?.({ action: "restore", ...data });
+          if (!isCurrentRender("parse", token, hash)) return;
           notify("备份恢复成功", "success");
           render();
         } catch (error) { notify(`备份恢复失败：${error.message}`, "error"); }
-        finally { restore.disabled = false; }
+        finally {
+          if (prepared) await options.onPaperMutationFinished?.({ paperHash: hash });
+          restore.disabled = false;
+        }
       });
       backupActions.append(backup, restore, restoreInput);
       view.appendChild(backupActions);
@@ -981,8 +1148,9 @@ export function createResearchTools(options = {}) {
     } catch { if (isCurrentRender("parse", token, hash)) status.textContent = "数据统计或任务状态暂时不可用"; }
   }
 
-  function renderEvidence(view) {
+  function renderEvidence(view, token) {
     const selected = selectedBlock();
+    const requestPaperHash = paperHash();
     const prompt = makeElement(doc, "textarea", "research-tools-textarea");
     prompt.placeholder = "询问方法、结论或证据链";
     const context = makeElement(doc, "p", "research-tools-context", selected ? `当前证据：Page ${Number(selected.page || 1)} / block ${selected.id}${selected.sectionTitle ? ` · ${selected.sectionTitle}` : ""}` : "当前论文全部证据块");
@@ -1000,7 +1168,7 @@ export function createResearchTools(options = {}) {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            paperHash: paperHash(),
+            paperHash: requestPaperHash,
             question: text,
             evidenceId: selected?.evidenceId || null,
             blockId: selected?.id || null,
@@ -1010,12 +1178,15 @@ export function createResearchTools(options = {}) {
             thinkingLevel: state.paper?.thinkingLevel || "max",
           }),
         });
+        if (!isCurrentRender("evidence", token, requestPaperHash)) return;
         answer.textContent = data.answer || data.text || "助手没有返回内容";
         const evidence = Array.isArray(data.evidence) ? data.evidence : [];
         evidence.forEach((item) => {
           evidenceList.appendChild(evidenceResult(item, `${item.sectionTitle ? `${item.sectionTitle} · ` : ""}${String(item.originalQuote || item.text || "").slice(0, 180)}`));
         });
-      } catch { answer.textContent = "证据助手暂时不可用"; }
+      } catch {
+        if (isCurrentRender("evidence", token, requestPaperHash)) answer.textContent = "证据助手暂时不可用";
+      }
       finally { ask.disabled = false; }
     });
     view.append(context, prompt, ask, answer, evidenceList);
@@ -1063,6 +1234,7 @@ export function createResearchTools(options = {}) {
           if (!isCurrentRender("glossary", token, requestPaperHash)) return;
           state.glossary = result?.glossary?.terms || state.glossary;
           await options.onPaperStateChanged?.({ kind: "glossary", paperHash: requestPaperHash, glossary: result?.glossary });
+          if (state.activeTool !== "glossary" || paperHash() !== requestPaperHash) return;
           notify("术语已保存；后续翻译将使用新版本", "success");
           render();
         } catch (error) {
@@ -1083,6 +1255,7 @@ export function createResearchTools(options = {}) {
             await call(`${endpoints.glossary}?paperHash=${encodeURIComponent(requestPaperHash)}&term=${encodeURIComponent(source)}`, { method: "DELETE" });
             if (!isCurrentRender("glossary", token, requestPaperHash)) return;
             await options.onPaperStateChanged?.({ kind: "glossary", paperHash: requestPaperHash, deletedTerm: source });
+            if (state.activeTool !== "glossary" || paperHash() !== requestPaperHash) return;
             notify("术语已删除", "success");
             render();
           } catch (error) {
@@ -1096,7 +1269,7 @@ export function createResearchTools(options = {}) {
     } catch { if (isCurrentRender("glossary", token, hash)) status.textContent = "暂无术语或翻译缓存状态"; }
   }
 
-  function renderLab(view) {
+  function renderLab(view, token) {
     const select = makeElement(doc, "select", "research-tools-select");
     select.setAttribute("aria-label", "图表证据类型");
     [["all", "全部证据"], ["image", "图片"], ["chart", "图表"], ["equation", "公式"], ["table", "表格"]].forEach(([value, label]) => {
@@ -1112,6 +1285,9 @@ export function createResearchTools(options = {}) {
     });
     if (!matches.length) { renderMessage(list, "没有符合筛选条件的图表证据"); return; }
     matches.forEach(({ block, index }) => {
+      const blockType = String(block?.type || "").toLowerCase();
+      const latexText = normalizeLatex(block?.latex || (blockType === "equation" ? block?.text : ""));
+      const actionLabels = visualActionLabels(block);
       const evidence = {
         evidenceId: block.evidenceId,
         blockId: block.id,
@@ -1133,18 +1309,22 @@ export function createResearchTools(options = {}) {
       const media = makeElement(doc, "div", "research-tools-visual-media");
       if (block.assetRef?.cacheId && block.assetRef?.path) {
         media.appendChild(makeElement(doc, "span", "research-tools-muted", "正在载入图表本体…"));
-        const query = new URLSearchParams({ cacheId: block.assetRef.cacheId, path: block.assetRef.path });
+        const requestPaperHash = paperHash();
+        const query = new URLSearchParams({ paperHash: requestPaperHash, cacheId: block.assetRef.cacheId, path: block.assetRef.path });
         void options.apiFetch(`${endpoints.asset}?${query}`).then(async (response) => {
           if (!response.ok || !media.isConnected) throw new Error("asset unavailable");
           const blob = await response.blob();
           if (!blob.type.startsWith("image/")) throw new Error("asset is not image");
+          if (!isCurrentRender("lab", token, requestPaperHash)) return;
           const image = makeElement(doc, "img", "research-tools-visual-image");
           const url = URL.createObjectURL(blob);
           image.src = url; image.alt = block.text || `${block.type} Page ${block.page}`;
           image.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
           image.addEventListener("error", () => URL.revokeObjectURL(url), { once: true });
           media.replaceChildren(image);
-        }).catch(() => { if (media.isConnected) media.replaceChildren(makeElement(doc, "span", "research-tools-muted", "图表缓存不可用；可重新解析同一 PDF 恢复")); });
+        }).catch(() => {
+          if (media.isConnected && isCurrentRender("lab", token, requestPaperHash)) media.replaceChildren(makeElement(doc, "span", "research-tools-muted", "图表缓存不可用；可重新解析同一 PDF 恢复"));
+        });
       } else if (block.tableHtml) {
         const rows = tableRowsFromHtml(block.tableHtml).slice(0, 30);
         if (rows.length) {
@@ -1156,8 +1336,8 @@ export function createResearchTools(options = {}) {
           });
           media.appendChild(table);
         }
-      } else if (block.latex) {
-        media.appendChild(makeElement(doc, "code", "research-tools-latex", String(block.latex).replace(/^\$\$|\$\$$/g, "").trim()));
+      } else if (latexText) {
+        media.appendChild(makeElement(doc, "code", "research-tools-latex", latexText));
       } else {
         media.appendChild(makeElement(doc, "span", "research-tools-muted", "该对象没有独立资源，请回到 PDF 原页查看"));
       }
@@ -1177,16 +1357,56 @@ export function createResearchTools(options = {}) {
       const jump = button(doc, "回到正文", "research-tools-button-primary"); addListener(jump, "click", () => locate(evidence)); actions.appendChild(jump);
       const markdown = `![${block.text || block.type}](attachments/${block.assetRef?.path || "visual"})\n\n> 来源：${state.paper?.title || "当前论文"} · Page ${Number(block.page || 1)} · block ${block.id} · Evidence ${block.evidenceId || ""}\n\n${neighbors.map((item) => item.text).join("\n\n")}`;
       const copy = button(doc, "复制带来源 Markdown");
-      addListener(copy, "click", async () => { const copied = await copyText(markdown); notify(copied ? "带来源 Markdown 已复制" : "浏览器拒绝剪贴板写入", copied ? "success" : "error"); });
+      copy.dataset.researchAction = "copy-markdown";
+      copy.setAttribute("aria-label", "复制带来源 Markdown");
+      addListener(copy, "click", async () => {
+        const copied = await copyTextWithFallback(markdown, { document: doc, hostWrite: options.clipboardWrite });
+        notify(copied ? "带来源 Markdown 已复制" : "剪贴板写入被拒绝；请检查权限后重试", copied ? "success" : "error");
+      });
       actions.appendChild(copy);
-      if (block.tableHtml) {
+      if (actionLabels.includes("导出 CSV")) {
         const csv = button(doc, "导出 CSV");
-        addListener(csv, "click", () => downloadBlob(doc, new Blob(["\uFEFF", csvText(tableRowsFromHtml(block.tableHtml))], { type: "text/csv;charset=utf-8" }), `${block.id}.csv`));
+        csv.dataset.researchAction = "export-csv";
+        csv.setAttribute("aria-label", "导出 CSV");
+        const CsvBlob = doc.defaultView?.Blob || globalThis.Blob;
+        const csvRows = tableRowsFromHtml(block.tableHtml, doc);
+        const csvFallback = () => typeof CsvBlob === "function"
+          && downloadBlob(doc, new CsvBlob(["\uFEFF", csvText(csvRows)], { type: "text/csv;charset=utf-8" }), `${block.id}.csv`);
+        addListener(csv, "click", async () => {
+          csv.disabled = true;
+          try {
+            const result = await startDownload(
+              doc,
+              endpoints.csv,
+              { paperHash: paperHash(), blockId: block.id },
+              options.apiUrl,
+              options.resourceOpen,
+              call,
+              options.diagnosticLog,
+              csvFallback,
+              true,
+            );
+            if (result?.method === "direct" && result?.filePath) notify(`✅ CSV 已保存至下载文件夹：${result.fileName}`, "success");
+            else if (result?.method === "host") notify("CSV 已交给宿主下载，请检查下载文件夹", "info");
+            else if (result?.method === "blob") notify("CSV 下载已发起", "success");
+            else notify("CSV 下载已发起，请检查浏览器下载列表", "info");
+          } catch (error) {
+            notify(`CSV 导出失败：${error?.message || "下载地址无效"}`, "error");
+          } finally {
+            window.setTimeout(() => { if (csv.isConnected) csv.disabled = false; }, 500);
+          }
+        });
         actions.appendChild(csv);
       }
-      if (block.latex) {
+      if (latexText && actionLabels.includes("复制 LaTeX")) {
         const latex = button(doc, "复制 LaTeX");
-        addListener(latex, "click", async () => { const copied = await copyText(String(block.latex).replace(/^\$\$|\$\$$/g, "").trim()); notify(copied ? "LaTeX 已复制" : "浏览器拒绝剪贴板写入", copied ? "success" : "error"); });
+        latex.dataset.researchAction = "copy-latex";
+        latex.setAttribute("aria-label", "复制 LaTeX");
+        latex.title = "复制此公式的 LaTeX 源码";
+        addListener(latex, "click", async () => {
+          const copied = await copyTextWithFallback(latexText, { document: doc, hostWrite: options.clipboardWrite });
+          notify(copied ? "LaTeX 已复制" : "剪贴板写入被拒绝；请检查权限后重试", copied ? "success" : "error");
+        });
         actions.appendChild(latex);
       }
       card.appendChild(actions);
@@ -1197,13 +1417,20 @@ export function createResearchTools(options = {}) {
   async function exportMarkdown() {
     const hash = paperHash();
     if (!hash) throw new Error("当前没有可导出的论文");
-    const result = await startDownload(doc, endpoints.export, { paperHash: hash }, options.apiUrl, options.resourceOpen, call);
+    if (state.exportBusy) return false;
+    state.exportBusy = true;
+    try {
+      const result = await startDownload(doc, endpoints.export, { paperHash: hash }, options.apiUrl, options.resourceOpen, call, options.diagnosticLog);
     if (result?.method === "direct" && result?.filePath) {
       notify(`✅ 双语 Markdown 已保存至下载文件夹：${result.fileName}`, "success");
     } else if (result?.method === "host") {
       notify("双语 Markdown 已交给宿主下载，请检查下载文件夹", "info");
-    } else {
-      notify("双语 Markdown 下载已发起，请检查浏览器下载列表", "info");
+      } else {
+        notify("双语 Markdown 下载已发起，请检查浏览器下载列表", "info");
+      }
+      return true;
+    } finally {
+      window.setTimeout(() => { state.exportBusy = false; }, 500);
     }
   }
 
@@ -1227,9 +1454,9 @@ export function createResearchTools(options = {}) {
     if (id === "markers") renderMarkers(view, token);
     if (id === "notes") renderNotes(view, token);
     if (id === "parse") void renderParse(view, token);
-    if (id === "evidence") renderEvidence(view);
+    if (id === "evidence") renderEvidence(view, token);
     if (id === "glossary") void renderGlossary(view, token);
-    if (id === "lab") renderLab(view);
+    if (id === "lab") renderLab(view, token);
     if (id === "export") renderExport(view);
   }
 
@@ -1263,23 +1490,62 @@ export function createResearchTools(options = {}) {
     state.open = true; render(); return api;
   }
   function restoreUiState(value = {}) {
-    const search = value.searchState || {};
-    if (typeof search.query === "string") state.query = search.query.slice(0, 200);
-    if (["page", "section", "all"].includes(search.scope)) state.searchScope = search.scope;
-    if (["original", "translation", "both"].includes(search.language)) state.searchLanguage = search.language;
-    if (Array.isArray(search.types)) state.searchTypes = new Set(search.types.filter((item) => SEARCH_TYPES.some(([value]) => value === item)));
-    if (value.noteDraft && typeof value.noteDraft === "object") {
-      state.noteDraft = value.noteDraft;
-      state.note = String(value.noteDraft.note || "");
-      state.noteType = NOTE_TYPE_LABELS[value.noteDraft.noteType] ? value.noteDraft.noteType : "finding";
-      state.noteTags = String(value.noteDraft.tags || "");
+    const incomingHash = String(value?.paperHash || "");
+    const currentHash = paperHash();
+    if (incomingHash && currentHash && incomingHash !== currentHash) return api;
+    if (Object.prototype.hasOwnProperty.call(value, "searchState")) {
+      const search = value.searchState && typeof value.searchState === "object" ? value.searchState : {};
+      state.query = typeof search.query === "string" ? search.query.slice(0, 200) : "";
+      state.searchScope = ["page", "section", "all"].includes(search.scope) ? search.scope : "all";
+      state.searchLanguage = ["original", "translation", "both"].includes(search.language) ? search.language : "both";
+      state.searchTypes = Array.isArray(search.types)
+        ? new Set(search.types.filter((item) => SEARCH_TYPES.some(([value]) => value === item)))
+        : new Set();
+      state.results = [];
+    }
+    if (Object.prototype.hasOwnProperty.call(value, "noteDraft")) {
+      const draft = value.noteDraft && typeof value.noteDraft === "object" ? value.noteDraft : null;
+      const draftHash = String(draft?.paperHash || "");
+      state.noteDraft = draft && currentHash && draftHash && draftHash !== currentHash ? null : draft;
+      state.note = String(state.noteDraft?.note || "");
+      state.noteType = NOTE_TYPE_LABELS[state.noteDraft?.noteType] ? state.noteDraft.noteType : "finding";
+      state.noteTags = String(state.noteDraft?.tags || "");
+      state.editingNoteId = null;
     }
     return api;
   }
-  function uiState() { return { searchState: searchStateSnapshot(), noteDraft: state.noteDraft }; }
+  function uiState() {
+    return { paperHash: paperHash(), searchState: searchStateSnapshot(), noteDraft: state.noteDraft };
+  }
+  function resetPaperState() {
+    state.paper = null;
+    state.query = "";
+    state.results = [];
+    state.outline = [];
+    state.filter = "all";
+    state.searchScope = "all";
+    state.searchLanguage = "both";
+    state.searchTypes = new Set();
+    state.note = "";
+    state.noteType = "finding";
+    state.noteTags = "";
+    state.noteFilterType = "all";
+    state.noteFilterSection = "all";
+    state.noteFilterTag = "";
+    state.noteUnresolvedOnly = false;
+    state.noteDraft = null;
+    state.editingNoteId = null;
+    state.glossary = {};
+    state.notes = [];
+    state.bookmarks = [];
+    state.progress = null;
+    state.tasks = [];
+    state.renderToken += 1;
+    return api;
+  }
   function closeDrawer() { state.open = false; render(); return api; }
   function destroy() { clearNoticeTimer(); shell.remove(); state.destroyed = true; }
-  const api = { open, close: closeDrawer, destroy, refresh, restoreUiState, uiState };
+  const api = { open, close: closeDrawer, destroy, refresh, restoreUiState, resetPaperState, uiState };
   addListener(close, "click", closeDrawer);
   render();
   return api;

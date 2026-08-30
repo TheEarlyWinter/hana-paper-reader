@@ -88,8 +88,8 @@ test("notes, bookmarks, progress and glossary CRUD are paper-scoped", async () =
   assert.equal(note.validationStatus, "verified");
   assert.equal(bookmark.page, 2);
   assert.equal(bookmark.evidence.blockType, "equation");
-  assert.equal(await workspace.deleteItem("notes", note.id), true);
-  assert.equal(await workspace.deleteItem("notes", note.id), false);
+  assert.equal(await workspace.deleteItem("notes", note.id, hash), true);
+  assert.equal(await workspace.deleteItem("notes", note.id, hash), false);
   const progress = await workspace.setProgress({ paperHash: hash, page: 2, percent: 48 });
   assert.equal(progress.percent, 48);
   const glossary = await workspace.putGlossary({ paperHash: hash, terms: { "water stress": "水分胁迫" } });
@@ -328,4 +328,43 @@ test("precise progress persists reading mode scroll positions drafts and search 
   assert.equal(progress.contrastScrollTop, 560);
   assert.equal(progress.noteDraft.note, "unfinished");
   assert.equal(progress.searchState.scope, "section");
+});
+
+test("library indexing, metadata updates, search and filtering work across papers", async () => {
+  const hashA = "a".repeat(64);
+  const hashB = "b".repeat(64);
+  const hashC = "c".repeat(64);
+
+  await workspace.upsertPaper({ ...fixture(), paperHash: hashA, metadata: { title: "Paper Alpha", authors: ["Alice Smith"], year: 2024, doi: "10.1000/alpha", tags: ["ml"] } });
+  await workspace.upsertPaper({ ...fixture(), paperHash: hashB, metadata: { title: "Paper Beta", authors: ["Bob Jones"], year: 2025, doi: "10.1000/beta", tags: ["bio"] } });
+  await workspace.upsertPaper({ ...fixture(), paperHash: hashC, metadata: { title: "Paper Gamma", authors: ["Charlie"], year: 2023, tags: ["ml", "bio"] } });
+
+  await workspace.putNote({ paperHash: hashA, blockId: "mineru_p1_b2", note: "Alpha note" });
+  await workspace.putGlossary({ paperHash: hashA, terms: { transformer: "变形金刚" } });
+  await workspace.setProgress({ paperHash: hashA, blockId: "mineru_p1_b2", percent: 75 });
+
+  await workspace.updatePaperMetadata(hashA, { favorite: true });
+  await workspace.updatePaperMetadata(hashC, { archived: true });
+
+  const all = workspace.listLibrary({ archived: "all" });
+  assert.equal(all.length, 3);
+
+  const activeOnly = workspace.listLibrary({ archived: false });
+  assert.equal(activeOnly.length, 2);
+  assert.ok(activeOnly.some((p) => p.paperHash === hashA));
+  assert.ok(activeOnly.some((p) => p.paperHash === hashB));
+
+  const favorites = workspace.listLibrary({ favorite: true, archived: "all" });
+  assert.equal(favorites.length, 1);
+  assert.equal(favorites[0].paperHash, hashA);
+  assert.equal(favorites[0].noteCount, 1);
+  assert.equal(favorites[0].readingProgress.percent, 75);
+  assert.equal(favorites[0].hasGlossary, true);
+
+  const searched = workspace.listLibrary({ q: "Alice", archived: "all" });
+  assert.equal(searched.length, 1);
+  assert.equal(searched[0].paperHash, hashA);
+
+  const tagged = workspace.listLibrary({ tag: "bio", archived: "all" });
+  assert.equal(tagged.length, 2);
 });

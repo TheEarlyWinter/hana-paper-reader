@@ -12,6 +12,8 @@ assert.match(source, /function buildNativeDownloadUrl[\s\S]*?withSurfaceSession/
 assert.match(source, /function scheduleDownloadCleanup[\s\S]*?1000/);
 assert.match(source, /function hostResourceDownload[\s\S]*?mode: "download"/);
 assert.match(source, /function startDownload[\s\S]*?resourceOpen/);
+assert.match(source, /const confirmAction = async/);
+assert.match(source, /await confirmAction\(/);
 assert.match(source, /startDownload\(\s*doc,\s*endpoints\.export/);
 assert.match(source, /startDownload\(\s*doc,\s*endpoints\.backup/);
 assert.match(source, /options\.apiUrl/);
@@ -28,7 +30,7 @@ assert.match(source, /WORKFLOW_DEFINITIONS/);
 assert.match(source, /activeWorkflow/);
 assert.match(source, /dataset\.evidenceId/);
 assert.match(source, /result\.evidence/);
-for (const endpoint of ["notes", "bookmarks", "progress", "parse", "evidence", "glossary", "export", "storage", "cleanup", "backup", "restore"]) {
+for (const endpoint of ["notes", "bookmarks", "progress", "parse", "evidence", "glossary", "export", "storage", "cleanup", "backup", "restore", "csv"]) {
   assert.match(source, new RegExp(`\\b${endpoint}: \\"/api/research/`));
 }
 assert.match(source, /endpoints\[kind\]/);
@@ -70,4 +72,3 @@ assert.match(source, /state\.destroyed = true/);
 assert.doesNotMatch(source, /lastChild\.textContent/);
 
 console.log("research tools static checks: ok");
-console.log("DOM behavior tests not run: no browser DOM test dependency is installed in this repository.");
