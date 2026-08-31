@@ -10,7 +10,7 @@
 - 许可证：MIT
 - 运行方式：无构建步骤、无 npm 依赖的 direct WebView 插件
 
-![Hana Paper Reader 工作区界面](assets/hana-paper-reader-workspace.png)
+![Hana Paper Reader 工作区界面](assets/contrast-reading-mode.png)
 
 ## 为什么是 Paper Reader
 
@@ -77,6 +77,18 @@ validationStatus
 | 沉淀 | 研究笔记、术语与译文、研究导出 | 用研究发现、方法与条件、疑问、局限与风险四类笔记沉淀判断，并绑定稳定 Evidence |
 | 独立入口 | 数据与任务 | 查看解析阶段、存储占用和失败原因，取消任务，分项清理、备份或恢复论文研究数据 |
 
+#### 定位工作流（全文搜索与筛选）
+
+![研究工作流 - 定位](assets/workflow-locate.png)
+
+#### 核验工作流（证据助手与图表公式）
+
+![研究工作流 - 核验](assets/workflow-verify.png)
+
+#### 沉淀工作流（四类证据型笔记与导出）
+
+![研究工作流 - 沉淀](assets/workflow-deposit.png)
+
 ### 工作区自动恢复
 
 重新打开插件时，会恢复最近论文的：
@@ -122,6 +134,8 @@ paperHash + blockId + glossaryVersion + agentId + modelRef
 - PDF.js 仅负责本地原页预览和定位，不参与正文结构解析。
 
 ### 数据所有权与分篇存储
+
+![我的文库与文献管理](assets/paper-library.png)
 
 工作区 schema 3 使用 `per-paper-v1` 分篇布局：每篇论文的结构、研究记录、译文和任务写入独立目录。旧版单文件工作区首次打开前会自动备份，再迁移到新布局。
 
@@ -205,6 +219,8 @@ git clone https://github.com/TheEarlyWinter/hana-paper-reader.git
 
 ## 快速开始
 
+![阅读器初始界面与单段翻译](assets/reading-view-initial.png)
+
 1. 打开 **Hana Paper Reader**，首屏只需在三个入口中选择：`体验示例论文`、`配置 MinerU`、`导入我的论文`。
 2. 想先体验界面，可点击 `体验示例论文`，无需 MinerU。
 3. 正式解析 PDF 前，点击 `配置 MinerU`，填写 Token，选择模型、语言、公式、表格和 OCR 设置并保存。
@@ -246,6 +262,8 @@ MinerU 官方 API 文档：<https://mineru.net/apiManage/docs>
 ## MinerU 设置与 Token 安全
 
 ### 阅读器内设置
+
+![MinerU 精准解析设置](assets/mineru-settings.png)
 
 点击顶部 `MinerU 未配置` 或 `MinerU · VLM`，可以设置：
 
