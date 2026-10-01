@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>论文 PDF</title>
+  <link rel="stylesheet" href="./assets/pdf-preview.css">
+</head>
+<body data-hana-theme="inherit">
+  <main id="pdf-preview" aria-label="论文 PDF 预览">
+    <header class="preview-toolbar">
+      <div class="preview-heading"><strong id="document-name">论文 PDF</strong><span>只读预览</span></div>
+      <nav aria-label="PDF 阅读工具">
+        <button id="open-document" hidden title="在这张预览卡中打开 PDF">打开 PDF</button>
+        <button id="previous-page" data-document-control disabled title="上一页（←）" aria-label="上一页">‹</button>
+        <label class="page-label">页码 <input id="page-number" data-document-control disabled type="number" min="1" value="1" inputmode="numeric" aria-label="页码"></label>
+        <span id="page-count" aria-label="总页数">/ —</span>
+        <button id="next-page" data-document-control disabled title="下一页（→）" aria-label="下一页">›</button>
+        <span class="toolbar-divider"></span>
+        <button id="zoom-out" data-document-control disabled aria-label="缩小">−</button>
+        <select id="zoom-mode" data-document-control disabled aria-label="缩放">
+          <option value="width">适合宽度</option><option value="page">整页</option>
+          <option value="0.5">50%</option><option value="0.75">75%</option>
+          <option value="1">100%</option><option value="1.25">125%</option>
+          <option value="1.5">150%</option><option value="2">200%</option>
+          <option value="3">300%</option><option value="4">400%</option>
+          <option id="custom-zoom" value="custom" hidden>自定义</option>
+        </select>
+        <button id="zoom-in" data-document-control disabled aria-label="放大">+</button>
+        <button id="rotate-page" data-document-control disabled title="顺时针旋转 90°">旋转</button>
+        <button id="reload-document" title="重新读取当前文档">重新加载</button>
+      </nav>
+    </header>
+    <form id="find-form" class="preview-find" role="search">
+      <label for="find-query">查找</label>
+      <input id="find-query" data-document-control disabled type="search" maxlength="128" placeholder="在 PDF 文字中查找" autocomplete="off">
+      <button id="start-find" data-document-control disabled type="submit">查找</button>
+      <button id="cancel-find" type="button" hidden>停止</button>
+      <button id="previous-match" type="button" disabled aria-label="上一处匹配">↑</button>
+      <button id="next-match" type="button" disabled aria-label="下一处匹配">↓</button>
+      <output id="find-status" aria-live="polite"></output>
+    </form>
+    <div id="preview-message" class="preview-message" role="status" aria-live="polite">正在连接文档…</div>
+    <div id="page-stage" class="page-stage" tabindex="0" aria-label="PDF 页面；可选择文字" aria-busy="true">
+      <div id="page-host" class="page-host" hidden></div>
+      <div id="preview-empty" class="preview-empty"><span>正在加载论文 PDF…</span></div>
+    </div>
+    <footer class="preview-footer"><span id="render-detail"></span><span>← → 翻页 · Ctrl + / − 缩放 · Ctrl F 查找</span></footer>
+  </main>
+  <dialog id="password-dialog" aria-labelledby="password-title">
+    <form id="password-form">
+      <h2 id="password-title">解锁 PDF</h2>
+      <p id="password-hint">这份 PDF 需要打开密码。</p>
+      <label for="pdf-password">PDF 密码</label>
+      <input id="pdf-password" type="password" autocomplete="off" required>
+      <p class="password-note">密码仅用于本次打开，关闭后清除。</p>
+      <div class="dialog-actions"><button id="cancel-password" type="button">取消</button><button type="submit">打开</button></div>
+    </form>
+  </dialog>
+  <script type="module">
+    import { hana } from "./assets/sdk.js";
+    hana.ready({ surface: "preview" });
+    const showBootError = () => {
+      const message = document.getElementById("preview-message");
+      if (document.body.dataset.previewBooted) return;
+      message.textContent = "PDF 预览组件加载失败，请关闭后重新打开。";
+      message.dataset.level = "error";
+      document.getElementById("page-stage").setAttribute("aria-busy", "false");
+    };
+    window.addEventListener("error", showBootError);
+    window.addEventListener("unhandledrejection", showBootError);
+  </script>
+  <script type="module" src="./assets/pdf-preview.js"></script>
+</body>
+</html>

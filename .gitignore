@@ -10,3 +10,19 @@ node_modules/
 *.tmp
 .cache/
 dist/
+
+# Local App development and user data
+.smoke-tools/
+work/
+outputs/
+app-data/
+plugin-data/
+.hanako/
+.codex/
+.env
+.env.*
+*.migration.json
+*.pem
+*.key
+paper-workspace.json
+mineru-settings.json

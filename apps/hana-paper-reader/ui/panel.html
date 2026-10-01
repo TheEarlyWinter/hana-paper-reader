@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hana Paper Reader</title>
+  <link rel="stylesheet" href="./assets/panel.css">
+  <link rel="stylesheet" href="./assets/app-ui.css">
+</head>
+<body>
+  <main data-hana-app-ui>
+    <h1>Hana Paper Reader</h1>
+    <p id="startup-status" role="status">Loading App...</p>
+    <div id="form"></div>
+    <p id="greeting" role="status"></p>
+  </main>
+  <script>
+    window.addEventListener('error', () => {
+      document.getElementById('startup-status').textContent = 'App failed to start. Check its resources and run the App validator.';
+    }, true);
+  </script>
+  <script type="module" src="./assets/panel.js"></script>
+</body>
+</html>

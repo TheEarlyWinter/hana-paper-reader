@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>论文精读</title>
+  <link rel="stylesheet" href="./assets/panel.css">
+  <link rel="stylesheet" href="./assets/research-tools.css">
+</head>
+<body
+  data-hana-theme="inherit"
+  data-surface="reader"
+  data-pdfjs-url="./pdfjs.mjs"
+  data-research-tools-url="./research-tools.js"
+  data-sha256-url="./sha256.js"
+>
+  <div id="root" data-surface="reader">
+    <div style="min-height:100vh;display:grid;place-items:center;padding:24px;color:#537d96;background:#f8f5ed;font:14px/1.6 system-ui,sans-serif;text-align:center">
+      <span data-hpr-boot-loader>正在加载 Hana Paper Reader…</span><br><small style="color:#7a7369">若此提示持续显示，说明前端资源未成功加载。</small>
+    </div>
+  </div>
+  <script type="module">
+    import { hana } from "./assets/sdk.js";
+
+    // Signal the host before the optional research bundle hydrates. If the
+    // bundle has a runtime error, the Page remains mounted and diagnosable.
+    try {
+      hana.ready({ surface: "reader" });
+      window.__hanaPaperReaderReady = true;
+    } catch {
+      window.__hanaPaperReaderReadyError = true;
+    }
+
+    function showBootError() {
+      const root = document.getElementById("root");
+      if (!root || !root.querySelector("[data-hpr-boot-loader]")) return;
+      root.innerHTML = '<div style="min-height:100vh;display:grid;place-items:center;padding:24px;color:#8b3f35;background:#f8f5ed;font:14px/1.6 system-ui,sans-serif;text-align:center"><strong>前端初始化失败</strong><br><small>论文精读页面未能完成加载，请重新打开该页面。</small></div>';
+    }
+
+    window.addEventListener("error", (event) => {
+      if (event?.filename || event?.target?.tagName === "SCRIPT") showBootError();
+    });
+    window.addEventListener("unhandledrejection", () => showBootError());
+  </script>
+  <script type="module" src="./assets/panel.js"></script>
+</body>
+</html>

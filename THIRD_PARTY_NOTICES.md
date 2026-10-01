@@ -1,16 +1,25 @@
 # Third-Party Notices
 
+## OpenHanako / HanaAgent App SDK
+
+The V2 App includes the Hana 0.1050.9 App SDK distribution from OpenHanako.
+
+- Upstream: https://github.com/liliMozi/openhanako
+- License: Apache License 2.0
+- License and attribution: apps/hana-paper-reader/sdk/LICENSE and sdk/NOTICE
+- Bundled dependency notices: sdk/THIRD_PARTY_NOTICES.txt and retained .LEGAL.txt files
+
 ## Mozilla PDF.js 5.6.205
 
-Hana Paper Reader includes a bundled browser module at `assets/pdfjs.mjs` derived from Mozilla PDF.js 5.6.205 (build `ada343803`). It is used only to render the user-selected local PDF as an original-page visual reference and fallback crop source.
+The V2 PDF renderer includes PDF.js and its version-matched CMap and standard-font assets.
 
-PDF.js is developed by Mozilla and PDF.js contributors:
-
-- Project: <https://github.com/mozilla/pdf.js>
-- Version: 5.6.205
+- Upstream: https://github.com/mozilla/pdf.js
 - License: Apache License 2.0
-- License copy: `licenses/PDFJS-APACHE-2.0.txt`
+- License copy: apps/hana-paper-reader/assets/licenses/PDFJS-APACHE-2.0.txt
+- CMap notice: apps/hana-paper-reader/ui/assets/cmaps/LICENSE
+- Font notices: apps/hana-paper-reader/ui/assets/standard_fonts/LICENSE_FOXIT and LICENSE_LIBERATION
 
-The bundled file is a minified/bundled distribution form. Hana Paper Reader does not claim ownership of PDF.js. Apache License 2.0 terms continue to apply to that component.
+## Bundled App UI dependencies
 
-No PaperQuay source code is included in this version.
+The compiled UI preserves apps/hana-paper-reader/ui/assets/THIRD_PARTY_NOTICES.txt and app-ui.js.LEGAL.txt.
+Project-owned code remains under the root MIT LICENSE; the licenses of bundled components continue to apply.
