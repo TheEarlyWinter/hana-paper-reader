@@ -16,6 +16,10 @@
 
 ## 安装
 
+已构建的 1.0.34 试用包可从 [V2 发布页](https://github.com/TheEarlyWinter/hana-paper-reader/releases/tag/v1.0.34)下载。通常选 full-feature-candidate.zip；reader-only-candidate.zip 不声明独立 PDF 卡和 Previewer。在 Hana 扩展管理中通过“本地安装”直接选择 App ZIP，无需解压；GitHub 自动提供的 Source code 压缩包不用于安装。
+
+需要自行打包时，按以下步骤准备候选目录。
+
 在项目根目录使用 Node.js 26 或更新版本准备候选目录：
 
 ~~~sh
