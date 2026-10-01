@@ -1,5 +1,9 @@
 # Hana Paper Reader
 
+> **v2 App 试用候选 1.0.34** 已加入本分支，最低 Hana 版本 0.1050.9。
+> [v2 安装与使用说明](apps/hana-paper-reader/README.md) · [测试覆盖与待验收项](docs/v2/TEST_STATUS_1.0.34.md) · [v2 架构](docs/v2/ARCHITECTURE.md)
+> 以下原有 README、根目录 manifest 和插件代码仍描述旧版 0.9.0；v2 位于 apps/hana-paper-reader，完整发布验收尚未完成。
+
 面向 **HanaAgent** 的可引用双语论文精读工作台。
 
 它不只是把 PDF 翻译成中文，而是把论文转换为一个可以搜索、定位、引用、提问、批注和导出的研究工作区：**MinerU 提取语义结构，PDF.js 保留原始页面证据，Hana 助手负责翻译与解释，稳定的 `Page X / block Y` 锚点把每个结论带回原文。**

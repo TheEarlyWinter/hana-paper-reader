@@ -1,0 +1,4 @@
+# Preserve the shipped App/SDK distribution, including source-map and font bytes.
+apps/hana-paper-reader/** -text
+docs/v2/** text eol=lf
+tools/** text eol=lf

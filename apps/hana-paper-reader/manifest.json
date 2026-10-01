@@ -1,0 +1,70 @@
+{
+  "manifestVersion": 2,
+  "id": "hana-paper-reader",
+  "name": "Hana Paper Reader",
+  "version": "1.0.34",
+  "description": "证据驱动的学术论文精读工作台，支持论文结构、证据锚点与研究工作区。",
+  "entry": "index.js",
+  "icon": "assets/icon.svg",
+  "minAppVersion": "0.1050.9",
+  "capabilities": [
+    "app/models.infer",
+    "app/agents.read",
+    "app/resources.read",
+    "app/process.spawn",
+    "app/sessions.read",
+    "app/sessions.manage",
+    "app/session.start-turn",
+    "app/session.switch-model",
+    "app/session.thinking-level"
+  ],
+  "network": {
+    "allowedHosts": [
+      "mineru.net",
+      "*.mineru.net",
+      "*.openxlab.org.cn",
+      "mineru.oss-cn-shanghai.aliyuncs.com"
+    ],
+    "methods": ["GET", "POST", "PUT"],
+    "defaultTimeoutMs": 60000,
+    "maxResponseBytes": 134217728
+  },
+  "contributes": {
+    "cards": [
+      {
+        "id": "reader",
+        "title": "论文精读",
+        "description": "论文结构、证据与研究工作区。",
+        "realization": "page",
+        "siteNavEntry": true,
+        "face": { "image": "assets/cover.png" },
+        "route": "/reader.html",
+        "detached": { "route": "/reader.html" },
+        "detachedDefaultSize": { "width": 1200, "height": 800 },
+        "cardForm": "flush",
+        "titlebar": "solid"
+      },
+      {
+        "id": "pdf-preview",
+        "title": "PDF 预览（试点）",
+        "description": "打开独立只读 PDF 预览，支持翻页、缩放、旋转与全文查找。",
+        "realization": "card",
+        "face": { "image": "assets/cover.png" },
+        "route": "/pdf-preview.html",
+        "detached": { "route": "/pdf-preview.html" },
+        "detachedDefaultSize": { "width": 1100, "height": 850 },
+        "cardForm": "flush",
+        "titlebar": "solid"
+      }
+    ],
+    "previewers": [
+      {
+        "id": "pdf",
+        "title": "论文 PDF（试点）",
+        "route": "/pdf-preview.html",
+        "mode": "read",
+        "selectors": [ { "extensions": ["pdf"] }, { "mimeTypes": ["application/pdf"] } ]
+      }
+    ]
+  }
+}

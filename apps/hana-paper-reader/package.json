@@ -1,0 +1,14 @@
+{
+  "name": "hana-paper-reader-v2-development",
+  "version": "1.0.34",
+  "private": true,
+  "type": "module",
+  "description": "Development commands for the Hana Paper Reader v2 App candidate",
+  "license": "MIT",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs"
+  }
+}
