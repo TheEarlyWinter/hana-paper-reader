@@ -22,12 +22,13 @@
     "allowedHosts": [
       "mineru.net",
       "*.mineru.net",
+      "openxlab.org.cn",
       "*.openxlab.org.cn",
       "mineru.oss-cn-shanghai.aliyuncs.com"
     ],
     "methods": ["GET", "POST", "PUT"],
     "defaultTimeoutMs": 60000,
-    "maxResponseBytes": 134217728
+    "maxResponseBytes": 262144000
   },
   "contributes": {
     "cards": [

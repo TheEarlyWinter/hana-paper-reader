@@ -224,8 +224,55 @@ function cacheDirectorySize(directory) {
   return total;
 }
 
+function collectPaperAssetCacheIds(paper, into) {
+  if (!paper || typeof paper !== "object") return;
+  for (const collection of [paper.blocks, paper.resources]) {
+    if (!Array.isArray(collection)) continue;
+    for (const item of collection) {
+      const id = typeof item?.assetRef?.cacheId === "string" ? item.assetRef.cacheId.trim().toLowerCase() : "";
+      if (/^[a-f0-9]{24}$/.test(id)) into.add(id);
+    }
+  }
+}
+
+function referencedMineruCacheIds(dataDir) {
+  const referenced = new Set();
+  const indexPath = path.resolve(dataDir, "paper-workspace.json");
+  if (fs.existsSync(indexPath)) {
+    try {
+      const index = JSON.parse(fs.readFileSync(indexPath, "utf8"));
+      const papers = index?.papers && typeof index.papers === "object" ? index.papers : {};
+      for (const [hash, paper] of Object.entries(papers)) {
+        collectPaperAssetCacheIds(paper, referenced);
+        const shardPath = path.resolve(dataDir, "papers", hash, "paper.json");
+        if (fs.existsSync(shardPath)) {
+          collectPaperAssetCacheIds(JSON.parse(fs.readFileSync(shardPath, "utf8")), referenced);
+        }
+      }
+    } catch {
+      return null;
+    }
+  }
+  const papersDir = path.resolve(dataDir, "papers");
+  if (fs.existsSync(papersDir)) {
+    try {
+      for (const entry of fs.readdirSync(papersDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const shardPath = path.join(papersDir, entry.name, "paper.json");
+        if (!fs.existsSync(shardPath)) continue;
+        collectPaperAssetCacheIds(JSON.parse(fs.readFileSync(shardPath, "utf8")), referenced);
+      }
+    } catch {
+      return null;
+    }
+  }
+  return referenced;
+}
+
 function pruneMineruCache(dataDir, keepCacheId) {
   const root = path.resolve(dataDir, "mineru-cache");
+  const referenced = referencedMineruCacheIds(dataDir);
+  if (referenced === null) return;
   let directories;
   try {
     directories = fs.readdirSync(root, { withFileTypes: true })
@@ -236,14 +283,17 @@ function pruneMineruCache(dataDir, keepCacheId) {
         try { modified = fs.statSync(directory).mtimeMs; } catch {}
         return { id: entry.name, directory, modified, size: cacheDirectorySize(directory) };
       })
-      .sort((left, right) => (right.id === keepCacheId) - (left.id === keepCacheId) || right.modified - left.modified);
+      .sort((left, right) => (
+        (right.id === keepCacheId || referenced.has(right.id)) - (left.id === keepCacheId || referenced.has(left.id))
+        || right.modified - left.modified
+      ));
   } catch {
     return;
   }
   let kept = 0;
   let total = 0;
   for (const item of directories) {
-    const mustKeep = item.id === keepCacheId;
+    const mustKeep = item.id === keepCacheId || referenced.has(item.id);
     if (mustKeep || (kept < MAX_CACHE_ENTRIES && total + item.size <= MAX_CACHE_BYTES)) {
       kept += 1;
       total += item.size;

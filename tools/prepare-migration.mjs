@@ -55,9 +55,15 @@ const papers = manifest.paperHashes.map(hash => {
     const bytes = fs.readFileSync(target);
     bytesTotal += bytes.length;
     if (bytesTotal > 180 * 1024 * 1024) throw new Error("Migration bundle exceeds 256 MiB JSON limit; prepare smaller snapshots");
-    assets.push({ cacheId: match[1].toLowerCase(), path: match[2], data: bytes.toString("base64") });
+    assets.push({
+      cacheId: match[1].toLowerCase(),
+      path: match[2],
+      size: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      data: bytes.toString("base64"),
+    });
   }
-  return { format: "hana-paper-reader-backup", version: 1, paperHash: hash,
+  return { format: "hana-paper-reader-backup", version: 1, paperHash: hash, assetMode: "included",
     paper: { ...paper, paperHash: hash, translations: translations.translations || {}, translationStates: translations.translationStates || {},
       translationGlossaryVersion: translations.translationGlossaryVersion || 0, readingMode: research.readingMode || "bilingual" },
     notes: records(research.notes, hash), bookmarks: records(research.bookmarks, hash),
@@ -67,8 +73,8 @@ const papers = manifest.paperHashes.map(hash => {
     tasks: records(tasks.tasks, hash).map(task => ({ id: task.id, paperHash: hash, kind: task.kind || "parse", type: task.type,
       state: ["queued", "running"].includes(task.state || task.status) ? "failed" : task.state || task.status || "failed",
       status: ["queued", "running"].includes(task.state || task.status) ? "failed" : task.state || task.status || "failed",
-      needsRetry: ["queued", "running"].includes(task.state || task.status), createdAt: task.createdAt, updatedAt: task.updatedAt,
-      error: ["queued", "running"].includes(task.state || task.status) ? "旧任务未在新版本自动恢复，请重新发起" : undefined })), assets };
+      needsRetry: ["queued", "running"].includes(task.state || task.status) || Boolean(task.needsRetry), createdAt: task.createdAt, updatedAt: task.updatedAt,
+      error: ["queued", "running"].includes(task.state || task.status) ? "旧任务未在新版本自动恢复，请重新发起" : task.error })), assets };
 });
 // These checks are mandatory migration integrity guards, not App acceptance.
 const finalManifest = inspectMigrationSource(source);

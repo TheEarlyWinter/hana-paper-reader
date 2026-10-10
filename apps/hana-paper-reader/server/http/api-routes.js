@@ -165,9 +165,11 @@ export default function registerApiRoutes(app, runtime) {
       const results = searchResearchPaper(runtime.dataDir, paperHash, query, {
         scope: requestQuery(c, "scope"),
         language: requestQuery(c, "language"),
-        type: requestQuery(c, "type") || requestQuery(c, "types"),
+        type: requestQuery(c, "type"),
+        types: requestQuery(c, "types") || requestQuery(c, "type"),
         page: requestQuery(c, "page"),
         sectionId: requestQuery(c, "sectionId"),
+        currentBlockId: requestQuery(c, "currentBlockId"),
         limit: requestQuery(c, "limit"),
       });
       return results

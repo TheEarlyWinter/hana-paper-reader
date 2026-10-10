@@ -200,16 +200,29 @@ function snippet(value, needle, max = 240) {
   return `${start > 0 ? "…" : ""}${source.slice(start, end)}${end < source.length ? "…" : ""}`;
 }
 
+function searchTypeGroup(block) {
+  const kind = text(block?.type, 40).toLowerCase();
+  if (["heading", "title", "section"].includes(kind) || Number(block?.level) > 0) return "title";
+  if (["image", "chart", "figure", "caption"].includes(kind)) return "figure";
+  if (kind === "table") return "table";
+  if (kind === "equation" || text(block?.latex)) return "equation";
+  return "body";
+}
+
 function searchBlocks(paper, query, options = {}) {
   const needle = text(query, 200).toLocaleLowerCase();
   if (!needle) return [];
   const language = SEARCH_LANGUAGES.has(options.language) ? options.language : "both";
   const scope = SEARCH_SCOPES.has(options.scope) ? options.scope : "all";
-  const page = Math.max(0, Number(options.page) || 0);
-  const sectionId = text(options.sectionId, 256);
-  const type = text(options.type || options.types, 100).toLowerCase();
+  const currentPage = Math.max(0, Number(options.page || options.currentPage) || 0);
+  const currentSectionId = text(options.sectionId || options.currentSectionId, 256);
+  const currentBlockId = text(options.currentBlockId, 256);
+  const sourceTypes = Array.isArray(options.types) ? options.types : text(options.types || options.type, 200).split(",");
+  const types = new Set(sourceTypes.map((value) => text(value, 40).toLowerCase()).filter(Boolean));
   const limit = Math.min(100, Math.max(1, Number(options.limit) || 100));
-  return array(paper.blocks).map((block, index) => {
+  const sourceBlocks = array(paper.blocks);
+  const currentIndex = sourceBlocks.findIndex((block) => text(block?.id, 256) === currentBlockId);
+  return sourceBlocks.map((block, index) => {
     const original = text(block?.text || block?.caption || block?.latex);
     const translation = text(block?.translatedText);
     const originalLower = original.toLocaleLowerCase();
@@ -217,25 +230,46 @@ function searchBlocks(paper, query, options = {}) {
     const originalCount = language === "translation" ? 0 : occurrenceCount(originalLower, needle);
     const translationCount = language === "original" ? 0 : occurrenceCount(translationLower, needle);
     const blockType = text(block?.type, 40).toLowerCase();
+    const group = searchTypeGroup(block);
     const inScope = scope === "all"
-      || (scope === "page" && page > 0 && Number(block?.page) === page)
-      || (scope === "section" && sectionId && text(block?.sectionId, 256) === sectionId);
-    if (!inScope || (type && blockType !== type) || (!originalCount && !translationCount)) return null;
+      || (scope === "page" && currentPage > 0 && Number(block?.page) === currentPage)
+      || (scope === "section" && currentSectionId && text(block?.sectionId, 256) === currentSectionId);
+    const typeMatch = !types.size || types.has(group) || types.has(blockType);
+    if (!inScope || !typeMatch || (!originalCount && !translationCount)) return null;
     let score = Math.min(30, (originalCount + translationCount) * 8);
     const reasons = [`命中 ${originalCount + translationCount} 次`];
-    if (["heading", "title", "section"].includes(blockType) || Number(block?.level) > 0) {
+    if (group === "title") {
       score += 28;
       reasons.push("标题块 +28");
+    } else if (["figure", "table", "equation"].includes(group)) {
+      score += 12;
+      reasons.push("视觉证据 +12");
     }
     if (originalLower.startsWith(needle) || translationLower.startsWith(needle)) {
       score += 12;
       reasons.push("段首命中 +12");
+    }
+    if (text(block?.sectionTitle, 1000).toLocaleLowerCase().includes(needle)) {
+      score += 10;
+      reasons.push("章节标题命中 +10");
+    }
+    if (currentPage > 0 && Number(block?.page) === currentPage) {
+      score += 8;
+      reasons.push("当前页 +8");
+    }
+    if (currentIndex >= 0) {
+      const proximity = Math.max(0, 10 - Math.min(10, Math.abs(index - currentIndex)));
+      if (proximity) {
+        score += proximity;
+        reasons.push(`邻近当前块 +${proximity}`);
+      }
     }
     return {
       id: text(block?.id, 256),
       evidenceId: text(block?.evidenceId, 128) || evidenceIdFor(paper.paperHash, text(block?.id, 256)),
       page: normalizedPage(block?.page),
       type: text(block?.type, 40) || "paragraph",
+      typeGroup: group,
       text: original,
       translatedText: translation,
       sectionId: text(block?.sectionId, 256) || null,
@@ -314,11 +348,17 @@ function listLibraryOwned(dataDir, options = {}) {
     const notes = object(research.notes);
     const bookmarks = object(research.bookmarks);
     const progress = object(research.progress);
+    const glossaryTerms = object(research.glossary?.terms || bundle.paper.glossaryTerms);
     const title = text(metadata.title, 500) || "未命名论文";
     const authors = Array.isArray(metadata.authors) ? metadata.authors : [];
     const tags = Array.isArray(metadata.tags) ? metadata.tags : [];
+    const progressPercent = typeof progress.percent === "number"
+      ? progress.percent
+      : (typeof progress.scrollRatio === "number" ? Math.round(progress.scrollRatio * 100) : (progress.blockId ? 50 : 0));
+    const blockId = progress.blockId || progress.lastBlockId || null;
     return {
       paperHash,
+      revision: bundle.paper.revision,
       title,
       authors,
       doi: metadata.doi || null,
@@ -326,15 +366,18 @@ function listLibraryOwned(dataDir, options = {}) {
       tags,
       favorite: metadata.favorite === true,
       archived: metadata.archived === true,
-      lastReadAt: entry.lastReadAt || bundle.paper.updatedAt || bundle.paper.createdAt || null,
+      lastReadAt: entry.lastReadAt || metadata.lastReadAt || progress.updatedAt || bundle.paper.updatedAt || bundle.paper.createdAt || null,
       createdAt: bundle.paper.createdAt || entry.createdAt || null,
       updatedAt: bundle.paper.updatedAt || entry.updatedAt || null,
       blockCount: Number(entry.blockCount) || array(bundle.paper.blocks).length,
       noteCount: Object.keys(notes).length,
       bookmarkCount: Object.keys(bookmarks).length,
+      hasGlossary: Object.keys(glossaryTerms).length > 0,
       readingProgress: {
-        percent: Number(progress.percent) || 0,
-        lastBlockId: progress.lastBlockId || null,
+        percent: Number(progressPercent) || 0,
+        blockId,
+        lastBlockId: blockId,
+        updatedAt: progress.updatedAt || null,
         readingMode: progress.readingMode || bundle.paper.readingMode || "bilingual",
       },
     };

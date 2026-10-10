@@ -20,11 +20,13 @@ export function verifyNoSymlinks(targetPath, rootBoundary = null) {
   // Inspect the authorized root and its descendants, never its host-owned parents.
   let current = resolvedTarget;
   while (true) {
-    if (fs.existsSync(current)) {
+    try {
       const stat = fs.lstatSync(current);
       if (stat.isSymbolicLink()) {
         throw new Error(`symlink or junction detected: "${current}"`);
       }
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
     }
     if (boundary && current === boundary) break;
     const parent = path.dirname(current);

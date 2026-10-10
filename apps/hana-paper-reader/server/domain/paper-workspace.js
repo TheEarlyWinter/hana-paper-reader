@@ -303,7 +303,15 @@ function rebuildDerivedIndexes(paper) {
       assetRef: ref,
     };
   });
-  const blockIds = new Set(rawBlocks.map((block) => block.id));
+  const blockIds = new Set();
+  for (const block of rawBlocks) {
+    if (blockIds.has(block.id)) {
+      const err = new Error(`duplicate block id: ${block.id}`);
+      err.code = "duplicate_block_id";
+      throw err;
+    }
+    blockIds.add(block.id);
+  }
   const translations = {
     ...Object.fromEntries(rawBlocks.filter((block) => block.translatedText).map((block) => [block.id, block.translatedText])),
     ...Object.fromEntries(Object.entries(object(paper.translations)).map(([blockId, value]) => [text(blockId, 256), translationText(value)]).filter(([blockId, value]) => blockIds.has(blockId) && value)),
@@ -437,11 +445,13 @@ function verifyNoSymlinksInPath(targetPath, boundaryPath) {
   let current = path.resolve(targetPath);
   const boundary = path.resolve(boundaryPath);
   while (true) {
-    if (fs.existsSync(current)) {
+    try {
       const stat = fs.lstatSync(current);
       if (stat.isSymbolicLink()) {
         throw new Error(`symlink or junction detected: ${current}`);
       }
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
     }
     if (current === boundary) break;
     const parent = path.dirname(current);
@@ -864,7 +874,7 @@ export function createPaperWorkspace(options = {}) {
     },
     listTasks: (paperHash, limit = MAX_SNAPSHOT_ITEMS) => {
       const hash = safePaperHash(paperHash);
-      return Object.values(load().tasks).filter((task) => task.paperHash === hash).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, clamp(limit, 1, MAX_SNAPSHOT_ITEMS)).map(clone);
+      return Object.values(load().tasks).filter((task) => task.paperHash === hash).sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""))).slice(0, clamp(limit, 1, MAX_SNAPSHOT_ITEMS)).map(clone);
     },
     search: (paperHash, query, options) => {
       const paper = getPaper(paperHash);
@@ -939,7 +949,7 @@ export function createPaperWorkspace(options = {}) {
         .filter((item) => !sectionId || item.evidenceSnapshot?.sectionId === sectionId || item.evidence?.sectionId === sectionId)
         .filter((item) => !tag || array(item.tags).some((value) => text(value, 80).toLocaleLowerCase() === tag))
         .filter((item) => !unresolvedOnly || item.noteType === "question" && item.resolved !== true)
-        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")))
         .slice(0, clamp(limit, 1, MAX_SNAPSHOT_ITEMS))
         .map((item) => clone(hydrateEvidenceRelation({ ...item, itemVersion: itemVersionOf(item) }, paper, collection === "notes" ? "note" : "bookmark")));
     },
@@ -1055,9 +1065,11 @@ export function createPaperWorkspace(options = {}) {
           if (!paper) throw new Error("paper not found");
           assertExpectedPaperRevision(paper, expectedRevision, "清理");
           const cacheIds = assetCacheIds(paper);
+          paper.blocks = array(paper.blocks).map((block) => ({ ...block, assetRef: null }));
           paper.revision = advancePaperRevision(store, hash);
           paper.updatedAt = now();
-          return { action, removedCacheIds: [], candidateCacheIds: cacheIds, paper: clone(paper) };
+          store.papers[hash] = rebuildDerivedIndexes(paper);
+          return { action, removedCacheIds: [], candidateCacheIds: cacheIds, paper: clone(store.papers[hash]) };
         }, ({ result }) => {
           Object.assign(result, cleanupAssetCaches(result.candidateCacheIds, {
             excludePaperHash: hash, expectedOwnerRevision: result.paper.revision, expectedIndexToken: dataStorageToken,
@@ -1162,6 +1174,11 @@ export function createPaperWorkspace(options = {}) {
         : input.paper?.revision !== undefined
           ? expectedPaperRevision({ expectedRevision: input.paper.revision })
           : null;
+      if (!input.paper || typeof input.paper !== "object" || Array.isArray(input.paper) || !Array.isArray(input.paper.blocks)) {
+        const err = new Error("backup paper structure is invalid");
+        err.code = "backup_invalid";
+        throw err;
+      }
       if (input.paper?.paperHash && normalizePaperHash(input.paper.paperHash) !== hash) {
         const err = new Error("backup paper hash mismatch");
         err.code = "backup_invalid";
@@ -1274,7 +1291,17 @@ export function createPaperWorkspace(options = {}) {
       }
       const validatedAssets = [...seenAssets.values()];
 
-      const candidatePaper = rebuildDerivedIndexes({ ...object(input.paper), paperHash: hash });
+      let candidatePaper;
+      try {
+        candidatePaper = rebuildDerivedIndexes({ ...object(input.paper), paperHash: hash });
+      } catch (error) {
+        if (!error?.code || error.code === "duplicate_block_id") {
+          const err = new Error(error?.message || "backup paper blocks are invalid");
+          err.code = "backup_invalid";
+          throw err;
+        }
+        throw error;
+      }
       candidatePaper.metadata = normalizePaperMetadata(candidatePaper.metadata);
       validateBackupAssetCoverage(input, candidatePaper, seenAssets);
 

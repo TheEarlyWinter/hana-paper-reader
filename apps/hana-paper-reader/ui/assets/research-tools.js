@@ -410,7 +410,10 @@ export function createResearchTools(options = {}) {
       }
       return data;
     } catch (error) {
-      if (!quiet && !init.signal?.aborted && researchContextIsCurrent(requestEpoch, requestHash)) notify(String(error?.message || "研究工具请求失败"), "error");
+      if (!quiet && !init.signal?.aborted && researchContextIsCurrent(requestEpoch, requestHash)) {
+        notify(String(error?.message || "研究工具请求失败"), "error");
+        if (error && typeof error === "object") error.notified = true;
+      }
       throw error;
     }
   }
@@ -849,7 +852,7 @@ export function createResearchTools(options = {}) {
         if (!result || state.activeTool !== "notes" || !researchContextIsCurrent(formEpoch, formHash)
             || state.noteDraft !== submittedDraft || (state.editingNoteId || null) !== submittedDraft.id) return;
         state.note = ""; state.noteDraft = null; state.editingNoteId = null; state.editingNoteVersion = null; emitUiState(); render();
-      }).catch((error) => { if (researchContextIsCurrent(formEpoch, formHash)) notify(error.message, "error"); }).finally(() => {
+      }).catch((error) => { if (!error?.notified && researchContextIsCurrent(formEpoch, formHash)) notify(error.message, "error"); }).finally(() => {
         finishNoteSave(pendingSave);
       });
     });
@@ -946,7 +949,7 @@ export function createResearchTools(options = {}) {
                 }
                 render();
               })
-              .catch((error) => { if (researchContextIsCurrent(requestEpoch, requestPaperHash)) notify(error?.message || "笔记更新失败", "error"); })
+              .catch((error) => { if (!error?.notified && researchContextIsCurrent(requestEpoch, requestPaperHash)) notify(error?.message || "笔记更新失败", "error"); })
               .finally(() => { finishNoteSave(pendingSave); });
           });
           row.appendChild(resolve);
@@ -979,7 +982,7 @@ export function createResearchTools(options = {}) {
       state.bookmarkSavePending = pending;
       bookmark.disabled = true;
       void saveNote("bookmarks", { blockId: selected?.id, page: selected?.page })
-        .catch((error) => { if (researchContextIsCurrent(formEpoch, hash)) notify(error.message, "error"); })
+        .catch((error) => { if (!error?.notified && researchContextIsCurrent(formEpoch, hash)) notify(error.message, "error"); })
         .finally(() => {
           if (state.bookmarkSavePending !== pending) return;
           state.bookmarkSavePending = null;
@@ -997,7 +1000,7 @@ export function createResearchTools(options = {}) {
           notify("阅读进度已同步", "success");
           render();
         })
-        .catch((error) => notify(error.message, "error"))
+        .catch((error) => { if (!error?.notified && researchContextIsCurrent(formEpoch, requestPaperHash)) notify(error.message, "error"); })
         .finally(() => { progress.disabled = false; });
     });
     actions.append(bookmark, progress);
@@ -1078,13 +1081,13 @@ export function createResearchTools(options = {}) {
       const operations = makeElement(doc, "div", "research-tools-data-actions");
       const clearAssets = button(doc, "仅清理解析缓存");
       clearAssets.title = "删除 MinerU 图片与表格资源缓存；保留论文结构、译文、笔记、书签与用户定稿。视觉本体需重新解析后恢复。";
-      addListener(clearAssets, "click", () => void runCleanup("assets", "将删除当前论文的 MinerU 图片与表格资源缓存。\n\n会保留：论文结构、正文、译文、用户定稿、笔记、书签和阅读进度。\n影响：视觉本体需要重新解析同一 PDF 才能恢复。\n\n确认继续？").catch((error) => notify(error?.message || "清理失败", "error")));
+      addListener(clearAssets, "click", () => void runCleanup("assets", "将删除当前论文的 MinerU 图片与表格资源缓存。\n\n会保留：论文结构、正文、译文、用户定稿、笔记、书签和阅读进度。\n影响：视觉本体需要重新解析同一 PDF 才能恢复。\n\n确认继续？").catch((error) => { if (!error?.notified) notify(error?.message || "清理失败", "error"); }));
       const clearAi = button(doc, "仅清理 AI 译文");
       clearAi.title = "删除 AI 译文与翻译缓存；保留用户定稿、原文结构、笔记和书签。";
-      addListener(clearAi, "click", () => void runCleanup("ai-translations", "将删除当前论文的所有 AI 译文和翻译缓存。\n\n会保留：用户定稿、论文原文结构、图片缓存、笔记、书签和术语表。\n\n确认继续？").catch((error) => notify(error?.message || "清理失败", "error")));
+      addListener(clearAi, "click", () => void runCleanup("ai-translations", "将删除当前论文的所有 AI 译文和翻译缓存。\n\n会保留：用户定稿、论文原文结构、图片缓存、笔记、书签和术语表。\n\n确认继续？").catch((error) => { if (!error?.notified) notify(error?.message || "清理失败", "error"); }));
       const detach = button(doc, "保留笔记后删除论文结构", "research-tools-button-danger");
       detach.title = "保留证据快照、研究笔记和术语；删除正文结构、视觉缓存、译文、书签、进度与任务。";
-      addListener(detach, "click", () => void runCleanup("structure-keep-notes", "将删除当前论文的正文结构、视觉缓存、全部译文、书签、阅读进度和解析任务。\n\n只保留：论文标题、基本解析信息、术语表，以及带原文证据快照的研究笔记。\n此操作后阅读正文需要重新导入同一 PDF。\n\n确认继续？").catch((error) => notify(error?.message || "清理失败", "error")));
+      addListener(detach, "click", () => void runCleanup("structure-keep-notes", "将删除当前论文的正文结构、视觉缓存、全部译文、书签、阅读进度和解析任务。\n\n只保留：论文标题、基本解析信息、术语表，以及带原文证据快照的研究笔记。\n此操作后阅读正文需要重新导入同一 PDF。\n\n确认继续？").catch((error) => { if (!error?.notified) notify(error?.message || "清理失败", "error"); }));
       const removeAll = button(doc, "删除整篇论文及其研究数据", "research-tools-button-danger");
       removeAll.title = "删除论文结构、视觉缓存、全部译文、用户定稿、笔记、书签、进度、术语和任务。";
       addListener(removeAll, "click", async () => {

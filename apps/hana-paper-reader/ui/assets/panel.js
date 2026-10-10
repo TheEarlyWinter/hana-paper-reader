@@ -235,6 +235,8 @@ let paperRevision = 0;
 let currentPaperHashPromise = null;
 let paperLoadRequestId = 0;
 let libraryRequestId = 0;
+let mineruSettingsRequestId = 0;
+let agentCatalogRequestId = 0;
 let restoreRequestId = 0;
 let fullTranslationRunId = 0;
 let fullTranslationBusy = false;
@@ -1714,10 +1716,14 @@ async function loadMineruSettings() {
     updateMineruUI();
     return;
   }
+  const requestId = ++mineruSettingsRequestId;
   try {
     const response = await pluginApiFetch("/api/mineru-settings");
-    applyMineruSettings(await response.json());
+    const data = await response.json();
+    if (requestId !== mineruSettingsRequestId) return;
+    applyMineruSettings(data);
   } catch {
+    if (requestId !== mineruSettingsRequestId) return;
     updateMineruUI();
   }
 }
@@ -1794,6 +1800,7 @@ async function saveMineruSettings() {
   }
   button.disabled = true;
   button.textContent = "正在保存…";
+  const requestId = ++mineruSettingsRequestId;
   try {
     const response = await pluginApiFetch("/api/mineru-settings", {
       method: "POST",
@@ -1802,7 +1809,7 @@ async function saveMineruSettings() {
     });
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(apiErrorMessage(data, "保存失败"));
-    applyMineruSettings(data);
+    if (requestId === mineruSettingsRequestId) applyMineruSettings(data);
     closeMineruSettings();
     await safeToast({ message: "MinerU 设置已保存", type: "success" });
     const pendingFile = pendingPdfFile;
@@ -1822,6 +1829,7 @@ async function saveMineruSettings() {
 
 async function clearMineruToken() {
   if (!await confirmAction("确认清除已保存的 MinerU Token？之后导入 PDF 时需要重新填写。", { title: "清除 MinerU Token", confirmText: "确认清除" })) return;
+  const requestId = ++mineruSettingsRequestId;
   try {
     const response = await pluginApiFetch("/api/mineru-settings", {
       method: "POST",
@@ -1830,7 +1838,7 @@ async function clearMineruToken() {
     });
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(apiErrorMessage(data, "清除失败"));
-    applyMineruSettings(data);
+    if (requestId === mineruSettingsRequestId) applyMineruSettings(data);
     pendingPdfFile = null;
     pendingPdfLoadRequestId = 0;
     closeMineruSettings();
@@ -2260,6 +2268,14 @@ function invalidatePaperContext(hash) {
   paperLoadRequestId += 1;
   paperRevision += 1;
   researchStateRevision += 1;
+  fullTranslationRunId += 1;
+  fullTranslationBusy = false;
+  blockTranslationRunIds.clear();
+  const translateButton = document.getElementById("btn-translate-all");
+  if (translateButton) {
+    translateButton.disabled = false;
+    translateButton.textContent = "翻译全文";
+  }
   if (activeParseController) void cancelActiveParse();
   return true;
 }
@@ -3553,19 +3569,23 @@ async function loadAgentsAndModels() {
     updateAgentUI();
     return;
   }
+  const requestId = ++agentCatalogRequestId;
   const previousAgentId = currentAgent?.id;
   const [agentsResult, modelsResult] = await Promise.allSettled([
     pluginApiFetch("/api/agents"),
     pluginApiFetch("/api/models"),
   ]);
+  if (requestId !== agentCatalogRequestId) return;
 
   if (agentsResult.status === "fulfilled") {
     try {
       const response = agentsResult.value;
       const data = await response.json();
+      if (requestId !== agentCatalogRequestId) return;
       if (response.ok && data.ok && Array.isArray(data.agents)) {
+        const preferredAgentId = currentAgent?.id || previousAgentId;
         agentsList = data.agents;
-        currentAgent = agentsList.find((agent) => agent.id === previousAgentId)
+        currentAgent = agentsList.find((agent) => agent.id === preferredAgentId)
           || agentsList.find((agent) => agent.id === "hakimi")
           || agentsList[0]
           || null;
@@ -3575,6 +3595,7 @@ async function loadAgentsAndModels() {
         console.log("agents load fallback:", apiErrorMessage(data, "无法读取助手列表"));
       }
     } catch (error) {
+      if (requestId !== agentCatalogRequestId) return;
       agentsList = [];
       currentAgent = null;
       console.log("agents load fallback:", error);
@@ -3589,6 +3610,7 @@ async function loadAgentsAndModels() {
     try {
       const response = modelsResult.value;
       const data = await response.json();
+      if (requestId !== agentCatalogRequestId) return;
       if (response.ok && data.ok && Array.isArray(data.models)) {
         chatModels = data.models.filter((model) => model?.ref && normalizeModelRef(model.ref));
         modelCatalogReady = true;
@@ -3599,6 +3621,7 @@ async function loadAgentsAndModels() {
         modelCatalogError = apiErrorMessage(data, "无法读取聊天模型列表");
       }
     } catch (error) {
+      if (requestId !== agentCatalogRequestId) return;
       chatModels = [];
       modelCatalogReady = false;
       modelCatalogError = error?.message || "无法读取聊天模型列表";
@@ -5273,6 +5296,12 @@ async function startFullTranslation() {
       button.textContent = failedCount ? `重试未完成段落 (${failedCount})` : "重新翻译全文";
       renderBlocks();
       scheduleResearchSync();
+    } else if (runId === fullTranslationRunId) {
+      fullTranslationBusy = false;
+      if (currentPaper === paperRef) {
+        button.disabled = false;
+        button.textContent = "翻译全文";
+      }
     }
   }
 }

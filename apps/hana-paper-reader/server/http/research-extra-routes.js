@@ -105,7 +105,11 @@ function workspaceError(c, error) {
   };
   const message = storageFailure ? messages.workspace_storage_unavailable
     : messages[code] || (notFound ? messages.paper_not_found : "研究工作区请求失败，请稍后重试");
-  const status = storageFailure || code === "workspace_integrity_error" || code === "workspace_storage_unavailable"
+  const status = storageFailure
+    || code === "workspace_integrity_error"
+    || code === "workspace_storage_unavailable"
+    || code === "restore_fatal"
+    || code === "export_path_invalid"
     ? 503
     : code === "paper_conflict" || code === "backup_assets_unavailable"
       ? 409

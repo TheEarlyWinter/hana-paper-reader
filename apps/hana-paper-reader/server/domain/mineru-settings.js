@@ -154,9 +154,17 @@ export function createMineruSettingsStore(dataDir, options = {}) {
   const setMany = (patch) => {
     const input = isObject(patch) ? patch : {};
     const operation = writeChain.then(async () => {
-      const current = await read();
+      const rawStored = cleanSettings(readStored(file));
+      const current = { ...rawStored, mineruApiToken: await unprotect(rawStored.mineruApiToken) };
       const next = cleanSettings({ ...current, ...input });
-      const stored = { ...next, mineruApiToken: await protect(next.mineruApiToken) };
+      const preserveProtectedToken = !Object.prototype.hasOwnProperty.call(input, "mineruApiToken")
+        && process.platform !== "win32"
+        && isProtected(rawStored.mineruApiToken)
+        && !current.mineruApiToken;
+      const storedToken = preserveProtectedToken
+        ? rawStored.mineruApiToken
+        : await protect(next.mineruApiToken);
+      const stored = { ...next, mineruApiToken: storedToken };
       writeStored(file, stored);
       return next;
     });

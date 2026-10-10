@@ -317,7 +317,7 @@ export default function registerModelRoutes(app, runtime) {
         runtime,
       });
       const translations = parseJsonArray(result.text);
-      if (!translations || translations.length !== list.length || translations.some((text) => text.length > 12000)) {
+      if (!translations || translations.length !== list.length || translations.some((text) => !text.trim() || text.length > 12000)) {
         throw new ModelBoundaryError("translation_output_invalid", "翻译模型返回格式无效", 502);
       }
       return c.json({

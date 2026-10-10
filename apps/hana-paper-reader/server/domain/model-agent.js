@@ -290,7 +290,8 @@ function parseJsonArray(text) {
   if (!match) return null;
   try {
     const value = JSON.parse(match[0]);
-    return Array.isArray(value) ? value.map((item) => String(item ?? "")) : null;
+    if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) return null;
+    return value;
   } catch {
     return null;
   }
@@ -594,7 +595,7 @@ async function runUtilityTranslation(models, list, glossaryTerms, runtime, signa
     runtime,
   });
   const translations = parseJsonArray(result.text);
-  if (!translations || translations.length !== list.length || translations.some((text) => text.length > MAX_TEXT_CHARS)) {
+  if (!translations || translations.length !== list.length || translations.some((text) => !text.trim() || text.length > MAX_TEXT_CHARS)) {
     throw new ModelBoundaryError("translation_output_invalid", "翻译模型返回格式无效", 502);
   }
   return { ...result, translations };

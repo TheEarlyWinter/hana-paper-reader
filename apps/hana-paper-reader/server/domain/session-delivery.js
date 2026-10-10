@@ -3,7 +3,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { verifyNoSymlinks } from "./paper-path-guard.js";
 import { getResearchEvidence, readResearchPaper, isSafePaperHash } from "./research-read.js";
-import { readPublicAgent, selectModel, normalizeThinkingLevel } from "./model-agent.js";
+import { readPublicAgent, selectModel, normalizeThinkingLevel, ModelBoundaryError } from "./model-agent.js";
 
 const LIMIT = 300;
 const TTL = 15 * 60 * 1000;
@@ -140,9 +140,17 @@ export function createSessionDelivery(runtime) {
       let row;
       let createInput;
       if (create) {
-        const resolved = await readPublicAgent(runtime.agents, text(body.agentId, 128));
-        if (!resolved.agent) fail("agent_not_found", "请先选择一个可用助手");
-        const model = await selectModel(runtime.models, text(body.modelRef), resolved.agent);
+        let resolved;
+        let model;
+        try {
+          resolved = await readPublicAgent(runtime.agents, text(body.agentId, 128));
+          if (!resolved.agent) fail("agent_not_found", "请先选择一个可用助手");
+          model = await selectModel(runtime.models, text(body.modelRef), resolved.agent);
+        } catch (error) {
+          if (error instanceof SessionDeliveryError) throw error;
+          if (error instanceof ModelBoundaryError) fail(error.code, error.message, error.status);
+          throw error;
+        }
         createInput = { agentId: resolved.agent.id, model: model.model, kind: "paper-discussion" };
         const level = normalizeThinkingLevel(body.thinkingLevel);
         if (level) createInput.thinkingLevel = level;
