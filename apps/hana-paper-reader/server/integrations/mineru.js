@@ -235,35 +235,52 @@ function collectPaperAssetCacheIds(paper, into) {
   }
 }
 
-function referencedMineruCacheIds(dataDir) {
+import { createPaperStorage } from "../domain/paper-storage.js";
+import { verifyNoSymlinks } from "../domain/paper-path-guard.js";
+
+function referencedMineruCacheIdsOwned(dataDir, loaded) {
   const referenced = new Set();
   const indexPath = path.resolve(dataDir, "paper-workspace.json");
   if (fs.existsSync(indexPath)) {
-    try {
-      const index = JSON.parse(fs.readFileSync(indexPath, "utf8"));
-      const papers = index?.papers && typeof index.papers === "object" ? index.papers : {};
-      for (const [hash, paper] of Object.entries(papers)) {
-        collectPaperAssetCacheIds(paper, referenced);
+    const rawIndex = JSON.parse(fs.readFileSync(indexPath, "utf8"));
+    const indexPapers = rawIndex?.papers;
+    if (!indexPapers || typeof indexPapers !== "object" || Array.isArray(indexPapers)) return null;
+    for (const [hash, entry] of Object.entries(indexPapers)) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+      collectPaperAssetCacheIds(entry, referenced);
+      if (rawIndex.storageLayout === "per-paper-v1") {
         const shardPath = path.resolve(dataDir, "papers", hash, "paper.json");
-        if (fs.existsSync(shardPath)) {
-          collectPaperAssetCacheIds(JSON.parse(fs.readFileSync(shardPath, "utf8")), referenced);
-        }
+        if (!fs.existsSync(shardPath)) return null;
+        verifyNoSymlinks(shardPath, dataDir);
+        const shard = JSON.parse(fs.readFileSync(shardPath, "utf8"));
+        if (!shard || typeof shard !== "object" || Array.isArray(shard)) return null;
+        if (!shard.structureDetached && !Array.isArray(shard.blocks)) return null;
+        collectPaperAssetCacheIds(shard, referenced);
       }
-    } catch {
-      return null;
+    }
+  }
+  if (loaded?.source !== null && loaded?.source !== undefined) {
+    const papers = loaded.source?.papers;
+    if (!papers || typeof papers !== "object" || Array.isArray(papers)) return null;
+    for (const paper of Object.values(papers)) {
+      if (!paper || typeof paper !== "object" || Array.isArray(paper)) return null;
+      if (!paper.structureDetached && !Array.isArray(paper.blocks)) return null;
+      collectPaperAssetCacheIds(paper, referenced);
     }
   }
   const papersDir = path.resolve(dataDir, "papers");
   if (fs.existsSync(papersDir)) {
-    try {
-      for (const entry of fs.readdirSync(papersDir, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const shardPath = path.join(papersDir, entry.name, "paper.json");
-        if (!fs.existsSync(shardPath)) continue;
-        collectPaperAssetCacheIds(JSON.parse(fs.readFileSync(shardPath, "utf8")), referenced);
-      }
-    } catch {
-      return null;
+    verifyNoSymlinks(papersDir, dataDir);
+    for (const entry of fs.readdirSync(papersDir, { withFileTypes: true })) {
+      if (entry.isSymbolicLink()) return null;
+      if (!entry.isDirectory()) continue;
+      const shardPath = path.join(papersDir, entry.name, "paper.json");
+      if (!fs.existsSync(shardPath)) return null;
+      verifyNoSymlinks(shardPath, papersDir);
+      const shard = JSON.parse(fs.readFileSync(shardPath, "utf8"));
+      if (!shard || typeof shard !== "object" || Array.isArray(shard)) return null;
+      if (!shard.structureDetached && !Array.isArray(shard.blocks)) return null;
+      collectPaperAssetCacheIds(shard, referenced);
     }
   }
   return referenced;
@@ -271,39 +288,45 @@ function referencedMineruCacheIds(dataDir) {
 
 function pruneMineruCache(dataDir, keepCacheId) {
   const root = path.resolve(dataDir, "mineru-cache");
-  const referenced = referencedMineruCacheIds(dataDir);
-  if (referenced === null) return;
-  let directories;
+  const indexPath = path.resolve(dataDir, "paper-workspace.json");
+  const storage = createPaperStorage({ filePath: indexPath });
   try {
-    directories = fs.readdirSync(root, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && /^[a-f0-9]{24}$/.test(entry.name))
-      .map((entry) => {
-        const directory = path.join(root, entry.name);
-        let modified = 0;
-        try { modified = fs.statSync(directory).mtimeMs; } catch {}
-        return { id: entry.name, directory, modified, size: cacheDirectorySize(directory) };
-      })
-      .sort((left, right) => (
-        (right.id === keepCacheId || referenced.has(right.id)) - (left.id === keepCacheId || referenced.has(left.id))
-        || right.modified - left.modified
-      ));
+    storage.readSnapshot((loaded) => {
+      const referenced = referencedMineruCacheIdsOwned(dataDir, loaded);
+      if (referenced === null) return;
+      if (!fs.existsSync(root)) return;
+      verifyNoSymlinks(root, dataDir);
+      const directories = fs.readdirSync(root, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink() && /^[a-f0-9]{24}$/.test(entry.name))
+        .map((entry) => {
+          const directory = path.join(root, entry.name);
+          let modified = 0;
+          try { modified = fs.statSync(directory).mtimeMs; } catch {}
+          return { id: entry.name, directory, modified, size: cacheDirectorySize(directory) };
+        })
+        .sort((left, right) => (
+          (right.id === keepCacheId || referenced.has(right.id)) - (left.id === keepCacheId || referenced.has(left.id))
+          || right.modified - left.modified
+        ));
+      let kept = 0;
+      let total = 0;
+      for (const item of directories) {
+        const mustKeep = item.id === keepCacheId || referenced.has(item.id);
+        if (mustKeep || (kept < MAX_CACHE_ENTRIES && total + item.size <= MAX_CACHE_BYTES)) {
+          kept += 1;
+          total += item.size;
+          continue;
+        }
+        try {
+          verifyNoSymlinks(item.directory, root);
+          fs.rmSync(item.directory, { recursive: true, force: true });
+        } catch {}
+      }
+    });
   } catch {
-    return;
-  }
-  let kept = 0;
-  let total = 0;
-  for (const item of directories) {
-    const mustKeep = item.id === keepCacheId || referenced.has(item.id);
-    if (mustKeep || (kept < MAX_CACHE_ENTRIES && total + item.size <= MAX_CACHE_BYTES)) {
-      kept += 1;
-      total += item.size;
-      continue;
-    }
-    try { fs.rmSync(item.directory, { recursive: true, force: true }); } catch {}
+    // Fail closed when workspace state is busy, recovering, or unreadable.
   }
 }
-
-import { verifyNoSymlinks } from "../domain/paper-path-guard.js";
 
 function writeMineruCache(entries, dataDir, cacheId, referencedPaths) {
   const cacheBase = path.resolve(dataDir, "mineru-cache");

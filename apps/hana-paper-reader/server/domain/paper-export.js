@@ -112,14 +112,22 @@ function normalizeEntries(collection, kind) {
   });
 }
 
+function firstPlainText(...values) {
+  for (const value of values) {
+    const text = plainText(value);
+    if (text) return text;
+  }
+  return "";
+}
+
 function assetIndex(assets) {
   const list = Array.isArray(assets) ? assets : asArray(assets?.items ?? assets?.assets);
   const byBlock = new Map();
   const byPath = new Map();
   for (const item of list) {
     if (!isRecord(item)) continue;
-    const blockId = plainText(item.blockId ?? item.block_id ?? item.id);
-    const sourcePath = plainText(item.assetPath ?? item.sourcePath ?? item.path ?? item.assetRef?.path);
+    const blockId = firstPlainText(item.blockId, item.block_id, item.id);
+    const sourcePath = firstPlainText(item.assetPath, item.sourcePath, item.path, item.assetRef?.path);
     if (blockId) byBlock.set(blockId, item);
     if (sourcePath) byPath.set(sourcePath, item);
   }
@@ -128,7 +136,7 @@ function assetIndex(assets) {
 
 function resolveAsset(block, assets) {
   const direct = isRecord(block?.asset) ? block.asset : null;
-  const sourcePath = plainText(block?.assetPath ?? block?.imagePath ?? block?.assetRef?.path);
+  const sourcePath = firstPlainText(block?.assetPath, block?.imagePath, block?.assetRef?.path);
   return direct
     || assets.byBlock.get(plainText(block?.id))
     || assets.byPath.get(sourcePath)
@@ -179,9 +187,15 @@ function renderVisual(block, asset, attachmentBasePath) {
   const type = plainText(block.type) || "image";
   const labels = { image: "图", chart: "图表", table: "表", equation: "公式" };
   const result = [`> **${labels[type] || "视觉块"}** · Page ${Number(block.page) > 0 ? Number(block.page) : 1}`];
-  const assetPath = plainText(
-    asset?.exportPath ?? asset?.relativePath ?? asset?.path ?? asset?.assetPath ?? asset?.assetRef?.path
-    ?? block?.assetPath ?? block?.imagePath ?? block?.assetRef?.path
+  const assetPath = firstPlainText(
+    asset?.exportPath,
+    asset?.relativePath,
+    asset?.path,
+    asset?.assetPath,
+    asset?.assetRef?.path,
+    block?.assetPath,
+    block?.imagePath,
+    block?.assetRef?.path,
   );
   if (assetPath) {
     const alt = plainText(asset?.alt ?? block.text) || labels[type] || "论文附件";

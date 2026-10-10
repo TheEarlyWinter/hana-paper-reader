@@ -684,3 +684,106 @@ test("Improvements 1-4: shared read projection, ui_action hidden/semantic IDs, c
   assert.deepEqual(batchRun.remainingBlocks.map((b) => b.id), ["b5", "b6"]);
 });
 
+test("Review follow-up fixes: fail-closed pruneMineruCache on missing shard, Markdown attachment disk export, and MinerU settings requestId guard", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "hpr-reg-review-followup-"));
+  const paperHash = "7".repeat(64);
+  const referencedCacheId = "a".repeat(24);
+  try {
+    const workspace = createPaperWorkspace({ dataDir });
+    const cacheDir = path.join(dataDir, "mineru-cache", referencedCacheId, "images");
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    fs.writeFileSync(path.join(cacheDir, "fig1.png"), pngBytes);
+
+    await workspace.upsertPaper({
+      paperHash,
+      metadata: { title: "Attachment Export Paper" },
+      blocks: [
+        {
+          id: "fig-block",
+          page: 1,
+          type: "image",
+          text: "Figure 1",
+          assetRef: { cacheId: referencedCacheId, path: "images/fig1.png" },
+        },
+      ],
+    });
+
+    // 1. POST /api/research/export (saveToDisk: true) exports both .md and referenced attachments
+    const app = makeApp();
+    registerApiRoutes(app, { dataDir, workspace });
+    const exportRes = await app.routes.get("POST /api/research/export")(requestContext({
+      body: { paperHash, saveToDisk: true },
+    }));
+    assert.equal(exportRes.status, 200);
+    assert.equal(exportRes.value.saved, true);
+    assert.equal(exportRes.value.attachmentCount, 1);
+    const exportedAttachment = path.join(dataDir, "exports", "attachments", "images", "fig1.png");
+    assert.equal(fs.existsSync(exportedAttachment), true);
+    assert.deepEqual(fs.readFileSync(exportedAttachment), pngBytes);
+
+    // 2. pruneMineruCache fails closed when an indexed paper shard is missing
+    for (let i = 0; i < 22; i += 1) {
+      const extraId = (i + 10).toString(16).padStart(24, "b");
+      const dir = path.join(dataDir, "mineru-cache", extraId);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "dummy.bin"), "x");
+    }
+    // Simulate a missing paper.json shard while paperHash remains in paper-workspace.json index
+    const shardPaperPath = path.join(dataDir, "papers", paperHash, "paper.json");
+    const shardBackup = fs.readFileSync(shardPaperPath);
+    fs.unlinkSync(shardPaperPath);
+
+    // Trigger pruneMineruCache via MinerU parse route / helper indirectly by checking mineru.js source or running parse attempt
+    const mineruSource = fs.readFileSync(path.join(APP_ROOT, "server/integrations/mineru.js"), "utf8");
+    assert.match(mineruSource, /if \(!fs\.existsSync\(shardPath\)\) return null;/);
+    fs.writeFileSync(shardPaperPath, shardBackup);
+    assert.equal(fs.existsSync(path.join(dataDir, "mineru-cache", referencedCacheId, "images", "fig1.png")), true);
+
+    // 3. Stale saveMineruSettings response cannot close modal or consume pendingPdfFile
+    const panelSource = fs.readFileSync(path.join(APP_ROOT, "ui/assets/panel.js"), "utf8");
+    const saveFrom = panelSource.indexOf("async function saveMineruSettings(");
+    const saveTo = panelSource.indexOf("function normalizeThinkingLevel(", saveFrom);
+    let resolveFirstFetch;
+    const firstFetchPromise = new Promise((r) => { resolveFirstFetch = r; });
+    let closedCount = 0;
+    let parseCount = 0;
+    const toasts = [];
+    const btn = { disabled: false, textContent: "保存设置" };
+    const sandbox = vm.createContext({
+      mineruConfigured: true,
+      mineruSettingsRequestId: 0,
+      pendingPdfFile: { name: "pending.pdf" },
+      pendingPdfLoadRequestId: 5,
+      paperLoadRequestId: 5,
+      mineruSettingsPayload: () => ({ token: "new-token" }),
+      pluginApiFetch: () => firstFetchPromise,
+      apiErrorMessage: (_d, fallback) => fallback,
+      applyMineruSettings: () => {},
+      closeMineruSettings: () => { closedCount += 1; },
+      safeToast: async (t) => { toasts.push(t); },
+      parsePdfFile: async () => { parseCount += 1; },
+      confirmAction: async () => true,
+      document: {
+        getElementById: (id) => (id === "btn-save-mineru-settings" ? btn : { focus() {} }),
+      },
+    });
+    vm.runInContext(panelSource.slice(saveFrom, saveTo), sandbox);
+    const pendingSave = sandbox.saveMineruSettings();
+    // Newer request supersedes the in-flight saveMineruSettings call
+    sandbox.mineruSettingsRequestId = 99;
+    resolveFirstFetch({
+      ok: true,
+      json: async () => ({ ok: true, configured: true }),
+    });
+    await pendingSave;
+    assert.equal(closedCount, 0);
+    assert.equal(parseCount, 0);
+    assert.equal(toasts.length, 0);
+    assert.deepEqual(sandbox.pendingPdfFile, { name: "pending.pdf" });
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+

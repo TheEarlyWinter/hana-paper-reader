@@ -4,9 +4,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { createPaperWorkspace } from "../domain/paper-workspace.js";
 import { storageStateFailure } from "../domain/workspace-storage-errors.js";
 import { generatePaperMarkdown } from "../domain/paper-export.js";
+import { safeBackupAssetPath } from "../domain/backup-assets.js";
 import { verifyNoSymlinks } from "../domain/paper-path-guard.js";
 import { isSafePaperHash } from "../domain/research-read.js";
 import { buildDiagnostics } from "../domain/diagnostics.js";
+import { readMineruAsset } from "../integrations/mineru.js";
 import registerSessionRoutes from "./session-routes.js";
 import registerMigrationRoutes from "./migration-routes.js";
 
@@ -239,6 +241,80 @@ function queryExportConditions(c) {
 
 function sourceReceipt(paper) { return { paperHash: paper.paperHash, sourceRevision: paper.revision, sourceGeneration: paper.generation }; }
 
+function collectMarkdownAttachments(runtime, paper, options = {}) {
+  const blocks = Array.isArray(paper?.blocks) ? paper.blocks : [];
+  if (!blocks.length) return [];
+  const rawBase = typeof options?.attachmentBasePath === "string" && options.attachmentBasePath.trim()
+    ? options.attachmentBasePath.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "")
+    : "attachments";
+  let safeBase = "attachments";
+  try {
+    safeBase = safeBackupAssetPath(rawBase);
+  } catch {
+    safeBase = "attachments";
+  }
+  const seen = new Set();
+  const attachments = [];
+  for (const block of blocks) {
+    const ref = block?.assetRef;
+    if (!ref || typeof ref !== "object" || !ref.cacheId || !ref.path) continue;
+    const rawRel = [block?.assetPath, block?.imagePath, ref.path]
+      .map((item) => String(item || "").trim())
+      .find(Boolean)
+      ?.replace(/\\/g, "/")
+      .replace(/^\/+/, "") || "";
+    if (!rawRel) continue;
+    let relativePath;
+    try {
+      relativePath = safeBackupAssetPath(`${safeBase}/${rawRel}`);
+    } catch {
+      continue;
+    }
+    const key = relativePath.toLowerCase();
+    if (seen.has(key)) continue;
+    const asset = readMineruAsset({
+      ctx: { dataDir: runtime.dataDir },
+      cacheId: ref.cacheId,
+      assetPath: ref.path,
+    });
+    if (!asset?.bytes) continue;
+    seen.add(key);
+    attachments.push({ relativePath, bytes: asset.bytes });
+  }
+  return attachments;
+}
+
+function saveMarkdownAttachments(runtime, attachments = []) {
+  if (!Array.isArray(attachments) || !attachments.length) return [];
+  const exportDir = path.join(runtime.dataDir, "exports");
+  verifyExportDir(runtime, exportDir);
+  const written = [];
+  for (const item of attachments) {
+    const targetPath = path.resolve(exportDir, ...String(item.relativePath).split("/"));
+    const rel = path.relative(exportDir, targetPath);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+      const error = new Error("App 导出目录不可用");
+      error.code = "export_path_invalid";
+      throw error;
+    }
+    const targetDir = path.dirname(targetPath);
+    verifyExportDir(runtime, targetDir);
+    fs.mkdirSync(targetDir, { recursive: true });
+    verifyExportDir(runtime, targetDir);
+    verifyNoSymlinks(targetPath, exportDir);
+    const tempPath = path.join(targetDir, `.asset-${randomUUID()}.tmp`);
+    try {
+      fs.writeFileSync(tempPath, item.bytes);
+      verifyNoSymlinks(tempPath, exportDir);
+      fs.renameSync(tempPath, targetPath);
+      written.push(item.relativePath);
+    } finally {
+      try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+    }
+  }
+  return written;
+}
+
 function exportMarkdown(runtime, paperHash, body = {}) {
   const workspace = workspaceFor(runtime);
   const captured = publicExportInput(workspace, paperHash, body);
@@ -248,7 +324,10 @@ function exportMarkdown(runtime, paperHash, body = {}) {
     error.code = "export_too_large";
     throw error;
   }
-  return { paper: captured.paper, markdown };
+  const attachments = body?.saveToDisk === true
+    ? collectMarkdownAttachments(runtime, captured.paper, captured.input.options)
+    : [];
+  return { paper: captured.paper, markdown, attachments };
 }
 
 function backupPayload(runtime, paperHash, includeAssets, conditions = {}) {
@@ -395,7 +474,15 @@ export default function registerResearchExtraRoutes(app, runtime) {
       const fileName = safeFileName(result.paper?.metadata?.title, ".md", "paper.md");
       if (body.saveToDisk === true) {
         const saved = await saveInAppExports(runtime, fileName, result.markdown);
-        return c.json({ ok: true, saved: true, ...saved, ...sourceReceipt(result.paper), apiVersion: APP_API_VERSION });
+        const exportedAttachments = saveMarkdownAttachments(runtime, result.attachments);
+        return c.json({
+          ok: true,
+          saved: true,
+          ...saved,
+          ...sourceReceipt(result.paper),
+          attachmentCount: exportedAttachments.length,
+          apiVersion: APP_API_VERSION,
+        });
       }
       return downloadResponse(result.markdown, fileName, "text/markdown; charset=utf-8", paperHash, result.paper);
     } catch (error) {

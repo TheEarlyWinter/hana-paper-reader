@@ -1810,8 +1810,9 @@ async function saveMineruSettings() {
       body: JSON.stringify(payload),
     });
     const data = await response.json();
+    if (requestId !== mineruSettingsRequestId) return;
     if (!response.ok || !data.ok) throw new Error(apiErrorMessage(data, "保存失败"));
-    if (requestId === mineruSettingsRequestId) applyMineruSettings(data);
+    applyMineruSettings(data);
     closeMineruSettings();
     await safeToast({ message: "MinerU 设置已保存", type: "success" });
     const pendingFile = pendingPdfFile;
@@ -1822,10 +1823,13 @@ async function saveMineruSettings() {
       void parsePdfFile(pendingFile);
     }
   } catch (error) {
+    if (requestId !== mineruSettingsRequestId) return;
     await safeToast({ message: `保存失败：${error?.message || "设置无效"}`, type: "error" });
   } finally {
-    button.disabled = false;
-    button.textContent = "保存设置";
+    if (requestId === mineruSettingsRequestId) {
+      button.disabled = false;
+      button.textContent = "保存设置";
+    }
   }
 }
 
@@ -1839,13 +1843,15 @@ async function clearMineruToken() {
       body: JSON.stringify({ clearToken: true }),
     });
     const data = await response.json();
+    if (requestId !== mineruSettingsRequestId) return;
     if (!response.ok || !data.ok) throw new Error(apiErrorMessage(data, "清除失败"));
-    if (requestId === mineruSettingsRequestId) applyMineruSettings(data);
+    applyMineruSettings(data);
     pendingPdfFile = null;
     pendingPdfLoadRequestId = 0;
     closeMineruSettings();
     await safeToast({ message: "MinerU Token 已清除", type: "success" });
   } catch (error) {
+    if (requestId !== mineruSettingsRequestId) return;
     await safeToast({ message: `清除失败：${error?.message || "未知错误"}`, type: "error" });
   }
 }
