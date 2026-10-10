@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { publicCachedPaper, WorkspaceIntegrityError, readCommittedWorkspace } from "./recent-paper.js";
 import { normalizeRevisionClocks, assertPaperRevisionClock } from "./paper-revision.js";
+import { searchBlocks as searchProjectedBlocks, projectLibraryItem, filterAndSortLibraryItems } from "./paper-read-projection.js";
 import { evidenceRequestBasis, selectionRequestBasis } from "../../ui/assets/evidence-source.js";
 
 const PAPER_HASH_RE = /^[a-f0-9]{12,128}$/i;
@@ -179,113 +180,14 @@ function resolveEvidence(paper, options = {}) {
   return block ? evidenceFromBlock(paper, block, options.usageKind) : null;
 }
 
-function occurrenceCount(haystack, needle) {
-  if (!needle) return 0;
-  let count = 0;
-  let cursor = 0;
-  while ((cursor = haystack.indexOf(needle, cursor)) >= 0) {
-    count += 1;
-    cursor += needle.length;
-  }
-  return count;
-}
-
-function snippet(value, needle, max = 240) {
-  const source = text(value);
-  if (!source) return "";
-  const index = source.toLocaleLowerCase().indexOf(needle);
-  if (index < 0 || source.length <= max) return source.slice(0, max);
-  const start = Math.max(0, index - Math.floor(max * 0.38));
-  const end = Math.min(source.length, start + max);
-  return `${start > 0 ? "…" : ""}${source.slice(start, end)}${end < source.length ? "…" : ""}`;
-}
-
-function searchTypeGroup(block) {
-  const kind = text(block?.type, 40).toLowerCase();
-  if (["heading", "title", "section"].includes(kind) || Number(block?.level) > 0) return "title";
-  if (["image", "chart", "figure", "caption"].includes(kind)) return "figure";
-  if (kind === "table") return "table";
-  if (kind === "equation" || text(block?.latex)) return "equation";
-  return "body";
-}
-
 function searchBlocks(paper, query, options = {}) {
-  const needle = text(query, 200).toLocaleLowerCase();
-  if (!needle) return [];
-  const language = SEARCH_LANGUAGES.has(options.language) ? options.language : "both";
-  const scope = SEARCH_SCOPES.has(options.scope) ? options.scope : "all";
-  const currentPage = Math.max(0, Number(options.page || options.currentPage) || 0);
-  const currentSectionId = text(options.sectionId || options.currentSectionId, 256);
-  const currentBlockId = text(options.currentBlockId, 256);
-  const sourceTypes = Array.isArray(options.types) ? options.types : text(options.types || options.type, 200).split(",");
-  const types = new Set(sourceTypes.map((value) => text(value, 40).toLowerCase()).filter(Boolean));
-  const limit = Math.min(100, Math.max(1, Number(options.limit) || 100));
-  const sourceBlocks = array(paper.blocks);
-  const currentIndex = sourceBlocks.findIndex((block) => text(block?.id, 256) === currentBlockId);
-  return sourceBlocks.map((block, index) => {
-    const original = text(block?.text || block?.caption || block?.latex);
-    const translation = text(block?.translatedText);
-    const originalLower = original.toLocaleLowerCase();
-    const translationLower = translation.toLocaleLowerCase();
-    const originalCount = language === "translation" ? 0 : occurrenceCount(originalLower, needle);
-    const translationCount = language === "original" ? 0 : occurrenceCount(translationLower, needle);
-    const blockType = text(block?.type, 40).toLowerCase();
-    const group = searchTypeGroup(block);
-    const inScope = scope === "all"
-      || (scope === "page" && currentPage > 0 && Number(block?.page) === currentPage)
-      || (scope === "section" && currentSectionId && text(block?.sectionId, 256) === currentSectionId);
-    const typeMatch = !types.size || types.has(group) || types.has(blockType);
-    if (!inScope || !typeMatch || (!originalCount && !translationCount)) return null;
-    let score = Math.min(30, (originalCount + translationCount) * 8);
-    const reasons = [`命中 ${originalCount + translationCount} 次`];
-    if (group === "title") {
-      score += 28;
-      reasons.push("标题块 +28");
-    } else if (["figure", "table", "equation"].includes(group)) {
-      score += 12;
-      reasons.push("视觉证据 +12");
-    }
-    if (originalLower.startsWith(needle) || translationLower.startsWith(needle)) {
-      score += 12;
-      reasons.push("段首命中 +12");
-    }
-    if (text(block?.sectionTitle, 1000).toLocaleLowerCase().includes(needle)) {
-      score += 10;
-      reasons.push("章节标题命中 +10");
-    }
-    if (currentPage > 0 && Number(block?.page) === currentPage) {
-      score += 8;
-      reasons.push("当前页 +8");
-    }
-    if (currentIndex >= 0) {
-      const proximity = Math.max(0, 10 - Math.min(10, Math.abs(index - currentIndex)));
-      if (proximity) {
-        score += proximity;
-        reasons.push(`邻近当前块 +${proximity}`);
-      }
-    }
-    return {
-      id: text(block?.id, 256),
-      evidenceId: text(block?.evidenceId, 128) || evidenceIdFor(paper.paperHash, text(block?.id, 256)),
-      page: normalizedPage(block?.page),
-      type: text(block?.type, 40) || "paragraph",
-      typeGroup: group,
-      text: original,
-      translatedText: translation,
-      sectionId: text(block?.sectionId, 256) || null,
-      sectionTitle: text(block?.sectionTitle, 1000) || null,
-      matches: { original: originalCount > 0, translated: translationCount > 0, originalCount, translatedCount: translationCount },
-      snippets: { original: originalCount ? snippet(original, needle) : "", translation: translationCount ? snippet(translation, needle) : "" },
-      score,
-      scoreExplanation: reasons,
-      bbox: normalizedBbox(block?.bbox),
-      evidence: evidenceFromBlock(paper, block),
-      index,
-    };
-  }).filter(Boolean)
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-    .slice(0, limit)
-    .map(({ index: _index, ...result }) => result);
+  return searchProjectedBlocks(paper?.blocks, query, {
+    ...options,
+    paperHash: paper?.paperHash,
+    normalizePage: true,
+    normalizeBbox: true,
+    resolveEvidence: (block) => evidenceFromBlock(paper, block),
+  });
 }
 
 function outlineFor(paper) {
@@ -332,73 +234,26 @@ function readPaperBundleOwned(dataDir, rawPaperHash, knownIndex = null) {
 function listLibraryOwned(dataDir, options = {}) {
   const root = assertDataDir(dataDir);
   const index = readIndex(root);
-  const query = text(options.query || options.q, 200).toLocaleLowerCase();
-  const filterFavorite = options.favorite === true || options.favorite === "true";
-  const filterArchived = options.archived === "all" ? "all" : (options.archived === true || options.archived === "true");
-  const filterTag = text(options.tag, 100).toLocaleLowerCase();
-  const sortField = text(options.sort, 40) || "lastRead";
-  const sortOrder = text(options.order, 10).toLowerCase() === "asc" ? "asc" : "desc";
   const items = Object.entries(index.papers).map(([rawHash, entry]) => {
     const paperHash = canonicalPaperHash(rawHash);
     if (!paperHash) throw new WorkspaceIntegrityError("paper-workspace.json contains an invalid paper hash");
     const bundle = readPaperBundleOwned(root, paperHash, index);
     if (!bundle) throw new WorkspaceIntegrityError(`paper ${paperHash} cannot be loaded`);
-    const metadata = object(bundle.paper.metadata);
     const research = object(bundle.research);
-    const notes = object(research.notes);
-    const bookmarks = object(research.bookmarks);
-    const progress = object(research.progress);
     const glossaryTerms = object(research.glossary?.terms || bundle.paper.glossaryTerms);
-    const title = text(metadata.title, 500) || "未命名论文";
-    const authors = Array.isArray(metadata.authors) ? metadata.authors : [];
-    const tags = Array.isArray(metadata.tags) ? metadata.tags : [];
-    const progressPercent = typeof progress.percent === "number"
-      ? progress.percent
-      : (typeof progress.scrollRatio === "number" ? Math.round(progress.scrollRatio * 100) : (progress.blockId ? 50 : 0));
-    const blockId = progress.blockId || progress.lastBlockId || null;
-    return {
+    return projectLibraryItem({
       paperHash,
       revision: bundle.paper.revision,
-      title,
-      authors,
-      doi: metadata.doi || null,
-      year: metadata.year || null,
-      tags,
-      favorite: metadata.favorite === true,
-      archived: metadata.archived === true,
-      lastReadAt: entry.lastReadAt || metadata.lastReadAt || progress.updatedAt || bundle.paper.updatedAt || bundle.paper.createdAt || null,
-      createdAt: bundle.paper.createdAt || entry.createdAt || null,
-      updatedAt: bundle.paper.updatedAt || entry.updatedAt || null,
-      blockCount: Number(entry.blockCount) || array(bundle.paper.blocks).length,
-      noteCount: Object.keys(notes).length,
-      bookmarkCount: Object.keys(bookmarks).length,
+      paper: bundle.paper,
+      entry,
+      metadata: object(bundle.paper.metadata),
+      progress: object(research.progress),
+      noteCount: Object.keys(object(research.notes)).length,
+      bookmarkCount: Object.keys(object(research.bookmarks)).length,
       hasGlossary: Object.keys(glossaryTerms).length > 0,
-      readingProgress: {
-        percent: Number(progressPercent) || 0,
-        blockId,
-        lastBlockId: blockId,
-        updatedAt: progress.updatedAt || null,
-        readingMode: progress.readingMode || bundle.paper.readingMode || "bilingual",
-      },
-    };
-  }).filter((item) => {
-    if (filterFavorite && !item.favorite) return false;
-    if (filterArchived === true && !item.archived) return false;
-    if (filterArchived === false && item.archived) return false;
-    if (filterTag && !item.tags.some((tag) => String(tag).toLocaleLowerCase().includes(filterTag))) return false;
-    if (!query) return true;
-    return [item.title, item.doi, item.paperHash, ...item.authors, ...item.tags]
-      .some((value) => String(value || "").toLocaleLowerCase().includes(query));
+    });
   });
-  items.sort((left, right) => {
-    let compare;
-    if (sortField === "title") compare = left.title.localeCompare(right.title, "zh-CN");
-    else if (sortField === "created") compare = String(left.createdAt || "").localeCompare(String(right.createdAt || ""));
-    else if (sortField === "updated") compare = String(left.updatedAt || "").localeCompare(String(right.updatedAt || ""));
-    else compare = String(left.lastReadAt || "").localeCompare(String(right.lastReadAt || ""));
-    return sortOrder === "asc" ? compare : -compare;
-  });
-  return items;
+  return filterAndSortLibraryItems(items, options);
 }
 
 export function readPaperBundle(dataDir, rawPaperHash) {

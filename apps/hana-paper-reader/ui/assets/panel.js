@@ -5,6 +5,8 @@ import { createMigrationUi } from "./migration-ui.js";
 import { paperDeletionNotice, paperDeletionRevision } from "./paper-deletion-result.js";
 import { captureResearchOwner, withResearchOwner } from "./research-write-owner.js";
 import { selectionRequestBasis } from "./evidence-source.js";
+import { chunkTranslationBlocks, runConcurrentTranslationBatches } from "./translation-controller.js";
+import { syncOverlayHidden, syncModalOpen, syncDropdownOpen, syncToolbarVisible } from "./overlay-visibility.js";
 
 const UI_ASSET_CACHE_VERSION = `${UI_VERSION}-r1`;
 const TRANSLATION_PROMPT_VERSION = "academic-translation-v1";
@@ -583,6 +585,8 @@ function renderWorkspaceTabs() {
 function resetTranslationRunState() {
   fullTranslationRunId += 1;
   fullTranslationBusy = false;
+  fullTranslationPreparing = false;
+  fullTranslationPauseRequested = false;
   blockTranslationRunIds.clear();
   const button = document.getElementById("btn-translate-all");
   if (button) {
@@ -596,11 +600,10 @@ function hidePaperTransientUi() {
   selectedContext = "";
   selectedFromTranslation = false;
   const toolbar = document.getElementById("selection-toolbar");
-  if (toolbar) toolbar.style.display = "none";
-  document.getElementById("answer-drawer")?.classList.remove("open");
+  syncToolbarVisible(toolbar, false);
+  syncModalOpen(document.getElementById("answer-drawer"), false);
   const modal = document.getElementById("session-target-modal");
-  modal?.classList.remove("open");
-  modal?.setAttribute("aria-hidden", "true");
+  syncModalOpen(modal, false);
   selectedSessionTargetId = null;
   sessionTargets = [];
   sessionPickerBusy = false;
@@ -1249,7 +1252,7 @@ function initLayout() {
             <span id="agent-model-badge" class="agent-model-tag">gemini-3.7-flash</span>
             <span style="font-size:8px;color:var(--text-muted)">▼</span>
           </div>
-          <div id="agent-dropdown" class="agent-dropdown-menu"></div>
+          <div id="agent-dropdown" class="agent-dropdown-menu" hidden></div>
         </div>
       </div>
     </header>
@@ -1257,7 +1260,7 @@ function initLayout() {
     <div class="main-layout">
       <div id="panel-notice" class="panel-notice" role="status" aria-live="polite" hidden></div>
       <!-- 拖拽提示遮罩 -->
-      <div id="drag-overlay" class="drag-overlay">
+      <div id="drag-overlay" class="drag-overlay" hidden>
         <div class="drag-icon">📑</div>
         <div class="drag-text">松开鼠标即可解析 PDF 文献</div>
       </div>
@@ -1350,7 +1353,7 @@ function initLayout() {
         </div>
       </div>
 
-      <div id="mineru-settings-modal" class="settings-modal" aria-hidden="true">
+      <div id="mineru-settings-modal" class="settings-modal" aria-hidden="true" hidden>
         <div class="settings-backdrop" data-close-mineru-settings></div>
         <section class="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="mineru-settings-title">
           <div class="settings-dialog-header">
@@ -1411,7 +1414,7 @@ function initLayout() {
       </div>
 
       <!-- 划词悬浮操作栏 -->
-      <div id="selection-toolbar" class="selection-toolbar">
+      <div id="selection-toolbar" class="selection-toolbar" hidden>
         <div id="quick-agent-avatars" style="display:flex;gap:4px;margin-right:2px"></div>
         <button id="btn-ask-agent" class="tool-btn primary">
           <span id="tool-agent-text">问当前助手</span>
@@ -1424,7 +1427,7 @@ function initLayout() {
       </div>
 
       <!-- 会话目标选择器 -->
-      <div id="session-target-modal" class="session-target-modal" aria-hidden="true">
+      <div id="session-target-modal" class="session-target-modal" aria-hidden="true" hidden>
         <div class="session-target-backdrop" data-close-session-targets></div>
         <section class="session-target-dialog" role="dialog" aria-modal="true" aria-labelledby="session-target-title">
           <div class="session-target-header">
@@ -1450,7 +1453,7 @@ function initLayout() {
       </div>
 
       <!-- 右侧滑出解答抽屉 -->
-      <div id="answer-drawer" class="answer-drawer">
+      <div id="answer-drawer" class="answer-drawer" hidden>
         <div class="drawer-header">
           <div class="drawer-agent-info">
             <div id="drawer-avatar-slot"></div>
@@ -1607,8 +1610,9 @@ function bindEvents() {
 
   agentBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    agentDropdown.classList.toggle("show");
-    if (agentDropdown.classList.contains("show")) void loadAgentsAndModels();
+    const isOpen = !agentDropdown.classList.contains("show");
+    syncDropdownOpen(agentDropdown, isOpen);
+    if (isOpen) void loadAgentsAndModels();
   });
   agentDropdown.addEventListener("pointerdown", (event) => event.stopPropagation());
   agentDropdown.addEventListener("mousedown", (event) => event.stopPropagation());
@@ -1618,7 +1622,7 @@ function bindEvents() {
     const selectorWrap = document.querySelector(".agent-selector-wrap");
     if (path.includes(agentDropdown) || path.includes(selectorWrap)) return;
     if (event.target?.closest?.(".agent-selector-wrap")) return;
-    agentDropdown.classList.remove("show");
+    syncDropdownOpen(agentDropdown, false);
   };
   document.addEventListener("pointerdown", closeAgentDropdownOnOutside);
   document.addEventListener("mousedown", closeAgentDropdownOnOutside);
@@ -1626,7 +1630,7 @@ function bindEvents() {
   // 全局拖拽事件处理
   window.addEventListener("dragenter", (e) => {
     e.preventDefault();
-    dragOverlay.classList.add("active");
+    syncOverlayHidden(dragOverlay, true, { activeClass: "active" });
   });
   window.addEventListener("dragover", (e) => {
     e.preventDefault();
@@ -1635,11 +1639,11 @@ function bindEvents() {
     e.preventDefault();
   });
   dragOverlay.addEventListener("dragleave", (e) => {
-    if (e.relatedTarget === null) dragOverlay.classList.remove("active");
+    if (e.relatedTarget === null) syncOverlayHidden(dragOverlay, false, { activeClass: "active" });
   });
   window.addEventListener("drop", (e) => {
     e.preventDefault();
-    dragOverlay.classList.remove("active");
+    syncOverlayHidden(dragOverlay, false, { activeClass: "active" });
     if (e.dataTransfer?.files?.[0]) handleFile(e.dataTransfer.files[0]);
   });
 
@@ -1658,7 +1662,7 @@ function bindEvents() {
 
   btnCloseDrawer.addEventListener("click", () => {
     cancelSelectionQuestion();
-    document.getElementById("answer-drawer").classList.remove("open");
+    syncModalOpen(document.getElementById("answer-drawer"), false);
   });
   btnDrawerSendChat.addEventListener("click", () => void openSessionTargetPicker());
   btnCloseSessionTargets.addEventListener("click", () => closeSessionTargetPicker());
@@ -1760,8 +1764,7 @@ function openMineruSettings() {
   document.getElementById("mineru-token-hint").textContent = mineruConfigured
     ? "Token 已配置。留空可保持原值；如需替换，请粘贴新 Token。"
     : "尚未配置。保存后 Token 不会再次显示。";
-  modal.classList.add("open");
-  modal.setAttribute("aria-hidden", "false");
+  syncModalOpen(modal, true);
   window.setTimeout(() => document.getElementById("mineru-token-input").focus(), 0);
 }
 
@@ -1771,8 +1774,7 @@ function closeMineruSettings(eventOrCancel = false) {
     pendingPdfLoadRequestId = 0;
   }
   const modal = document.getElementById("mineru-settings-modal");
-  modal.classList.remove("open");
-  modal.setAttribute("aria-hidden", "true");
+  syncModalOpen(modal, false);
   document.getElementById("mineru-token-input").value = "";
 }
 
@@ -2068,11 +2070,10 @@ function resetResearchUiForPaper() {
   selectedText = "";
   selectedContext = "";
   selectedFromTranslation = false;
-  document.getElementById("selection-toolbar")?.style && (document.getElementById("selection-toolbar").style.display = "none");
-  document.getElementById("answer-drawer")?.classList.remove("open");
+  syncToolbarVisible(document.getElementById("selection-toolbar"), false);
+  syncModalOpen(document.getElementById("answer-drawer"), false);
   const sessionModal = document.getElementById("session-target-modal");
-  sessionModal?.classList.remove("open");
-  sessionModal?.setAttribute("aria-hidden", "true");
+  syncModalOpen(sessionModal, false);
   clearSearchHighlights();
   researchTools?.resetPaperState?.();
   researchTools?.restoreUiState(restoredResearchUiState);
@@ -2827,7 +2828,8 @@ async function restoreResearchBackup(file) {
 }
 
 async function createNoteFromSelection() {
-  document.getElementById("selection-toolbar").style.display = "none";
+  const toolbar = document.getElementById("selection-toolbar");
+  if (toolbar) { toolbar.style.display = "none"; toolbar.hidden = true; }
   if (!selectedBlockId) {
     await safeToast({ message: "请先划选一段原文或译文", type: "error" });
     return;
@@ -5182,8 +5184,73 @@ async function translateSingleBlock(blockId) {
   }
 }
 
+var fullTranslationPreparing = false;
+var fullTranslationPauseRequested = false;
+
+async function executeFullTranslationBatches(options = {}) {
+  if (typeof runConcurrentTranslationBatches === "function") {
+    return runConcurrentTranslationBatches(options);
+  }
+  const list = Array.isArray(options.blocks) ? options.blocks : [];
+  const size = Math.max(1, Math.min(24, Number(options.batchSize) || 2));
+  const batches = [];
+  for (let index = 0; index < list.length; index += size) {
+    batches.push(list.slice(index, index + size));
+  }
+  const maxWorkers = Math.max(1, Math.min(6, Number(options.concurrency) || 2, batches.length || 1));
+  const isCurrent = typeof options.isCurrent === "function" ? options.isCurrent : () => true;
+  const shouldPause = typeof options.shouldPause === "function" ? options.shouldPause : () => false;
+  let cursor = 0;
+  let completedCount = 0;
+  let failedCount = 0;
+  let paused = false;
+  async function worker() {
+    while (cursor < batches.length) {
+      if (!isCurrent()) return;
+      if (shouldPause()) { paused = true; return; }
+      const batchIndex = cursor;
+      cursor += 1;
+      const outcome = await options.executeBatch(batches[batchIndex], batchIndex);
+      if (!isCurrent()) return;
+      completedCount += Number(outcome?.completed) || 0;
+      failedCount += Number(outcome?.failed) || 0;
+      options.onProgress?.({
+        completedCount,
+        failedCount,
+        totalCount: list.length,
+        remainingCount: Math.max(0, list.length - completedCount - failedCount),
+        paused,
+      });
+      if (shouldPause() && cursor < batches.length) { paused = true; return; }
+    }
+  }
+  await Promise.all(Array.from({ length: maxWorkers }, () => worker()));
+  return {
+    completedCount,
+    failedCount,
+    totalCount: list.length,
+    remainingCount: Math.max(0, list.length - completedCount - failedCount),
+    remainingBlocks: paused ? batches.slice(cursor).flat() : [],
+    paused,
+  };
+}
+
+function pauseFullTranslation() {
+  if (!fullTranslationBusy || fullTranslationPreparing) return false;
+  fullTranslationPauseRequested = true;
+  const button = document.getElementById("btn-translate-all");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在暂停…";
+  }
+  return true;
+}
+
 async function startFullTranslation() {
-  if (fullTranslationBusy) return;
+  if (fullTranslationBusy) {
+    pauseFullTranslation();
+    return;
+  }
   const paperRef = currentPaper;
   const paperHash = normalizedPaperHash(paperRef.paperHash);
   const revision = paperRevision;
@@ -5197,13 +5264,17 @@ async function startFullTranslation() {
   const isCurrent = () => runId === fullTranslationRunId
     && paperContextIsCurrent(paperHash, revision, paperRef);
   fullTranslationBusy = true;
+  fullTranslationPreparing = true;
+  fullTranslationPauseRequested = false;
   if (!button) {
     fullTranslationBusy = false;
+    fullTranslationPreparing = false;
     return;
   }
   button.disabled = true;
   button.textContent = "正在准备翻译…";
   let failedCount = 0;
+  let pausedCount = 0;
   try {
     await refreshGlossaryState({ paperHash, paperRef, revision });
     if (!isCurrent()) return;
@@ -5221,6 +5292,7 @@ async function startFullTranslation() {
     const pending = mutableBlocks.filter((block) => !paperRef.translations[block.id]);
     if (!pending.length) {
       fullTranslationBusy = false;
+      fullTranslationPreparing = false;
       button.disabled = false;
       button.textContent = mutableBlocks.length ? "重新翻译全文" : "译文均已定稿";
       return;
@@ -5231,6 +5303,7 @@ async function startFullTranslation() {
     pending.forEach((block) => setTranslationPlaceholder(block.id, "正在翻译中..."));
 
     const batchSize = 2;
+    const concurrency = 2;
     const glossaryVersion = Number(paperRef.glossaryVersion || 0);
     const glossaryTerms = cloneJson(paperRef.glossaryTerms || {}) || {};
     const cache = force ? new Map() : await cachedTranslationsForBlocks(pending, true, {
@@ -5247,53 +5320,91 @@ async function startFullTranslation() {
       if (isCurrent()) commitBlockTranslation(blockId, translation, { paperHash, paperRef, revision, glossaryVersion });
     });
     const uncached = pending.filter((block) => !paperRef.translations[block.id]);
-    for (let index = 0; index < uncached.length; index += batchSize) {
-      if (!isCurrent() || Number(paperRef.glossaryVersion || 0) !== glossaryVersion) return;
-      const slice = uncached.slice(index, index + batchSize);
-      const texts = slice.map((block) => translationTextForBlock(block));
-      try {
-        const res = await pluginApiFetch("/api/translate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ texts, agentId, modelRef, thinkingLevel, glossaryTerms }),
-        });
-        const data = await res.json();
-        if (!isCurrent() || Number(paperRef.glossaryVersion || 0) !== glossaryVersion) return;
-        applyEffectiveThinkingLevel(data);
-        if (!data.ok || !Array.isArray(data.translations) || data.translations.length !== slice.length) {
-          throw new Error(apiErrorMessage(data, "翻译模型返回格式无效"));
+    fullTranslationPreparing = false;
+    if (uncached.length > batchSize) {
+      button.disabled = false;
+      button.textContent = `暂停翻译 (0/${uncached.length})`;
+    }
+    const summary = await executeFullTranslationBatches({
+      blocks: uncached,
+      batchSize,
+      concurrency,
+      isCurrent: () => isCurrent() && Number(paperRef.glossaryVersion || 0) === glossaryVersion,
+      shouldPause: () => fullTranslationPauseRequested,
+      onProgress: ({ completedCount }) => {
+        if (!isCurrent() || fullTranslationPauseRequested || uncached.length <= batchSize) return;
+        button.textContent = `暂停翻译 (${completedCount}/${uncached.length})`;
+      },
+      executeBatch: async (slice) => {
+        if (!isCurrent() || Number(paperRef.glossaryVersion || 0) !== glossaryVersion) {
+          return { completed: 0, failed: 0 };
         }
-        const translations = data.translations.map((value) => typeof value === "string" ? value.trim() : "");
-        if (translations.some((value) => !value)) throw new Error("翻译模型返回空结果");
-        for (let offset = 0; offset < slice.length; offset += 1) {
-          if (!isCurrent()) return;
-          const block = slice[offset];
-          const transText = translations[offset];
-          if (isFinalTranslation(block.id)) continue;
-          if (!commitBlockTranslation(block.id, transText, { paperHash, paperRef, revision, glossaryVersion })) return;
-          await cacheBlockTranslation(block, texts[offset], transText, {
-            paperHash,
-            paperRef,
-            revision,
-            glossaryVersion,
-            agentId,
-            modelRef,
+        const texts = slice.map((block) => translationTextForBlock(block));
+        try {
+          const res = await pluginApiFetch("/api/translate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ texts, agentId, modelRef, thinkingLevel, glossaryTerms }),
           });
+          const data = await res.json();
+          if (!isCurrent() || Number(paperRef.glossaryVersion || 0) !== glossaryVersion) {
+            return { completed: 0, failed: 0 };
+          }
+          applyEffectiveThinkingLevel(data);
+          if (!data.ok || !Array.isArray(data.translations) || data.translations.length !== slice.length) {
+            throw new Error(apiErrorMessage(data, "翻译模型返回格式无效"));
+          }
+          const translations = data.translations.map((value) => typeof value === "string" ? value.trim() : "");
+          if (translations.some((value) => !value)) throw new Error("翻译模型返回空结果");
+          let batchCompleted = 0;
+          for (let offset = 0; offset < slice.length; offset += 1) {
+            if (!isCurrent()) return { completed: batchCompleted, failed: 0 };
+            const block = slice[offset];
+            const transText = translations[offset];
+            if (isFinalTranslation(block.id)) {
+              batchCompleted += 1;
+              continue;
+            }
+            if (!commitBlockTranslation(block.id, transText, { paperHash, paperRef, revision, glossaryVersion })) {
+              return { completed: batchCompleted, failed: 0 };
+            }
+            await cacheBlockTranslation(block, texts[offset], transText, {
+              paperHash,
+              paperRef,
+              revision,
+              glossaryVersion,
+              agentId,
+              modelRef,
+            });
+            batchCompleted += 1;
+          }
+          if (isCurrent()) scheduleResearchSync();
+          return { completed: batchCompleted, failed: 0 };
+        } catch (error) {
+          if (!isCurrent() || Number(paperRef.glossaryVersion || 0) !== glossaryVersion) {
+            return { completed: 0, failed: 0 };
+          }
+          const failed = slice.filter((block) => !isFinalTranslation(block.id));
+          failedCount += failed.length;
+          failed.forEach((block) => setTranslationPlaceholder(block.id, "翻译失败，点击重试", true));
+          return { completed: 0, failed: failed.length };
         }
-        if (!isCurrent()) return;
-        scheduleResearchSync();
-      } catch (error) {
-        if (!isCurrent() || Number(paperRef.glossaryVersion || 0) !== glossaryVersion) return;
-        const failed = slice.filter((block) => !isFinalTranslation(block.id));
-        failedCount += failed.length;
-        failed.forEach((block) => setTranslationPlaceholder(block.id, "翻译失败，点击重试", true));
-      }
+      },
+    });
+    if (summary?.paused && isCurrent()) {
+      const remaining = (summary.remainingBlocks || []).filter((block) => !paperRef.translations[block.id] && !isFinalTranslation(block.id));
+      pausedCount = remaining.length;
+      remaining.forEach((block) => setTranslationPlaceholder(block.id, "点击翻译此段", false));
     }
   } finally {
+    fullTranslationPreparing = false;
+    fullTranslationPauseRequested = false;
     if (isCurrent()) {
       fullTranslationBusy = false;
       button.disabled = false;
-      button.textContent = failedCount ? `重试未完成段落 (${failedCount})` : "重新翻译全文";
+      button.textContent = pausedCount
+        ? `继续翻译 (${pausedCount})`
+        : (failedCount ? `重试未完成段落 (${failedCount})` : "重新翻译全文");
       renderBlocks();
       scheduleResearchSync();
     } else if (runId === fullTranslationRunId) {
@@ -5312,14 +5423,14 @@ function handleTextSelection() {
   const toolbar = document.getElementById("selection-toolbar");
 
   if (!text || text.length < 2) {
-    toolbar.style.display = "none";
+    syncToolbarVisible(toolbar, false);
     return;
   }
 
   let node = selection.anchorNode;
   while (node && !node.classList?.contains("block")) node = node.parentElement;
   if (!node) {
-    toolbar.style.display = "none";
+    syncToolbarVisible(toolbar, false);
     return;
   }
   selectedText = text;
@@ -5332,7 +5443,7 @@ function handleTextSelection() {
   const layout = document.querySelector(".main-layout")?.getBoundingClientRect();
   if (rect.width === 0 && rect.height === 0) return;
 
-  toolbar.style.display = "flex";
+  syncToolbarVisible(toolbar, true, "flex");
   toolbar.style.left = `${rect.left - (layout?.left || 0) + rect.width / 2}px`;
   toolbar.style.top = `${rect.top - (layout?.top || 0)}px`;
 }
@@ -5354,7 +5465,11 @@ function invalidateSelectionAnswerIfChanged() {
 }
 
 async function askAgentQuestion(questionType = "default") {
-  document.getElementById("selection-toolbar").style.display = "none";
+  const selectionToolbar = document.getElementById("selection-toolbar");
+  if (selectionToolbar) {
+    selectionToolbar.style.display = "none";
+    selectionToolbar.hidden = true;
+  }
   if (!currentAgent?.id) {
     await safeToast({ message: "当前没有可用的宿主 Agent", type: "error" });
     return;
@@ -5383,6 +5498,7 @@ async function askAgentQuestion(questionType = "default") {
     && normalizedPaperHash(currentPaper.paperHash) === paperHash
     && activeView === "paper";
 
+  drawer.hidden = false;
   drawer.classList.add("open");
   drawerQuote.textContent = `划选内容：“${quote}”`;
   drawerContent.innerHTML = `<span class="trans-loading">${escapeHtml(agent.name)}（${escapeHtml(agent.model || "")}）正在深度推导与解析中...</span>`;
@@ -5513,8 +5629,7 @@ function closeSessionTargetPicker(force = false) {
   const modal = document.getElementById("session-target-modal");
   if (!modal || (sessionPickerBusy && force !== true)) return;
   sessionPickerRequestId += 1;
-  modal.classList.remove("open");
-  modal.setAttribute("aria-hidden", "true");
+  syncModalOpen(modal, false);
   selectedSessionTargetId = null;
   sessionTargets = [];
   sessionDeliveryUnavailable = false;
@@ -5533,7 +5648,7 @@ function selectSessionTarget(targetId) {
 }
 
 async function openSessionTargetPicker() {
-  document.getElementById("selection-toolbar").style.display = "none";
+  syncToolbarVisible(document.getElementById("selection-toolbar"), false);
   if (!selectedText || selectedText.length < 2) {
     await safeToast({ message: "请先划选一段原文或译文", type: "error" });
     return;
@@ -5554,8 +5669,7 @@ async function openSessionTargetPicker() {
   sessionQuoteSnapshot = Object.freeze(snapshot);
   sessionDeliveryBlocked = Boolean(pendingSessionRequest());
   sessionPendingState = sessionDeliveryBlocked ? "unknown" : null;
-  modal.classList.add("open");
-  modal.setAttribute("aria-hidden", "false");
+  syncModalOpen(modal, true);
   selectedSessionTargetId = null;
   sessionTargets = [];
   sessionDeliveryUnavailable = false;
@@ -5799,7 +5913,7 @@ async function sendQuoteToSession() {
 }
 
 async function copyQuoteText() {
-  document.getElementById("selection-toolbar").style.display = "none";
+  syncToolbarVisible(document.getElementById("selection-toolbar"), false);
   const selectedBlock = currentPaper.blocks.find((block) => block.id === selectedBlockId) || null;
   const value = selectedBlock ? citationTextForBlock(selectedBlock, selectedText) : selectedText;
   if (await copyTextToClipboard(value)) {

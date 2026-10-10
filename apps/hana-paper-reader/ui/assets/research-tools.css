@@ -15,6 +15,7 @@
 }
 
 .research-tools-drawer.open { transform: translateX(0); }
+.research-tools-drawer[hidden] { display: none; }
 .research-tools-header {
   display: flex;
   align-items: flex-start;

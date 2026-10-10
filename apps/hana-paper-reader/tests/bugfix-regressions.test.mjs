@@ -17,6 +17,9 @@ import { parseJsonArray } from "../server/domain/model-agent.js";
 import { createMineruSettingsStore } from "../server/domain/mineru-settings.js";
 import { createMigrationImporter } from "../server/migration/migration-import.js";
 import { createResearchTools } from "../ui/assets/research-tools.js";
+import { searchBlocks as projectSearchBlocks, projectLibraryItem, filterAndSortLibraryItems } from "../server/domain/paper-read-projection.js";
+import { chunkTranslationBlocks, runConcurrentTranslationBatches } from "../ui/assets/translation-controller.js";
+import { syncOverlayHidden, syncModalOpen, syncDropdownOpen, syncToolbarVisible } from "../ui/assets/overlay-visibility.js";
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PREPARE_CLI = path.resolve(APP_ROOT, "../../tools/prepare-migration.mjs");
@@ -501,3 +504,183 @@ test("Bug 6, 10 & 11: status codes, duplicate block.id, restoreBackup validation
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test("Improvements 1-4: shared read projection, ui_action hidden/semantic IDs, concurrent translation pause/resume, and modular UI helpers", async () => {
+  // 1. Shared read projection module consistency
+  const samplePaper = {
+    paperHash: "f".repeat(64),
+    revision: 5,
+    generation: 2,
+    metadata: { title: "Shared Projection Paper", authors: ["Ada"], tags: ["ml"], favorite: true },
+    parser: { kind: "mineru", pageCount: 3 },
+    blocks: [
+      { id: "b1", page: 1, type: "heading", text: "1 Transformer Overview" },
+      { id: "b2", page: 1, type: "formula", text: "attention equation", latex: "Q K^T" },
+      { id: "b3", page: 1, type: "image", text: "attention architecture figure", caption: "attention heads" },
+    ],
+    translations: { b1: "1 Transformer 综述" },
+    translationStates: { b1: { kind: "final" } },
+    glossary: { version: 1, terms: { Transformer: "变换器" } },
+    notes: [{ id: "n1", noteType: "question", resolved: false }],
+    bookmarks: [{ id: "bm1" }],
+    progress: { page: 2, percent: 60, lastReadAt: "2026-10-11T00:00:00.000Z" },
+    updatedAt: "2026-10-11T00:00:00.000Z",
+    createdAt: "2026-10-10T00:00:00.000Z",
+  };
+  const hits = projectSearchBlocks(samplePaper.blocks, "attention", { types: ["equation", "figure"], currentBlockId: "b1", page: 1 });
+  assert.equal(hits.length, 2);
+  assert.equal(hits[0].id, "b2");
+  assert.equal(hits[0].typeGroup, "equation");
+  assert.equal(hits[1].id, "b3");
+  assert.equal(hits[1].typeGroup, "figure");
+
+  const projectedLib = projectLibraryItem({
+    paperHash: "f".repeat(64),
+    revision: 5,
+    paper: samplePaper,
+    metadata: samplePaper.metadata,
+    progress: samplePaper.progress,
+    noteCount: 1,
+    bookmarkCount: 1,
+    hasGlossary: true,
+  });
+  assert.equal(projectedLib.revision, 5);
+  assert.equal(projectedLib.hasGlossary, true);
+  assert.equal(projectedLib.noteCount, 1);
+  assert.equal(projectedLib.bookmarkCount, 1);
+  assert.equal(projectedLib.readingProgress.percent, 60);
+  const filteredLib = filterAndSortLibraryItems([projectedLib], { filter: "favorite", query: "ada" });
+  assert.equal(filteredLib.length, 1);
+
+  // 2. Overlay visibility & research-tools semantic IDs / hidden attribute for ui_action(describe_dom)
+  const mockModal = {
+    hidden: false,
+    attrs: {},
+    classes: new Set(["open"]),
+    style: { display: "flex" },
+    classList: {
+      add(c) { mockModal.classes.add(c); },
+      remove(c) { mockModal.classes.delete(c); },
+    },
+    setAttribute(k, v) { mockModal.attrs[k] = v; },
+  };
+  syncModalOpen(mockModal, false);
+  assert.equal(mockModal.hidden, true);
+  assert.equal(mockModal.classes.has("open"), false);
+  assert.equal(mockModal.attrs["aria-hidden"], "true");
+  syncModalOpen(mockModal, true);
+  assert.equal(mockModal.hidden, false);
+  assert.equal(mockModal.classes.has("open"), true);
+  assert.equal(mockModal.attrs["aria-hidden"], "false");
+
+  syncDropdownOpen(mockModal, false);
+  assert.equal(mockModal.hidden, true);
+  syncToolbarVisible(mockModal, false);
+  assert.equal(mockModal.hidden, true);
+  assert.equal(mockModal.style.display, "none");
+  syncOverlayHidden(mockModal, true, { activeClass: "active", display: "flex" });
+  assert.equal(mockModal.hidden, false);
+  assert.equal(mockModal.style.display, "flex");
+
+  // Verify research-tools drawer sets hidden=!open and assigns semantic IDs
+  function makeMockDomNode(tag) {
+    const node = {
+      tagName: tag.toUpperCase(),
+      id: "",
+      className: "",
+      textContent: "",
+      hidden: false,
+      inert: false,
+      disabled: false,
+      value: "",
+      type: "",
+      placeholder: "",
+      title: "",
+      dataset: {},
+      style: {},
+      attributes: {},
+      children: [],
+      isConnected: true,
+      parentElement: null,
+      classList: {
+        classes: new Set(),
+        add(c) { this.classes.add(c); },
+        remove(c) { this.classes.delete(c); },
+        toggle(c, force) {
+          const on = force === undefined ? !this.classes.has(c) : Boolean(force);
+          if (on) this.classes.add(c);
+          else this.classes.delete(c);
+          return on;
+        },
+        contains(c) { return this.classes.has(c); },
+      },
+      setAttribute(k, v) { this.attributes[k] = String(v); },
+      getAttribute(k) { return this.attributes[k] ?? null; },
+      addEventListener() {},
+      appendChild(child) {
+        if (child && typeof child === "object") {
+          child.parentElement = this;
+          this.children.push(child);
+        }
+        return child;
+      },
+      append(...items) {
+        items.forEach((item) => this.appendChild(item));
+      },
+      replaceChildren(...items) {
+        this.children = [];
+        this.append(...items);
+      },
+      remove() {},
+      contains() { return false; },
+      querySelectorAll() { return []; },
+    };
+    return node;
+  }
+  const root = makeMockDomNode("div");
+  const mockDoc = {
+    activeElement: null,
+    createElement: (tag) => makeMockDomNode(tag),
+    createDocumentFragment: () => makeMockDomNode("fragment"),
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
+  };
+  const tools = createResearchTools({
+    root,
+    document: mockDoc,
+    getPaper: () => samplePaper,
+    apiFetch: async () => ({ ok: true, json: async () => ({ ok: true, results: [], notes: [], bookmarks: [], tasks: [], glossary: { version: 1, terms: {} } }) }),
+  });
+  const drawer = root.children[0];
+  assert.equal(drawer.id, "research-tools-drawer");
+  assert.equal(drawer.hidden, true);
+  tools.open("search");
+  assert.equal(drawer.hidden, false);
+  tools.close();
+  assert.equal(drawer.hidden, true);
+
+  // 3. Concurrent micro-batches and Pause/Resume in translation-controller.js
+  const blocks = Array.from({ length: 6 }, (_, i) => ({ id: `b${i + 1}`, text: `Block ${i + 1}` }));
+  assert.equal(chunkTranslationBlocks(blocks, 2).length, 3);
+  let activeWorkers = 0;
+  let maxObservedWorkers = 0;
+  let pauseFlag = false;
+  const batchRun = await runConcurrentTranslationBatches({
+    blocks,
+    batchSize: 2,
+    concurrency: 2,
+    shouldPause: () => pauseFlag,
+    executeBatch: async (slice, batchIndex) => {
+      activeWorkers += 1;
+      maxObservedWorkers = Math.max(maxObservedWorkers, activeWorkers);
+      await new Promise((r) => setTimeout(r, 15));
+      if (batchIndex === 0) pauseFlag = true;
+      activeWorkers -= 1;
+      return { completed: slice.length, failed: 0 };
+    },
+  });
+  assert.equal(maxObservedWorkers, 2);
+  assert.equal(batchRun.paused, true);
+  assert.equal(batchRun.completedCount, 4);
+  assert.deepEqual(batchRun.remainingBlocks.map((b) => b.id), ["b5", "b6"]);
+});
+

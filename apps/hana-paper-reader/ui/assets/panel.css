@@ -1465,6 +1465,10 @@ mark[data-hpr-search] {
   transform: translateX(0);
 }
 
+.answer-drawer[hidden] {
+  display: none;
+}
+
 .drawer-header {
   padding: 14px 18px;
   border-bottom: 1px solid var(--border);

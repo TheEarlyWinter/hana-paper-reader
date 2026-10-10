@@ -292,12 +292,15 @@ export function createResearchTools(options = {}) {
   const addListener = (element, type, handler) => element.addEventListener(type, handler);
 
   const shell = makeElement(doc, "aside", "research-tools-drawer", "");
+  shell.id = "research-tools-drawer";
+  shell.hidden = true;
   shell.setAttribute("aria-label", "研究工具");
   const header = makeElement(doc, "header", "research-tools-header");
   const headerText = makeElement(doc, "div", "research-tools-heading");
   const paperTitle = makeElement(doc, "span", "research-tools-paper", "");
   headerText.append(makeElement(doc, "strong", "research-tools-title", "研究工具"), paperTitle);
   const close = button(doc, "关闭", "research-tools-close");
+  close.id = "btn-close-research-tools";
   close.setAttribute("aria-label", "关闭研究工具");
   header.append(headerText, close);
   const workflowNav = makeElement(doc, "nav", "research-workflow-nav");
@@ -348,6 +351,7 @@ export function createResearchTools(options = {}) {
   const workflowButtons = new Map();
   for (const [id, label, description] of WORKFLOW_DEFINITIONS) {
     const workflowButton = button(doc, label, "research-workflow-button");
+    workflowButton.id = `btn-workflow-${id}`;
     workflowButton.dataset.workflow = id;
     workflowButton.title = description;
     addListener(workflowButton, "click", () => {
@@ -360,6 +364,7 @@ export function createResearchTools(options = {}) {
     workflowButtons.set(id, workflowButton);
   }
   const systemButton = button(doc, "数据与任务", "research-tools-system-button");
+  systemButton.id = "btn-workflow-system";
   systemButton.title = "查看解析任务、缓存与工作区状态";
   addListener(systemButton, "click", () => {
     state.activeWorkflow = "system";
@@ -372,6 +377,7 @@ export function createResearchTools(options = {}) {
   const views = new Map();
   for (const [id, label, description, workflow] of TOOL_DEFINITIONS) {
     const navButton = button(doc, label, "research-tools-nav-button");
+    navButton.id = `btn-tool-${id}`;
     navButton.dataset.tool = id;
     navButton.dataset.workflow = workflow;
     navButton.title = description;
@@ -476,11 +482,13 @@ export function createResearchTools(options = {}) {
   function renderSearch(view, token) {
     const controls = makeElement(doc, "div", "research-tools-search-controls");
     const scope = makeElement(doc, "select", "research-tools-select");
+    scope.id = "research-search-scope";
     scope.setAttribute("aria-label", "搜索范围");
     [["page", "当前页面"], ["section", "当前章节"], ["all", "全文"]].forEach(([value, label]) => {
       const option = makeElement(doc, "option", "", label); option.value = value; option.selected = value === state.searchScope; scope.appendChild(option);
     });
     const language = makeElement(doc, "select", "research-tools-select");
+    language.id = "research-search-language";
     language.setAttribute("aria-label", "搜索语种");
     [["original", "原文"], ["translation", "译文"], ["both", "原文 + 译文"]].forEach(([value, label]) => {
       const option = makeElement(doc, "option", "", label); option.value = value; option.selected = value === state.searchLanguage; language.appendChild(option);
@@ -502,11 +510,13 @@ export function createResearchTools(options = {}) {
 
     const form = makeElement(doc, "form", "research-tools-form");
     const input = makeElement(doc, "input", "research-tools-input");
+    input.id = "research-search-input";
     input.type = "search";
     input.placeholder = "输入关键词";
     input.value = state.query;
     input.setAttribute("aria-label", "搜索论文");
     const submit = button(doc, "搜索", "research-tools-button-primary");
+    submit.id = "btn-research-search-submit";
     submit.type = "submit";
     form.append(input, submit);
     const resultBox = makeElement(doc, "div", "research-tools-results");
@@ -797,9 +807,11 @@ export function createResearchTools(options = {}) {
     if (translation) context.appendChild(makeElement(doc, "span", "research-tools-note-translation", `当前译文：${translation.slice(0, 500)}`));
 
     const type = makeElement(doc, "select", "research-tools-select");
+    type.id = "research-note-type";
     type.setAttribute("aria-label", "笔记类型");
     NOTE_TYPES.forEach(([value, label]) => { const option = makeElement(doc, "option", "", label); option.value = value; option.selected = value === (draft?.noteType ?? activeNote?.noteType ?? state.noteType); type.appendChild(option); });
     const tags = makeElement(doc, "input", "research-tools-input");
+    tags.id = "research-note-tags";
     tags.placeholder = "标签，用逗号分隔";
     tags.setAttribute("aria-label", "笔记标签");
     tags.value = draft?.tags ?? activeNote?.tags?.join(", ") ?? state.noteTags;
@@ -807,6 +819,7 @@ export function createResearchTools(options = {}) {
     fields.append(type, tags);
 
     const note = makeElement(doc, "textarea", "research-tools-textarea");
+    note.id = "research-note-input";
     note.placeholder = "写下你的研究判断；原文摘录、页码、结构块和当前译文会自动附上。";
     note.value = draft?.note ?? activeNote?.note ?? state.note;
     const updateDraft = () => {
@@ -829,6 +842,7 @@ export function createResearchTools(options = {}) {
     addListener(tags, "input", updateDraft);
     const actions = makeElement(doc, "div", "research-tools-actions");
     const save = button(doc, state.editingNoteId ? "更新研究笔记" : "保存研究笔记", "research-tools-button-primary");
+    save.id = "btn-save-research-note";
     trackNoteSaveButton(save, formEpoch);
     addListener(save, "click", () => {
       if (save.disabled || state.noteSavePending?.epoch === formEpoch || !updateDraft()) return;
@@ -969,7 +983,9 @@ export function createResearchTools(options = {}) {
     const context = makeElement(doc, "p", "research-tools-context", selected ? `当前位置：Page ${Number(selected.page || 1)} · block ${selected.id}` : "未选择段落");
     const actions = makeElement(doc, "div", "research-tools-actions");
     const bookmark = button(doc, "添加证据书签", "research-tools-button-primary");
+    bookmark.id = "btn-add-research-bookmark";
     const progress = button(doc, "同步阅读进度");
+    progress.id = "btn-sync-research-progress";
     const hash = paperHash();
     const formEpoch = state.paperStateEpoch;
     if (state.bookmarkSavePending?.epoch === formEpoch) {
@@ -1216,6 +1232,7 @@ export function createResearchTools(options = {}) {
     const anchorId = initialDraft ? initialDraft.blockId : selected?.id || null;
     const anchor = paperBlocks(state.paper).find(block => block.id === anchorId);
     const prompt = makeElement(doc, "textarea", "research-tools-textarea");
+    prompt.id = "research-evidence-prompt";
     prompt.placeholder = "询问方法、结论或证据链";
     prompt.setAttribute("aria-label", "论文证据问题");
     prompt.maxLength = 12000;
@@ -1223,10 +1240,13 @@ export function createResearchTools(options = {}) {
     const context = makeElement(doc, "p", "research-tools-context", anchor ? `当前证据：Page ${Number(anchor.page || 1)} / block ${anchor.id}${anchor.sectionTitle ? ` · ${anchor.sectionTitle}` : ""}`
       : anchorId ? "原证据段落当前不可用，可保留问题后重新选择段落" : "当前论文全部证据块");
     const ask = button(doc, "提交问题", "research-tools-button-primary");
+    ask.id = "btn-ask-research-evidence";
     ask.disabled = Boolean(state.evidenceRequestPending);
     const cancel = button(doc, "取消问答", "research-tools-button");
+    cancel.id = "btn-cancel-research-evidence";
     cancel.disabled = !state.evidenceRequestPending;
     const rebind = button(doc, "使用当前段落", "research-tools-button");
+    rebind.id = "btn-rebind-research-evidence";
     const answer = makeElement(doc, "div", "research-tools-answer");
     const evidenceList = makeElement(doc, "div", "research-tools-results");
     const currentForm = () => prompt.isConnected && isCurrentRender("evidence", token, requestPaperHash)
@@ -1357,18 +1377,22 @@ export function createResearchTools(options = {}) {
 
       const form = makeElement(doc, "form", "research-tools-glossary-form");
       const term = makeElement(doc, "input", "research-tools-input");
+      term.id = "research-glossary-term";
       term.placeholder = "原文术语";
       term.setAttribute("aria-label", "原文术语");
       const translation = makeElement(doc, "input", "research-tools-input");
+      translation.id = "research-glossary-translation";
       translation.placeholder = "固定译法";
       translation.setAttribute("aria-label", "固定译法");
       const initialDraft = state.glossaryDraft?.paperHash === hash ? state.glossaryDraft : null;
       term.value = initialDraft?.term || "";
       translation.value = initialDraft?.translation || "";
       const save = button(doc, "添加术语", "research-tools-button-primary");
+      save.id = "btn-save-research-glossary";
       save.type = "submit";
       save.disabled = Boolean(state.glossaryWritePending);
       const cancel = button(doc, "清空术语输入", "research-tools-button");
+      cancel.id = "btn-clear-research-glossary";
       form.append(term, translation, save);
       form.appendChild(cancel);
       const captureDraft = () => {
@@ -1654,6 +1678,7 @@ export function createResearchTools(options = {}) {
   function renderExport(view, token) {
     view.append(makeElement(doc, "p", "research-tools-muted", "导出当前论文的原文与翻译对照。"));
     const exportButton = button(doc, "导出双语 Markdown", "research-tools-button-primary");
+    exportButton.id = "btn-export-bilingual-markdown";
     const epoch = state.paperStateEpoch, hash = paperHash();
     trackExportButton(exportButton, epoch, hash);
     addListener(exportButton, "click", async () => {
@@ -1683,6 +1708,7 @@ export function createResearchTools(options = {}) {
     state.paper = getPaper();
     shell.classList.toggle("open", state.open);
     if (!state.open && shell.contains(doc.activeElement)) doc.activeElement?.blur?.();
+    shell.hidden = !state.open;
     shell.inert = !state.open;
     shell.setAttribute("aria-hidden", String(!state.open));
     paperTitle.textContent = String(state.paper?.title || "未载入文献");
