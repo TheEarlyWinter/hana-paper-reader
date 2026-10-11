@@ -54,6 +54,27 @@ function storedZip(entries) {
   return Buffer.concat([...locals, central, end]);
 }
 
+function readStoredZip(buffer) {
+  const eocd = buffer.length - 22;
+  const count = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  const out = [];
+  for (let i = 0; i < count; i += 1) {
+    const size = buffer.readUInt32LE(offset + 20);
+    const nameLen = buffer.readUInt16LE(offset + 28);
+    const extraLen = buffer.readUInt16LE(offset + 30);
+    const commentLen = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.subarray(offset + 46, offset + 46 + nameLen).toString("utf8");
+    const localNameLen = buffer.readUInt16LE(localOffset + 26);
+    const localExtraLen = buffer.readUInt16LE(localOffset + 28);
+    const start = localOffset + 30 + localNameLen + localExtraLen;
+    out.push([name, buffer.subarray(start, start + size)]);
+    offset += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
 function request({ query = {}, params = {}, body = {}, bytes = Buffer.alloc(0) } = {}) {
   return {
     get: key => key === "appRequestContext" ? { principal: { id: "owned-core-workflow" } } : undefined,
@@ -156,12 +177,21 @@ test("one normal reading workflow parses, translates, persists research, reloads
     const translatedSearch = (await call("GET", "/api/research/search", { query: { paperHash, q: "受控比较", language: "translation" } })).value.results;
     assert.ok(translatedSearch.some(item => item.translatedText === translated[1])); stages.push("translation-search");
 
-    const markdownResponse = await call("GET", "/api/research/export", { query: { paperHash } }), markdown = await markdownResponse.text();
+    const markdownResponse = await call("GET", "/api/research/export", { query: { paperHash } });
+    assert.equal(markdownResponse.headers.get("content-type"), "application/zip");
+    const zipEntries = readStoredZip(Buffer.from(await markdownResponse.arrayBuffer()));
+    const markdown = zipEntries.find(([name]) => name.endsWith(".md"))[1].toString("utf8");
     for (const text of [...original, ...translated, "Owned normal workflow finding", "Owned method bookmark", "比较"]) assert.ok(markdown.includes(text), `Missing exported content: ${text}`);
     const saved = (await call("POST", "/api/research/export", { body: { paperHash, saveToDisk: true,
       expectedRevision: reopened.revision, expectedGeneration: reopened.generation } })).value;
-    assert.equal(saved.saved, true); assert.equal(fs.readFileSync(saved.filePath, "utf8"), markdown);
-    assert.equal(saved.sha256, digest(Buffer.from(markdown))); assert.equal(saved.size, Buffer.byteLength(markdown)); stages.push("markdown-download-and-save");
+    assert.equal(saved.saved, true);
+    const savedMarkdown = fs.readFileSync(saved.filePath, "utf8");
+    for (const text of [...original, ...translated, "Owned normal workflow finding", "Owned method bookmark", "比较"]) assert.ok(savedMarkdown.includes(text), `Missing saved content: ${text}`);
+    assert.equal(saved.sha256, digest(Buffer.from(savedMarkdown))); assert.equal(saved.size, Buffer.byteLength(savedMarkdown));
+    const savedImgMatch = savedMarkdown.match(/!\[[^\]]*\]\((attachments\/[^)]+)\)/);
+    assert.ok(savedImgMatch);
+    assert.deepEqual(fs.readFileSync(path.join(path.dirname(saved.filePath), ...savedImgMatch[1].split("/"))), figure);
+    stages.push("markdown-download-and-save");
     const backupResponse = await call("GET", "/api/research/backup", { query: { paperHash } }), backup = await backupResponse.json();
     assert.equal(backup.assetMode, "included"); assert.equal(backup.assets.length, 1); assert.equal(backup.notes.length, 1);
     assert.equal(backup.bookmarks.length, 1); assert.equal(backup.translationCache.length, 2); stages.push("full-backup");
@@ -182,7 +212,8 @@ test("one normal reading workflow parses, translates, persists research, reloads
     assert.equal(finalCache.hit, true); assert.equal(finalCache.translation.translation, translated[1]);
     const finalImage = finalPaper.blocks.find(block => block.type === "image");
     assert.deepEqual((await freshCall("GET", "/api/mineru-asset", { query: { cacheId: finalImage.assetRef.cacheId, path: finalImage.assetRef.path } })).value, figure);
-    const restoredMarkdown = await (await freshCall("GET", "/api/research/export", { query: { paperHash } })).text();
+    const restoredZip = readStoredZip(Buffer.from(await (await freshCall("GET", "/api/research/export", { query: { paperHash } })).arrayBuffer()));
+    const restoredMarkdown = restoredZip.find(([name]) => name.endsWith(".md"))[1].toString("utf8");
     assert.equal(restoredMarkdown, markdown); stages.push("restore-and-fresh-reload");
     assert.equal(networkCalls.length, 4); assert.equal(modelCalls.length, 1);
     t.diagnostic(`Completed normal stages: ${stages.join(" -> ")}`);

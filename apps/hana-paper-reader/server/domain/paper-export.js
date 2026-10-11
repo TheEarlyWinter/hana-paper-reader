@@ -120,27 +120,40 @@ function firstPlainText(...values) {
   return "";
 }
 
+function assetRefExportPath(ref) {
+  if (!isRecord(ref)) return "";
+  const cacheId = plainText(ref.cacheId).toLowerCase();
+  const rel = plainText(ref.path).replace(/\\/g, "/").replace(/^\/+/, "");
+  if (/^[a-f0-9]{24}$/.test(cacheId) && rel) return `${cacheId}/${rel}`;
+  return "";
+}
+
 function assetIndex(assets) {
   const list = Array.isArray(assets) ? assets : asArray(assets?.items ?? assets?.assets);
   const byBlock = new Map();
+  const byCacheAndPath = new Map();
   const byPath = new Map();
   for (const item of list) {
     if (!isRecord(item)) continue;
     const blockId = firstPlainText(item.blockId, item.block_id, item.id);
+    const cacheId = firstPlainText(item.cacheId, item.assetRef?.cacheId).toLowerCase();
     const sourcePath = firstPlainText(item.assetPath, item.sourcePath, item.path, item.assetRef?.path);
     if (blockId) byBlock.set(blockId, item);
-    if (sourcePath) byPath.set(sourcePath, item);
+    if (cacheId && sourcePath) byCacheAndPath.set(`${cacheId}:${sourcePath}`, item);
+    if (sourcePath && !byPath.has(sourcePath)) byPath.set(sourcePath, item);
   }
-  return { byBlock, byPath };
+  return { byBlock, byCacheAndPath, byPath };
 }
 
 function resolveAsset(block, assets) {
   const direct = isRecord(block?.asset) ? block.asset : null;
+  const cacheId = plainText(block?.assetRef?.cacheId).toLowerCase();
   const sourcePath = firstPlainText(block?.assetPath, block?.imagePath, block?.assetRef?.path);
   return direct
     || assets.byBlock.get(plainText(block?.id))
+    || (cacheId && sourcePath ? assets.byCacheAndPath.get(`${cacheId}:${sourcePath}`) : null)
     || assets.byPath.get(sourcePath)
-    || (sourcePath ? { path: sourcePath } : null);
+    || (sourcePath ? { path: sourcePath, assetRef: block?.assetRef } : null);
 }
 
 function renderMetadata(metadata, progress) {
@@ -190,11 +203,13 @@ function renderVisual(block, asset, attachmentBasePath) {
   const assetPath = firstPlainText(
     asset?.exportPath,
     asset?.relativePath,
+    assetRefExportPath(asset?.assetRef),
+    assetRefExportPath(block?.assetRef),
     asset?.path,
     asset?.assetPath,
-    asset?.assetRef?.path,
     block?.assetPath,
     block?.imagePath,
+    asset?.assetRef?.path,
     block?.assetRef?.path,
   );
   if (assetPath) {

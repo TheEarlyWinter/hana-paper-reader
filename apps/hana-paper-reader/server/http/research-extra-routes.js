@@ -84,7 +84,7 @@ function workspaceError(c, error) {
   const storageFailure = storageCodes.includes(rawCode) || storageCodes.includes(error?.cause?.code);
   const publicCodes = new Set([
     "workspace_integrity_error", "workspace_storage_unavailable", "paper_conflict", "paper_not_found",
-    "backup_invalid", "backup_too_large", "backup_assets_unavailable", "export_too_large", "export_path_invalid", "export_condition_invalid",
+    "backup_invalid", "backup_too_large", "backup_assets_unavailable", "export_assets_unavailable", "export_too_large", "export_path_invalid", "export_condition_invalid",
     "restore_failed", "restore_fatal", "research_extra_failed",
   ]);
   const code = storageFailure
@@ -97,6 +97,7 @@ function workspaceError(c, error) {
     paper_conflict: "论文已在其他窗口更新，请重新载入后再试",
     backup_invalid: "备份内容无效",
     backup_assets_unavailable: "完整备份缺少或无法读取资源，请恢复资源后重试，或选择不含资源的备份",
+    export_assets_unavailable: "导出所需视觉附件缺失或无法读取，请重新解析或清理失效引用后重试",
     backup_too_large: "备份文件超过大小限制",
     export_too_large: "导出文件超过大小限制",
     export_path_invalid: "App 导出目录不可用",
@@ -113,7 +114,7 @@ function workspaceError(c, error) {
     || code === "restore_fatal"
     || code === "export_path_invalid"
     ? 503
-    : code === "paper_conflict" || code === "backup_assets_unavailable"
+    : code === "paper_conflict" || code === "backup_assets_unavailable" || code === "export_assets_unavailable"
       ? 409
       : notFound || code === "paper_not_found"
         ? 404
@@ -241,9 +242,21 @@ function queryExportConditions(c) {
 
 function sourceReceipt(paper) { return { paperHash: paper.paperHash, sourceRevision: paper.revision, sourceGeneration: paper.generation }; }
 
-function collectMarkdownAttachments(runtime, paper, options = {}) {
-  const blocks = Array.isArray(paper?.blocks) ? paper.blocks : [];
-  if (!blocks.length) return [];
+function exportAssetsUnavailable() {
+  return Object.assign(new Error("导出所需视觉附件缺失或无法读取"), { code: "export_assets_unavailable" });
+}
+
+function suffixExportAssetPath(exportRelPath, suffix) {
+  const normalized = String(exportRelPath || "").replace(/\\/g, "/");
+  const slashIndex = normalized.lastIndexOf("/");
+  const dir = slashIndex >= 0 ? normalized.slice(0, slashIndex + 1) : "";
+  const file = slashIndex >= 0 ? normalized.slice(slashIndex + 1) : normalized;
+  const ext = path.posix.extname(file);
+  const base = ext ? file.slice(0, -ext.length) : file;
+  return `${dir}${base}-${suffix}${ext}`;
+}
+
+function prepareExportAttachments(runtime, paper, options = {}, { saveToDisk = false } = {}) {
   const rawBase = typeof options?.attachmentBasePath === "string" && options.attachmentBasePath.trim()
     ? options.attachmentBasePath.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "")
     : "attachments";
@@ -253,81 +266,285 @@ function collectMarkdownAttachments(runtime, paper, options = {}) {
   } catch {
     safeBase = "attachments";
   }
-  const seen = new Set();
+  const blocks = Array.isArray(paper?.blocks) ? paper.blocks : [];
+  if (!blocks.length) {
+    return { safeBase, effectiveBase: safeBase, namespaceRel: null, attachments: [], blockExportPaths: new Map() };
+  }
+  const exportDir = path.join(runtime.dataDir, "exports");
+  if (saveToDisk) verifyExportDir(runtime, exportDir);
+  const seenByLower = new Map();
   const attachments = [];
+  const blockExportPaths = new Map();
+  let totalBytes = 0;
+
   for (const block of blocks) {
     const ref = block?.assetRef;
-    if (!ref || typeof ref !== "object" || !ref.cacheId || !ref.path) continue;
-    const rawRel = [block?.assetPath, block?.imagePath, ref.path]
-      .map((item) => String(item || "").trim())
-      .find(Boolean)
-      ?.replace(/\\/g, "/")
-      .replace(/^\/+/, "") || "";
-    if (!rawRel) continue;
-    let relativePath;
+    if (ref === null || ref === undefined) continue;
+    if (!ref || typeof ref !== "object" || Array.isArray(ref)) throw exportAssetsUnavailable();
+    const cacheId = String(ref.cacheId || "").trim().toLowerCase();
+    if (!/^[a-f0-9]{24}$/.test(cacheId)) throw exportAssetsUnavailable();
+    const rawRel = String(ref.path || "").trim().replace(/\\/g, "/").replace(/^\/+/, "");
+    let normalizedRel;
     try {
-      relativePath = safeBackupAssetPath(`${safeBase}/${rawRel}`);
+      normalizedRel = safeBackupAssetPath(rawRel);
     } catch {
-      continue;
+      throw exportAssetsUnavailable();
     }
-    const key = relativePath.toLowerCase();
-    if (seen.has(key)) continue;
     const asset = readMineruAsset({
       ctx: { dataDir: runtime.dataDir },
-      cacheId: ref.cacheId,
-      assetPath: ref.path,
+      cacheId,
+      assetPath: normalizedRel,
     });
-    if (!asset?.bytes) continue;
-    seen.add(key);
-    attachments.push({ relativePath, bytes: asset.bytes });
+    if (!asset?.bytes || !Buffer.isBuffer(asset.bytes)) throw exportAssetsUnavailable();
+    const sha256 = createHash("sha256").update(asset.bytes).digest("hex");
+    const baseExportRel = `${cacheId}/${normalizedRel}`;
+    let candidateExportRel = baseExportRel;
+    let attempt = 0;
+
+    while (true) {
+      const lowerKey = candidateExportRel.toLowerCase();
+      const existingInManifest = seenByLower.get(lowerKey);
+      if (existingInManifest) {
+        if (existingInManifest.sha256 === sha256) {
+          blockExportPaths.set(block.id, existingInManifest.exportRelPath);
+          break;
+        }
+      } else {
+        totalBytes += asset.bytes.length;
+        if (totalBytes > MAX_BACKUP_BYTES) {
+          throw Object.assign(new Error("导出文件超过 256 MB 限制"), { code: "export_too_large" });
+        }
+        const entry = {
+          relativePath: "",
+          exportRelPath: candidateExportRel,
+          bytes: asset.bytes,
+          sha256,
+        };
+        seenByLower.set(lowerKey, entry);
+        attachments.push(entry);
+        blockExportPaths.set(block.id, candidateExportRel);
+        break;
+      }
+      attempt += 1;
+      const suffix = attempt === 1 ? sha256.slice(0, 8) : `${sha256.slice(0, 8)}-${attempt}`;
+      candidateExportRel = suffixExportAssetPath(baseExportRel, suffix);
+    }
   }
-  return attachments;
+
+  let effectiveBase = safeBase;
+  let namespaceRel = null;
+  if (saveToDisk && attachments.length > 0) {
+    let allocated = null;
+    for (let attempt = 0; attempt < 64; attempt += 1) {
+      const exportId = `export-${randomUUID().replace(/-/g, "")}`;
+      const candidateNamespace = safeBackupAssetPath(`${safeBase}/${exportId}`);
+      const candidateDir = path.resolve(exportDir, ...candidateNamespace.split("/"));
+      verifyNoSymlinks(candidateDir, exportDir);
+      if (!fs.existsSync(candidateDir)) {
+        allocated = candidateNamespace;
+        break;
+      }
+    }
+    if (!allocated) {
+      throw Object.assign(new Error("App 导出目录目标冲突"), { code: "export_path_invalid" });
+    }
+    namespaceRel = allocated;
+    effectiveBase = allocated;
+  }
+
+  for (const item of attachments) {
+    item.relativePath = safeBackupAssetPath(`${effectiveBase}/${item.exportRelPath}`);
+  }
+
+  return { safeBase, effectiveBase, namespaceRel, attachments, blockExportPaths };
 }
 
-function saveMarkdownAttachments(runtime, attachments = []) {
-  if (!Array.isArray(attachments) || !attachments.length) return [];
+async function rollbackExportNamespace(runtime, namespaceDir, baseDir) {
+  if (!namespaceDir) return;
+  const exportDir = path.join(runtime.dataDir, "exports");
+  try {
+    verifyExportDir(runtime, exportDir);
+    verifyNoSymlinks(namespaceDir, exportDir);
+    await fs.promises.rm(namespaceDir, { recursive: true, force: true });
+  } catch {}
+  if (baseDir && baseDir !== exportDir) {
+    try {
+      verifyNoSymlinks(baseDir, exportDir);
+      await fs.promises.rmdir(baseDir);
+    } catch {}
+  }
+}
+
+async function saveMarkdownAttachments(runtime, attachments = [], namespaceRel = null, safeBase = "attachments") {
+  if (!Array.isArray(attachments) || !attachments.length || !namespaceRel) {
+    return { written: [], namespaceDir: null, baseDir: null };
+  }
   const exportDir = path.join(runtime.dataDir, "exports");
   verifyExportDir(runtime, exportDir);
+  fs.mkdirSync(exportDir, { recursive: true });
+  verifyExportDir(runtime, exportDir);
+  const baseDir = path.resolve(exportDir, ...String(safeBase).split("/"));
+  const baseRel = path.relative(exportDir, baseDir);
+  if (!baseRel || baseRel.startsWith("..") || path.isAbsolute(baseRel)) {
+    throw Object.assign(new Error("App 导出目录不可用"), { code: "export_path_invalid" });
+  }
+  verifyExportDir(runtime, baseDir);
+  fs.mkdirSync(baseDir, { recursive: true });
+  verifyExportDir(runtime, baseDir);
+
+  const namespaceDir = path.resolve(exportDir, ...String(namespaceRel).split("/"));
+  const nsRel = path.relative(exportDir, namespaceDir);
+  if (!nsRel || nsRel.startsWith("..") || path.isAbsolute(nsRel)) {
+    throw Object.assign(new Error("App 导出目录不可用"), { code: "export_path_invalid" });
+  }
+  verifyExportDir(runtime, path.dirname(namespaceDir));
+  verifyNoSymlinks(namespaceDir, exportDir);
+  await fs.promises.mkdir(namespaceDir, { recursive: false });
+  verifyExportDir(runtime, namespaceDir);
+
   const written = [];
-  for (const item of attachments) {
-    const targetPath = path.resolve(exportDir, ...String(item.relativePath).split("/"));
-    const rel = path.relative(exportDir, targetPath);
-    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
-      const error = new Error("App 导出目录不可用");
-      error.code = "export_path_invalid";
-      throw error;
+  try {
+    for (const item of attachments) {
+      const targetPath = path.resolve(exportDir, ...String(item.relativePath).split("/"));
+      const relToNs = path.relative(namespaceDir, targetPath);
+      if (!relToNs || relToNs.startsWith("..") || path.isAbsolute(relToNs)) {
+        throw Object.assign(new Error("App 导出目录不可用"), { code: "export_path_invalid" });
+      }
+      const targetDir = path.dirname(targetPath);
+      verifyExportDir(runtime, targetDir);
+      fs.mkdirSync(targetDir, { recursive: true });
+      verifyExportDir(runtime, targetDir);
+      verifyNoSymlinks(targetPath, exportDir);
+
+      const tempPath = path.join(targetDir, `.asset-${randomUUID()}.tmp`);
+      let handle = null;
+      try {
+        handle = await fs.promises.open(tempPath, "wx");
+        await handle.writeFile(item.bytes);
+        await handle.sync();
+        await handle.close();
+        handle = null;
+        verifyExportDir(runtime, targetDir);
+        verifyNoSymlinks(tempPath, exportDir);
+        verifyNoSymlinks(targetPath, exportDir);
+        await fs.promises.link(tempPath, targetPath);
+        written.push(item.relativePath);
+      } finally {
+        if (handle) { try { await handle.close(); } catch {} }
+        try { verifyExportDir(runtime, targetDir); await fs.promises.unlink(tempPath); } catch {}
+      }
     }
-    const targetDir = path.dirname(targetPath);
-    verifyExportDir(runtime, targetDir);
-    fs.mkdirSync(targetDir, { recursive: true });
-    verifyExportDir(runtime, targetDir);
-    verifyNoSymlinks(targetPath, exportDir);
-    const tempPath = path.join(targetDir, `.asset-${randomUUID()}.tmp`);
-    try {
-      fs.writeFileSync(tempPath, item.bytes);
-      verifyNoSymlinks(tempPath, exportDir);
-      fs.renameSync(tempPath, targetPath);
-      written.push(item.relativePath);
-    } finally {
-      try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+    return { written, namespaceDir, baseDir };
+  } catch (error) {
+    await rollbackExportNamespace(runtime, namespaceDir, baseDir);
+    throw error;
+  }
+}
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let index = 0; index < bytes.length; index += 1) {
+    crc ^= bytes[index];
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
     }
   }
-  return written;
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function buildExportZip(markdownFileName, markdownText, attachments = []) {
+  const entries = [
+    { name: markdownFileName, bytes: Buffer.from(String(markdownText || ""), "utf8") },
+    ...attachments.map((item) => ({ name: item.relativePath, bytes: Buffer.from(item.bytes) })),
+  ];
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const nameBytes = Buffer.from(String(entry.name).replace(/\\/g, "/"), "utf8");
+    const data = entry.bytes;
+    const checksum = crc32(data);
+    const local = Buffer.alloc(30 + nameBytes.length);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt32LE(checksum, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    nameBytes.copy(local, 30);
+    localParts.push(local, data);
+
+    const central = Buffer.alloc(46 + nameBytes.length);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt32LE(checksum, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBytes.length, 28);
+    central.writeUInt32LE(offset, 42);
+    nameBytes.copy(central, 46);
+    centralParts.push(central);
+    offset += local.length + data.length;
+  }
+  const centralBuffer = Buffer.concat(centralParts);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralBuffer.length, 12);
+  end.writeUInt32LE(offset, 16);
+  const zipBuffer = Buffer.concat([...localParts, centralBuffer, end]);
+  if (zipBuffer.length > MAX_BACKUP_BYTES) {
+    const error = new Error("导出文件超过 256 MB 限制");
+    error.code = "export_too_large";
+    throw error;
+  }
+  return zipBuffer;
 }
 
 function exportMarkdown(runtime, paperHash, body = {}) {
   const workspace = workspaceFor(runtime);
   const captured = publicExportInput(workspace, paperHash, body);
-  const markdown = generatePaperMarkdown(captured.input);
+  const { safeBase, effectiveBase, namespaceRel, attachments, blockExportPaths } = prepareExportAttachments(
+    runtime,
+    captured.paper,
+    captured.input.options,
+    { saveToDisk: body?.saveToDisk === true },
+  );
+  const exportInput = {
+    ...captured.input,
+    options: { ...(captured.input.options || {}), attachmentBasePath: effectiveBase },
+    blocks: (Array.isArray(captured.input.blocks) ? captured.input.blocks : []).map((block) => (
+      blockExportPaths.has(block?.id)
+        ? {
+          ...block,
+          asset: { ...(block.asset && typeof block.asset === "object" ? block.asset : {}), exportPath: blockExportPaths.get(block.id) },
+          assetRef: null,
+          assetPath: undefined,
+          imagePath: undefined,
+        }
+        : {
+          ...block,
+          asset: null,
+          assetRef: null,
+          assetPath: undefined,
+          imagePath: undefined,
+        }
+    )),
+    assets: [],
+  };
+  const markdown = generatePaperMarkdown(exportInput);
   if (Buffer.byteLength(markdown, "utf8") > MAX_EXPORT_MARKDOWN_BYTES) {
     const error = new Error("Markdown 导出超过 32 MB 限制");
     error.code = "export_too_large";
     throw error;
   }
-  const attachments = body?.saveToDisk === true
-    ? collectMarkdownAttachments(runtime, captured.paper, captured.input.options)
-    : [];
-  return { paper: captured.paper, markdown, attachments };
+  return { paper: captured.paper, markdown, attachments, safeBase, namespaceRel };
 }
 
 function backupPayload(runtime, paperHash, includeAssets, conditions = {}) {
@@ -473,16 +690,32 @@ export default function registerResearchExtraRoutes(app, runtime) {
       if (!result) return c.json({ ok: false, error: { code: "paper_not_found", message: "论文不存在" }, apiVersion: APP_API_VERSION }, 404);
       const fileName = safeFileName(result.paper?.metadata?.title, ".md", "paper.md");
       if (body.saveToDisk === true) {
-        const saved = await saveInAppExports(runtime, fileName, result.markdown);
-        const exportedAttachments = saveMarkdownAttachments(runtime, result.attachments);
+        const { written, namespaceDir, baseDir } = await saveMarkdownAttachments(
+          runtime,
+          result.attachments,
+          result.namespaceRel,
+          result.safeBase,
+        );
+        let saved;
+        try {
+          saved = await saveInAppExports(runtime, fileName, result.markdown);
+        } catch (error) {
+          await rollbackExportNamespace(runtime, namespaceDir, baseDir);
+          throw error;
+        }
         return c.json({
           ok: true,
           saved: true,
           ...saved,
           ...sourceReceipt(result.paper),
-          attachmentCount: exportedAttachments.length,
+          attachmentCount: written.length,
           apiVersion: APP_API_VERSION,
         });
+      }
+      if (result.attachments.length > 0 && body.format !== "md") {
+        const zipFileName = safeFileName(result.paper?.metadata?.title, ".zip", "paper.zip");
+        const zipBuffer = buildExportZip(fileName, result.markdown, result.attachments);
+        return downloadResponse(zipBuffer, zipFileName, "application/zip", paperHash, result.paper);
       }
       return downloadResponse(result.markdown, fileName, "text/markdown; charset=utf-8", paperHash, result.paper);
     } catch (error) {
@@ -498,7 +731,13 @@ export default function registerResearchExtraRoutes(app, runtime) {
     try {
       const result = exportMarkdown(runtime, paperHash, queryExportConditions(c));
       if (!result) return c.json({ ok: false, error: { code: "paper_not_found", message: "论文不存在" }, apiVersion: APP_API_VERSION }, 404);
-      return downloadResponse(result.markdown, safeFileName(result.paper?.metadata?.title, ".md", "paper.md"), "text/markdown; charset=utf-8", paperHash, result.paper);
+      const fileName = safeFileName(result.paper?.metadata?.title, ".md", "paper.md");
+      if (result.attachments.length > 0 && requestQuery(c, "format") !== "md") {
+        const zipFileName = safeFileName(result.paper?.metadata?.title, ".zip", "paper.zip");
+        const zipBuffer = buildExportZip(fileName, result.markdown, result.attachments);
+        return downloadResponse(zipBuffer, zipFileName, "application/zip", paperHash, result.paper);
+      }
+      return downloadResponse(result.markdown, fileName, "text/markdown; charset=utf-8", paperHash, result.paper);
     } catch (error) {
       return workspaceError(c, error);
     }

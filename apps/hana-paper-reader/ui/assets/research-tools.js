@@ -281,6 +281,7 @@ export function createResearchTools(options = {}) {
     evidenceRequestPending: null,
     evidenceResult: null,
     exportPending: null,
+    activeDataMutation: null,
     notes: [],
     bookmarks: [],
     progress: null,
@@ -1072,6 +1073,7 @@ export function createResearchTools(options = {}) {
         if (!await confirmAction(message) || !isCurrentRender("parse", token, hash)) return;
         let prepared = false;
         let mutationContext = null;
+        let dataMutation = null;
         try {
           mutationContext = await options.onBeforePaperMutation?.({ paperHash: hash, purpose: "清理" });
           prepared = typeof options.onBeforePaperMutation === "function";
@@ -1083,14 +1085,35 @@ export function createResearchTools(options = {}) {
             body: JSON.stringify({ paperHash: hash, action, expectedRevision }),
           });
           if (!isCurrentRender("parse", token, hash)) return;
-          if (await options.onPaperDataChanged?.({ action, ...(result?.result || {}), storage: result?.storage || null, mutationContext }) === false) return;
-          if (!isCurrentRender("parse", token, hash)) return;
+          let activeToken = token;
+          if (typeof state === "object" && state) {
+            if (state.activeDataMutation) state.activeDataMutation.invalidated = true;
+            dataMutation = { hash, tool: "parse", mutationContext, inCallback: true, invalidated: false };
+            state.activeDataMutation = dataMutation;
+          }
+          const applied = await options.onPaperDataChanged?.({ action, ...(result?.result || {}), storage: result?.storage || null, mutationContext });
+          if (dataMutation && typeof state === "object" && state) {
+            dataMutation.inCallback = false;
+            const latestPaper = getPaper();
+            const latestHash = String(latestPaper?.paperHash || "").toLowerCase();
+            if (!dataMutation.invalidated && state.activeDataMutation === dataMutation && state.open && state.activeTool === "parse" && latestHash === hash) {
+              state.paper = latestPaper;
+              activeToken = state.renderToken;
+            } else {
+              dataMutation.invalidated = true;
+            }
+          }
+          if (applied === false || !isCurrentRender("parse", activeToken, hash)) return;
           const cleanup = result?.result || {};
           if (cleanup.cleanupDeferred) notify("论文更改已保存，部分缓存尚未清理，请重新载入后检查", "warning");
           else if (cleanup.preservedCacheIds?.length) notify("指定范围已处理；其他论文仍引用的缓存已保留", "success");
           else notify("指定范围的数据已处理", "success");
           render();
         } finally {
+          if (dataMutation && typeof state === "object" && state) {
+            dataMutation.inCallback = false;
+            if (state.activeDataMutation === dataMutation) state.activeDataMutation = null;
+          }
           if (prepared) await options.onPaperMutationFinished?.({ paperHash: hash, mutationContext });
         }
       };
@@ -1159,6 +1182,7 @@ export function createResearchTools(options = {}) {
         restore.disabled = true;
         let prepared = false;
         let mutationContext = null;
+        let dataMutation = null;
         try {
           const parsed = JSON.parse(await file.text());
           const backupHash = String(parsed?.paperHash || parsed?.paper?.paperHash || "").toLowerCase();
@@ -1169,14 +1193,35 @@ export function createResearchTools(options = {}) {
           const expectedRevision = mutationContext?.expectedRevision ?? paperDeletionRevision(getPaper(), hash);
           const data = await call(endpoints.restore, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...parsed, expectedRevision }) });
           if (!isCurrentRender("parse", token, hash)) return;
-          if (await options.onPaperDataChanged?.({ action: "restore", ...data, mutationContext }) === false) return;
-          if (!isCurrentRender("parse", token, hash)) return;
+          let activeToken = token;
+          if (typeof state === "object" && state) {
+            if (state.activeDataMutation) state.activeDataMutation.invalidated = true;
+            dataMutation = { hash, tool: "parse", mutationContext, inCallback: true, invalidated: false };
+            state.activeDataMutation = dataMutation;
+          }
+          const applied = await options.onPaperDataChanged?.({ action: "restore", ...data, mutationContext });
+          if (dataMutation && typeof state === "object" && state) {
+            dataMutation.inCallback = false;
+            const latestPaper = getPaper();
+            const latestHash = String(latestPaper?.paperHash || "").toLowerCase();
+            if (!dataMutation.invalidated && state.activeDataMutation === dataMutation && state.open && state.activeTool === "parse" && latestHash === hash) {
+              state.paper = latestPaper;
+              activeToken = state.renderToken;
+            } else {
+              dataMutation.invalidated = true;
+            }
+          }
+          if (applied === false || !isCurrentRender("parse", activeToken, hash)) return;
           if (parsed.assetMode === "omitted") notify("备份恢复成功；这份备份不含图片和附件，请检查资源", "info");
           else if (parsed.assetMode === undefined) notify("备份恢复成功；旧备份未声明资源完整性，请检查图片和附件", "info");
           else notify("备份恢复成功", "success");
           render();
         } catch (error) { notify(`备份恢复失败：${error.message}`, "error"); }
         finally {
+          if (dataMutation && typeof state === "object" && state) {
+            dataMutation.inCallback = false;
+            if (state.activeDataMutation === dataMutation) state.activeDataMutation = null;
+          }
           if (prepared) await options.onPaperMutationFinished?.({ paperHash: hash, mutationContext });
           restore.disabled = false;
         }
@@ -1587,7 +1632,10 @@ export function createResearchTools(options = {}) {
 
       const actions = makeElement(doc, "div", "research-tools-actions research-tools-visual-actions");
       const jump = button(doc, "回到正文", "research-tools-button-primary"); addListener(jump, "click", () => locate(evidence)); actions.appendChild(jump);
-      const markdown = `![${block.text || block.type}](attachments/${block.assetRef?.path || "visual"})\n\n> 来源：${state.paper?.title || "当前论文"} · Page ${Number(block.page || 1)} · block ${block.id} · Evidence ${block.evidenceId || ""}\n\n${neighbors.map((item) => item.text).join("\n\n")}`;
+      const assetExportRel = block.assetRef?.cacheId && block.assetRef?.path
+        ? `${block.assetRef.cacheId}/${block.assetRef.path}`
+        : (block.assetRef?.path || "visual");
+      const markdown = `![${block.text || block.type}](attachments/${assetExportRel})\n\n> 来源：${state.paper?.title || "当前论文"} · Page ${Number(block.page || 1)} · block ${block.id} · Evidence ${block.evidenceId || ""}\n\n${neighbors.map((item) => item.text).join("\n\n")}`;
       const copy = button(doc, "复制带来源 Markdown");
       addListener(copy, "click", async () => { const copied = await copyText(markdown); notify(copied ? "带来源 Markdown 已复制" : "浏览器拒绝剪贴板写入", copied ? "success" : "error"); });
       actions.appendChild(copy);
@@ -1664,9 +1712,12 @@ export function createResearchTools(options = {}) {
         (route, init) => call(route, init, { quiet: true }), { isCurrent, canReveal: () => isCurrent() && state.open,
           extension: isBackup ? ".backup.json" : ".md", assetMode: isBackup ? (includeAssets ? "included" : "omitted") : undefined });
       if (!isCurrent() || !state.open || result?.method === "stale") return;
-      if (result?.method === "direct") notify(label + "已保存到 App 导出目录：" + result.fileName, "success");
-      else if (result?.method === "host") notify(label + "已交给宿主下载；实际位置由宿主决定", "info");
-      else notify("已尝试交给浏览器下载；请确认下载列表中出现" + label, "info");
+      const hasVisualAttachments = !isBackup && paperBlocks(current).some((block) => block?.assetRef?.cacheId && block?.assetRef?.path);
+      const downloadLabel = !isBackup && hasVisualAttachments ? "双语 Markdown 导出包（含附件）" : label;
+      const attachmentSuffix = !isBackup && Number(result?.attachmentCount) > 0 ? `（含 ${result.attachmentCount} 个附件）` : "";
+      if (result?.method === "direct") notify(label + "已保存到 App 导出目录：" + result.fileName + attachmentSuffix, "success");
+      else if (result?.method === "host") notify(downloadLabel + "已交给宿主下载；实际位置由宿主决定", "info");
+      else notify("已尝试交给浏览器下载；请确认下载列表中出现" + downloadLabel, "info");
     } catch (error) {
       if (isCurrent() && state.open) notify("导出失败：" + (error?.message || "导出结果未确认，请先检查导出目录"), "error");
     } finally {
@@ -1706,6 +1757,13 @@ export function createResearchTools(options = {}) {
     if (state.destroyed) return;
     const token = ++state.renderToken;
     state.paper = getPaper();
+    if (state.activeDataMutation) {
+      const activeHash = String(state.paper?.paperHash || "").toLowerCase();
+      if (!state.open || state.activeTool !== state.activeDataMutation.tool || activeHash !== state.activeDataMutation.hash) {
+        state.activeDataMutation.invalidated = true;
+        state.activeDataMutation = null;
+      }
+    }
     shell.classList.toggle("open", state.open);
     if (!state.open && shell.contains(doc.activeElement)) doc.activeElement?.blur?.();
     shell.hidden = !state.open;
@@ -1771,6 +1829,13 @@ export function createResearchTools(options = {}) {
   }
   function resetPaperState() {
     cancelEvidenceRequest(true);
+    if (state.activeDataMutation) {
+      const currentHash = String(getPaper()?.paperHash || "").toLowerCase();
+      if (!state.activeDataMutation.inCallback || !state.open || state.activeTool !== state.activeDataMutation.tool || currentHash !== state.activeDataMutation.hash) {
+        state.activeDataMutation.invalidated = true;
+        state.activeDataMutation = null;
+      }
+    }
     state.exportPending = null;
     state.paperStateEpoch += 1;
     state.paper = null;
@@ -1805,8 +1870,26 @@ export function createResearchTools(options = {}) {
     state.renderToken += 1;
     return api;
   }
-  function closeDrawer() { state.open = false; render(); return api; }
-  function destroy() { cancelEvidenceRequest(true); state.exportPending = null; clearNoticeTimer(); shell.remove(); state.destroyed = true; }
+  function closeDrawer() {
+    if (state.activeDataMutation) {
+      state.activeDataMutation.invalidated = true;
+      state.activeDataMutation = null;
+    }
+    state.open = false;
+    render();
+    return api;
+  }
+  function destroy() {
+    cancelEvidenceRequest(true);
+    state.exportPending = null;
+    if (state.activeDataMutation) {
+      state.activeDataMutation.invalidated = true;
+      state.activeDataMutation = null;
+    }
+    clearNoticeTimer();
+    shell.remove();
+    state.destroyed = true;
+  }
   const api = { open, close: closeDrawer, destroy, refresh, restoreUiState, resetPaperState, uiState };
   addListener(close, "click", closeDrawer);
   render();

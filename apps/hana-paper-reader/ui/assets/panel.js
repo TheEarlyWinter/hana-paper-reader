@@ -242,6 +242,7 @@ let agentCatalogRequestId = 0;
 let restoreRequestId = 0;
 let fullTranslationRunId = 0;
 let fullTranslationBusy = false;
+let activeFullTranslationControl = null;
 let askAgentRequestId = 0;
 let askAgentController = null;
 let selectionAnswerSource = null;
@@ -584,6 +585,7 @@ function renderWorkspaceTabs() {
 
 function resetTranslationRunState() {
   fullTranslationRunId += 1;
+  activeFullTranslationControl = null;
   fullTranslationBusy = false;
   fullTranslationPreparing = false;
   fullTranslationPauseRequested = false;
@@ -1752,6 +1754,17 @@ function updateMineruUI() {
 
 function openMineruSettings() {
   const modal = document.getElementById("mineru-settings-modal");
+  const saveButton = document.getElementById("btn-save-mineru-settings");
+  const clearButton = document.getElementById("btn-clear-mineru-token");
+  if (!saveButton?.dataset?.busyOwner) {
+    if (saveButton) {
+      saveButton.disabled = false;
+      saveButton.textContent = "保存设置";
+    }
+    if (clearButton) {
+      clearButton.disabled = false;
+    }
+  }
   document.getElementById("mineru-token-input").value = "";
   document.getElementById("mineru-api-base-input").value = mineruSettings.apiBaseUrl;
   document.getElementById("mineru-model-input").value = mineruSettings.modelVersion;
@@ -1772,6 +1785,17 @@ function closeMineruSettings(eventOrCancel = false) {
   if (eventOrCancel) {
     pendingPdfFile = null;
     pendingPdfLoadRequestId = 0;
+    mineruSettingsRequestId += 1;
+    const saveButton = document.getElementById("btn-save-mineru-settings");
+    const clearButton = document.getElementById("btn-clear-mineru-token");
+    if (saveButton) {
+      if (saveButton.dataset) delete saveButton.dataset.busyOwner;
+      saveButton.disabled = false;
+      saveButton.textContent = "保存设置";
+    }
+    if (clearButton) {
+      clearButton.disabled = false;
+    }
   }
   const modal = document.getElementById("mineru-settings-modal");
   syncModalOpen(modal, false);
@@ -1794,15 +1818,22 @@ function mineruSettingsPayload() {
 
 async function saveMineruSettings() {
   const button = document.getElementById("btn-save-mineru-settings");
+  const clearButton = document.getElementById("btn-clear-mineru-token");
   const payload = mineruSettingsPayload();
   if (!mineruConfigured && !String(payload.token || "").trim()) {
     await safeToast({ message: "首次使用请填写 MinerU API Token", type: "error" });
     document.getElementById("mineru-token-input").focus();
     return;
   }
-  button.disabled = true;
-  button.textContent = "正在保存…";
   const requestId = ++mineruSettingsRequestId;
+  const capturedPendingFile = pendingPdfFile;
+  const capturedPendingLoadId = pendingPdfLoadRequestId;
+  if (button) {
+    if (button.dataset) button.dataset.busyOwner = String(requestId);
+    button.disabled = true;
+    button.textContent = "正在保存…";
+  }
+  if (clearButton) clearButton.disabled = true;
   try {
     const response = await pluginApiFetch("/api/mineru-settings", {
       method: "POST",
@@ -1815,27 +1846,44 @@ async function saveMineruSettings() {
     applyMineruSettings(data);
     closeMineruSettings();
     await safeToast({ message: "MinerU 设置已保存", type: "success" });
-    const pendingFile = pendingPdfFile;
-    const pendingRequestId = pendingPdfLoadRequestId;
-    pendingPdfFile = null;
-    pendingPdfLoadRequestId = 0;
-    if (pendingFile && pendingRequestId === paperLoadRequestId) {
-      void parsePdfFile(pendingFile);
+    if (requestId !== mineruSettingsRequestId) return;
+    if (
+      capturedPendingFile
+      && pendingPdfFile === capturedPendingFile
+      && pendingPdfLoadRequestId === capturedPendingLoadId
+      && capturedPendingLoadId === paperLoadRequestId
+    ) {
+      pendingPdfFile = null;
+      pendingPdfLoadRequestId = 0;
+      void parsePdfFile(capturedPendingFile, { loadRequestId: capturedPendingLoadId });
     }
   } catch (error) {
     if (requestId !== mineruSettingsRequestId) return;
     await safeToast({ message: `保存失败：${error?.message || "设置无效"}`, type: "error" });
   } finally {
     if (requestId === mineruSettingsRequestId) {
-      button.disabled = false;
-      button.textContent = "保存设置";
+      const currentSaveBtn = document.getElementById("btn-save-mineru-settings") || button;
+      const currentClearBtn = document.getElementById("btn-clear-mineru-token") || clearButton;
+      if (currentSaveBtn) {
+        if (currentSaveBtn.dataset) delete currentSaveBtn.dataset.busyOwner;
+        currentSaveBtn.disabled = false;
+        currentSaveBtn.textContent = "保存设置";
+      }
+      if (currentClearBtn) currentClearBtn.disabled = false;
     }
   }
 }
 
 async function clearMineruToken() {
   if (!await confirmAction("确认清除已保存的 MinerU Token？之后导入 PDF 时需要重新填写。", { title: "清除 MinerU Token", confirmText: "确认清除" })) return;
+  const saveButton = document.getElementById("btn-save-mineru-settings");
+  const clearButton = document.getElementById("btn-clear-mineru-token");
   const requestId = ++mineruSettingsRequestId;
+  if (saveButton) {
+    if (saveButton.dataset) saveButton.dataset.busyOwner = String(requestId);
+    saveButton.disabled = true;
+  }
+  if (clearButton) clearButton.disabled = true;
   try {
     const response = await pluginApiFetch("/api/mineru-settings", {
       method: "POST",
@@ -1853,6 +1901,17 @@ async function clearMineruToken() {
   } catch (error) {
     if (requestId !== mineruSettingsRequestId) return;
     await safeToast({ message: `清除失败：${error?.message || "未知错误"}`, type: "error" });
+  } finally {
+    if (requestId === mineruSettingsRequestId) {
+      const currentSaveBtn = document.getElementById("btn-save-mineru-settings") || saveButton;
+      const currentClearBtn = document.getElementById("btn-clear-mineru-token") || clearButton;
+      if (currentSaveBtn) {
+        if (currentSaveBtn.dataset) delete currentSaveBtn.dataset.busyOwner;
+        currentSaveBtn.disabled = false;
+        currentSaveBtn.textContent = "保存设置";
+      }
+      if (currentClearBtn) currentClearBtn.disabled = false;
+    }
   }
 }
 
@@ -3848,6 +3907,14 @@ function setPdfPreviewStatus(generation, message, isError = false, paperHash = p
 async function initializePdfPreview(file, generation, paperHash = pdfPreviewPaperHash) {
   const expectedHash = normalizedPaperHash(paperHash);
   if (!file || !pdfPreviewIsCurrent(generation, expectedHash)) return;
+  if (expectedHash) {
+    pdfPreviewPaperHash = expectedHash;
+    currentPdfFile = file;
+    currentPdfFileHash = expectedHash;
+    if (typeof pdfFilesByHash !== "undefined" && pdfFilesByHash?.set) {
+      pdfFilesByHash.set(expectedHash, file);
+    }
+  }
   let task = null;
   try {
     if (file.size > MAX_PDF_BYTES) throw new Error("PDF preview exceeds the file size limit");
@@ -3865,7 +3932,8 @@ async function initializePdfPreview(file, generation, paperHash = pdfPreviewPape
     });
     pdfPreviewLoadingTask = task;
     const documentProxy = await task.promise;
-    if (!pdfPreviewIsCurrent(generation, expectedHash)) {
+    if (!pdfPreviewIsCurrent(generation, expectedHash) || pdfPreviewLoadingTask !== task) {
+      if (pdfPreviewLoadingTask === task) pdfPreviewLoadingTask = null;
       await documentProxy.destroy?.();
       return;
     }
@@ -3873,8 +3941,8 @@ async function initializePdfPreview(file, generation, paperHash = pdfPreviewPape
     pdfPreviewLoadingTask = null;
     observePdfPreviewPages(generation);
   } catch (error) {
-    if (!pdfPreviewIsCurrent(generation, expectedHash)) return;
     if (pdfPreviewLoadingTask === task) pdfPreviewLoadingTask = null;
+    if (!pdfPreviewIsCurrent(generation, expectedHash)) return;
     setPdfPreviewStatus(generation, "PDF 原页预览加载失败，提取文本仍可继续阅读", true, expectedHash);
   }
 }
@@ -4183,7 +4251,7 @@ async function renderPdfVisualCrop(preview, generation) {
   }
 }
 
-function mineruAssetObjectUrl(cacheId, assetPath, generation) {
+function mineruAssetObjectUrl(cacheId, assetPath, generation = pdfPreviewGeneration) {
   const key = `${generation}:${cacheId}:${assetPath}`;
   if (mineruAssetUrlPromises.has(key)) return mineruAssetUrlPromises.get(key);
   const promise = (async () => {
@@ -4192,9 +4260,13 @@ function mineruAssetObjectUrl(cacheId, assetPath, generation) {
     if (!response.ok) throw new Error("MinerU asset fetch failed");
     const blob = await response.blob();
     if (!blob.type.startsWith("image/")) throw new Error("MinerU asset is not an image");
-    if (generation !== pdfPreviewGeneration) throw new DOMException("Stale MinerU asset", "AbortError");
+    const assetStillReferenced = !Array.isArray(currentPaper?.blocks)
+      || currentPaper.blocks.some((block) => block?.assetRef?.cacheId === cacheId && block?.assetRef?.path === assetPath);
+    if (generation !== pdfPreviewGeneration || !assetStillReferenced) {
+      throw new DOMException("Stale MinerU asset", "AbortError");
+    }
     const objectUrl = URL.createObjectURL(blob);
-    if (generation !== pdfPreviewGeneration) {
+    if (generation !== pdfPreviewGeneration || !assetStillReferenced) {
       URL.revokeObjectURL(objectUrl);
       throw new DOMException("Stale MinerU asset", "AbortError");
     }
@@ -4208,15 +4280,20 @@ function mineruAssetObjectUrl(cacheId, assetPath, generation) {
   return promise;
 }
 
-async function renderMineruAsset(preview, generation) {
-  if (generation !== pdfPreviewGeneration || preview.dataset.state === "loading" || preview.dataset.state === "rendered") return;
+async function renderMineruAsset(preview, generation = pdfPreviewGeneration) {
+  if (
+    generation !== pdfPreviewGeneration
+    || preview?.isConnected === false
+    || preview.dataset.state === "loading"
+    || preview.dataset.state === "rendered"
+  ) return;
   const cacheId = preview.dataset.cacheId || "";
   const assetPath = preview.dataset.assetPath || "";
   if (!cacheId || !assetPath) return;
   preview.dataset.state = "loading";
   try {
     const objectUrl = await mineruAssetObjectUrl(cacheId, assetPath, generation);
-    if (generation !== pdfPreviewGeneration) return;
+    if (generation !== pdfPreviewGeneration || preview?.isConnected === false) return;
     const image = document.createElement("img");
     image.className = "structured-visual-image";
     image.src = objectUrl;
@@ -4225,7 +4302,7 @@ async function renderMineruAsset(preview, generation) {
     preview.querySelector(".structured-visual-media")?.replaceChildren(image);
     preview.dataset.state = "rendered";
   } catch {
-    if (!pdfPreviewIsCurrent(generation)) return;
+    if (!pdfPreviewIsCurrent(generation) || preview?.isConnected === false) return;
     preview.dataset.state = "error";
     const status = preview.querySelector(".structured-visual-status");
     if (status) {
@@ -4553,12 +4630,44 @@ async function loadPaper(paper, options = {}) {
   resetResearchUiForPaper();
 
   const isPdf = paper?.isPdf === true || (typeof paper?.parser === "object" && paper.parser?.kind === "mineru");
-  const pdfFile = options.pdfFile || (nextHash ? pdfFilesByHash.get(nextHash) : null);
   const previousPreviewHash = normalizedPaperHash(pdfPreviewPaperHash);
+  const pdfFile = options.pdfFile
+    || (nextHash ? pdfFilesByHash.get(nextHash) : null)
+    || (previousPreviewHash && previousPreviewHash === nextHash ? currentPdfFile : null);
   const previewNeedsReset = !isPdf
     || (previousPreviewHash && previousPreviewHash !== nextHash)
     || (!previousPreviewHash && (pdfPreviewDocument || pdfPreviewLoadingTask));
-  if (previewNeedsReset) resetPdfPreview();
+  if (previewNeedsReset) {
+    resetPdfPreview();
+  } else {
+    pdfPreviewGeneration += 1;
+    if (pdfPreviewLoadingTask) {
+      const taskToDestroy = pdfPreviewLoadingTask;
+      pdfPreviewLoadingTask = null;
+      if (taskToDestroy?.destroy) Promise.resolve(taskToDestroy.destroy()).catch(() => {});
+    }
+    if (typeof pdfPreviewRenderTasks !== "undefined" && pdfPreviewRenderTasks) {
+      for (const task of pdfPreviewRenderTasks) task.cancel?.();
+      pdfPreviewRenderTasks.clear?.();
+    }
+    if (typeof pdfPageRenderLocks !== "undefined" && pdfPageRenderLocks?.clear) {
+      pdfPageRenderLocks.clear();
+    }
+    if (typeof mineruAssetUrlPromises !== "undefined" && mineruAssetUrlPromises?.clear) {
+      mineruAssetUrlPromises.clear();
+    }
+    if (typeof pdfPreviewImageCache !== "undefined" && pdfPreviewImageCache?.clear) {
+      pdfPreviewImageCache.clear();
+    }
+    if (typeof pdfPreviewObjectUrls !== "undefined" && pdfPreviewObjectUrls) {
+      for (const url of pdfPreviewObjectUrls) {
+        if (typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
+          URL.revokeObjectURL(url);
+        }
+       }
+      pdfPreviewObjectUrls.clear();
+    }
+  }
   currentPdfFile = isPdf ? pdfFile || null : null;
   currentPdfFileHash = isPdf && pdfFile && nextHash ? nextHash : null;
   if (isPdf && nextHash) {
@@ -5242,7 +5351,10 @@ async function executeFullTranslationBatches(options = {}) {
 }
 
 function pauseFullTranslation() {
-  if (!fullTranslationBusy || fullTranslationPreparing) return false;
+  const control = typeof activeFullTranslationControl === "object" ? activeFullTranslationControl : null;
+  const isPreparing = control ? control.preparing : fullTranslationPreparing;
+  if (!fullTranslationBusy || isPreparing) return false;
+  if (control) control.pauseRequested = true;
   fullTranslationPauseRequested = true;
   const button = document.getElementById("btn-translate-all");
   if (button) {
@@ -5264,6 +5376,14 @@ async function startFullTranslation() {
   const button = document.getElementById("btn-translate-all");
   if (!paperHash || !blocks.length) return;
   const runId = ++fullTranslationRunId;
+  const runControl = {
+    runId,
+    preparing: true,
+    pauseRequested: false,
+  };
+  if (typeof activeFullTranslationControl !== "undefined") {
+    activeFullTranslationControl = runControl;
+  }
   const agentId = currentAgent?.id || "";
   const modelRef = selectedModelRefForAgent(currentAgent);
   const thinkingLevel = currentThinkingLevel;
@@ -5273,6 +5393,10 @@ async function startFullTranslation() {
   fullTranslationPreparing = true;
   fullTranslationPauseRequested = false;
   if (!button) {
+    runControl.preparing = false;
+    if (typeof activeFullTranslationControl !== "undefined" && activeFullTranslationControl === runControl) {
+      activeFullTranslationControl = null;
+    }
     fullTranslationBusy = false;
     fullTranslationPreparing = false;
     return;
@@ -5297,6 +5421,7 @@ async function startFullTranslation() {
     }
     const pending = mutableBlocks.filter((block) => !paperRef.translations[block.id]);
     if (!pending.length) {
+      runControl.preparing = false;
       fullTranslationBusy = false;
       fullTranslationPreparing = false;
       button.disabled = false;
@@ -5326,7 +5451,8 @@ async function startFullTranslation() {
       if (isCurrent()) commitBlockTranslation(blockId, translation, { paperHash, paperRef, revision, glossaryVersion });
     });
     const uncached = pending.filter((block) => !paperRef.translations[block.id]);
-    fullTranslationPreparing = false;
+    runControl.preparing = false;
+    if (runId === fullTranslationRunId) fullTranslationPreparing = false;
     if (uncached.length > batchSize) {
       button.disabled = false;
       button.textContent = `暂停翻译 (0/${uncached.length})`;
@@ -5336,9 +5462,10 @@ async function startFullTranslation() {
       batchSize,
       concurrency,
       isCurrent: () => isCurrent() && Number(paperRef.glossaryVersion || 0) === glossaryVersion,
-      shouldPause: () => fullTranslationPauseRequested,
+      shouldPause: () => runControl.pauseRequested || (runId === fullTranslationRunId && fullTranslationPauseRequested),
       onProgress: ({ completedCount }) => {
-        if (!isCurrent() || fullTranslationPauseRequested || uncached.length <= batchSize) return;
+        const pausedNow = runControl.pauseRequested || (runId === fullTranslationRunId && fullTranslationPauseRequested);
+        if (!isCurrent() || pausedNow || uncached.length <= batchSize) return;
         button.textContent = `暂停翻译 (${completedCount}/${uncached.length})`;
       },
       executeBatch: async (slice) => {
@@ -5403,8 +5530,14 @@ async function startFullTranslation() {
       remaining.forEach((block) => setTranslationPlaceholder(block.id, "点击翻译此段", false));
     }
   } finally {
-    fullTranslationPreparing = false;
-    fullTranslationPauseRequested = false;
+    runControl.preparing = false;
+    if (runId === fullTranslationRunId) {
+      if (typeof activeFullTranslationControl !== "undefined" && activeFullTranslationControl === runControl) {
+        activeFullTranslationControl = null;
+      }
+      fullTranslationPreparing = false;
+      fullTranslationPauseRequested = false;
+    }
     if (isCurrent()) {
       fullTranslationBusy = false;
       button.disabled = false;

@@ -911,7 +911,7 @@ export function createPaperWorkspace(options = {}) {
           if (!paper) throw new Error("paper not found");
           assertExpectedPaperRevision(paper, expectedRevision, "清理");
           const cacheIds = assetCacheIds(paper);
-          paper.blocks = array(paper.blocks).map((block) => ({ ...block, assetRef: null }));
+          paper.blocks = array(paper.blocks).map((block) => ({ ...block, assetRef: null, assetPath: "" }));
           paper.revision = advancePaperRevision(store, hash);
           paper.updatedAt = now();
           store.papers[hash] = rebuildDerivedIndexes(paper);
