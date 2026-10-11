@@ -24,11 +24,11 @@
 
 应用源码在 apps/hana-paper-reader。安装用 ZIP 必须由候选打包流程生成，使 manifest.json 在压缩包根目录；GitHub 的源码压缩包不是 App 安装包。
 
-**直接下载 V2 1.0.34 试用版：**
+**直接下载 V2 1.0.35 试用版：**
 
-1. 下载[完整安装包](https://github.com/TheEarlyWinter/hana-paper-reader/releases/download/v1.0.34/app-hana-paper-reader-1.0.34-full-feature-candidate.zip)。需要仅阅读版时，下载[仅阅读安装包](https://github.com/TheEarlyWinter/hana-paper-reader/releases/download/v1.0.34/app-hana-paper-reader-1.0.34-reader-only-candidate.zip)，它不声明独立 PDF 卡或 Previewer。
+1. 下载[完整安装包](https://github.com/TheEarlyWinter/hana-paper-reader/releases/download/v1.0.35/app-hana-paper-reader-1.0.35-full-feature-candidate.zip)。需要仅阅读版时，下载[仅阅读安装包](https://github.com/TheEarlyWinter/hana-paper-reader/releases/download/v1.0.35/app-hana-paper-reader-1.0.35-reader-only-candidate.zip)，它不声明独立 PDF 卡或 Previewer。
 2. 在 Hana 的扩展管理中选择“本地安装”，直接选择下载的 App ZIP，不需要解压。
-3. [V2 发布页](https://github.com/TheEarlyWinter/hana-paper-reader/releases/tag/v1.0.34)提供两个安装包、校验和、构建报告和试用说明；页面中的 Source code 是源码压缩包，不用于 App 安装。
+3. [V2 发布页](https://github.com/TheEarlyWinter/hana-paper-reader/releases/tag/v1.0.35)提供两个安装包、校验和、构建报告和试用说明；页面中的 Source code 是源码压缩包，不用于 App 安装。
 
 V2 发布页当前标记为 Pre-release。构建来源及校验和固定在该版本，后续 main 的开发产物仍可从 Actions 中的 **V2 Candidate Packages** 获取；下载 artifact 时，需要先解压外层文件，才能得到里面的 App ZIP。
 
