@@ -418,3 +418,17 @@ test("recent route accepts v1 paper hashes at both legal boundaries", () => {
     }
   }
 });
+
+test("version metadata and diagnostics stay aligned with single-entry manifest", async () => {
+  const manifest = JSON.parse(read("manifest.json"));
+  const pkg = JSON.parse(read("package.json"));
+  const { UI_VERSION } = await import("../ui/assets/build-info.js");
+  const { buildDiagnostics } = await import("../server/domain/diagnostics.js");
+  assert.equal(manifest.version, UI_VERSION);
+  assert.equal(pkg.version, UI_VERSION);
+  const report = buildDiagnostics({}, { uiVersion: UI_VERSION, visible: true, active: true, slot: "page", readingMode: "contrast" });
+  assert.equal(report.app.version, UI_VERSION);
+  assert.equal(report.clientSnapshot.uiVersion, UI_VERSION);
+  assert.equal(Object.prototype.hasOwnProperty.call(report.features, "pdfPreviewerDeclared"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(report.features, "pdfPreviewReadOnly"), false);
+});

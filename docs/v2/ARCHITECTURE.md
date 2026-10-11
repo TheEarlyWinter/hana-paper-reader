@@ -8,7 +8,7 @@ v2 App 位于 apps/hana-paper-reader，与根目录的旧插件入口分开。Ap
 
 MinerU 经受控网络适配器调用，Token 由用户在工作台手工设置。Windows 下设置使用当前用户 DPAPI，公开状态只说明是否配置，不回显凭据。
 
-PDF 预览是独立只读卡和可选 Previewer。文件选择由宿主授予资源，再用 hana.document 绑定和读取；普通 reader 卡不能自行假定有文档权限。随包保留 PDF.js 的匹配版本字体、CMap 和许可。
+工作台内置 PDF 原页与图表预览，随包保留 PDF.js 的匹配版本字体、CMap 和许可；不声明独立的 PDF Previewer 或独立 PDF 卡。
 
 导出写 dataDir/exports，回执对应捕获的来源版本。备份/恢复及离线迁移工具不自动读取真实旧数据；已有目标需要明确保留/合并策略。真实迁移先停写、授权源读取、创建不可变快照与独立备份，再核对源/目标计数和 SHA256。
 
