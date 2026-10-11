@@ -2,7 +2,7 @@
 
 面向 HanaAgent 的论文精读与研究工作台，基于 App v2 SDK、独立路由和 App 自有数据目录。
 
-- 当前版本：**1.0.35 试用候选**
+- 当前版本：**1.0.36 试用候选**
 - 最低 Hana 版本：**0.1050.9**
 - App ID：hana-paper-reader；manifestVersion：2
 - 自有代码许可证：MIT；随包组件分别保留许可证
@@ -15,8 +15,7 @@
 - 笔记、书签、术语、进度和翻译缓存；保存冲突给出明确反馈。
 - 宿主模型与 Agent 目录、翻译和证据问答。
 - MinerU 解析适配、Markdown 导出、备份/恢复和离线迁移准备。
-- 只读 PDF 预览：分页、缩放、旋转、查找、文本选择。
-- 1.0.34 带匹配版本的 CMap/标准字体资源，中文 PDF 已实机复测。
+- 对照阅读模式内置 PDF 预览（带匹配版本的 CMap 与标准字体资源，支持中文 PDF 渲染）。
 
 以上是实现范围，具体通过记录与待验收项见测试覆盖文档。当前版本适合少量论文副本试用，完整宿主与真实服务验收仍待完成。
 
@@ -24,11 +23,11 @@
 
 应用源码在 apps/hana-paper-reader。安装用 ZIP 必须由候选打包流程生成，使 manifest.json 在压缩包根目录；GitHub 的源码压缩包不是 App 安装包。
 
-**直接下载 V2 1.0.35 试用版：**
+**直接下载 V2 1.0.36 试用版：**
 
-1. 下载[完整安装包](https://github.com/TheEarlyWinter/hana-paper-reader/releases/download/v1.0.35/app-hana-paper-reader-1.0.35-full-feature-candidate.zip)。需要仅阅读版时，下载[仅阅读安装包](https://github.com/TheEarlyWinter/hana-paper-reader/releases/download/v1.0.35/app-hana-paper-reader-1.0.35-reader-only-candidate.zip)，它不声明独立 PDF 卡或 Previewer。
+1. 下载[候选安装包](https://github.com/TheEarlyWinter/hana-paper-reader/releases/download/v1.0.36/app-hana-paper-reader-1.0.36-candidate.zip)。
 2. 在 Hana 的扩展管理中选择“本地安装”，直接选择下载的 App ZIP，不需要解压。
-3. [V2 发布页](https://github.com/TheEarlyWinter/hana-paper-reader/releases/tag/v1.0.35)提供两个安装包、校验和、构建报告和试用说明；页面中的 Source code 是源码压缩包，不用于 App 安装。
+3. [V2 发布页](https://github.com/TheEarlyWinter/hana-paper-reader/releases/tag/v1.0.36)提供安装包、校验和、构建报告和试用说明；页面中的 Source code 是源码压缩包，不用于 App 安装。
 
 V2 发布页当前标记为 Pre-release。构建来源及校验和固定在该版本，后续 main 的开发产物仍可从 Actions 中的 **V2 Candidate Packages** 获取；下载 artifact 时，需要先解压外层文件，才能得到里面的 App ZIP。
 
@@ -41,7 +40,7 @@ V2 发布页当前标记为 Pre-release。构建来源及校验和固定在该�
 ./tools/verify-candidate-packages.ps1 -OutputDirectory ./dist/v2-packages
 ~~~
 
-也可用跨平台的 node tools/stage-release.mjs --out ./dist/v2-staging 准备完整候选目录；加 --reader-only 准备仅阅读版，再将该目录内容压缩为 ZIP。
+也可用跨平台的 node tools/stage-release.mjs --out ./dist/v2-staging 准备候选目录，再将该目录内容压缩为 ZIP。
 
 ## 使用与验证
 

@@ -95,12 +95,32 @@ test("v2 package is a page App with one registered route source", () => {
   assert.equal(manifest.network.methods.includes("GET"), true);
   assert.equal(manifest.network.methods.includes("POST"), true);
   assert.equal(Object.prototype.hasOwnProperty.call(manifest.contributes, "settings"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(manifest.contributes, "previewers"), false);
+  assert.equal(manifest.contributes.cards.length, 1);
+  assert.equal(manifest.contributes.cards[0].id, "reader");
   assert.equal(manifest.contributes.cards[0].realization, "page");
   assert.equal(manifest.contributes.cards[0].siteNavEntry, true);
   assert.equal(manifest.contributes.cards[0].route, "/reader.html");
   assert.equal(manifest.contributes.cards[0].detached.route, "/reader.html");
   assert.equal(fs.existsSync(path.join(root, "routes")), false);
   assert.equal(fs.existsSync(path.join(root, "ui", "reader.html")), true);
+  assert.equal(fs.existsSync(path.join(root, "ui", "pdf-preview.html")), false);
+});
+
+test("PDF.js CJK resources are bundled and configured for the reader workbench", () => {
+  const panel = read("ui/assets/panel.js");
+  assert.match(panel, /cMapUrl:\s*new URL\("\.\/assets\/cmaps\/", document\.baseURI\)\.href/);
+  assert.match(panel, /cMapPacked:\s*true/);
+  assert.match(panel, /standardFontDataUrl:\s*new URL\("\.\/assets\/standard_fonts\/", document\.baseURI\)\.href/);
+  for (const asset of [
+    "ui/assets/cmaps/UniGB-UCS2-H.bcmap",
+    "ui/assets/standard_fonts/LiberationSans-Regular.ttf",
+    "ui/assets/cmaps/LICENSE",
+    "ui/assets/standard_fonts/LICENSE_FOXIT",
+    "ui/assets/standard_fonts/LICENSE_LIBERATION",
+  ]) {
+    assert.ok(fs.statSync(path.join(root, asset)).size > 0, `${asset} must be present and non-empty`);
+  }
 });
 
 test("MinerU settings stay inside the paper workspace UI", () => {

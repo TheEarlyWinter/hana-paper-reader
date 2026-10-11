@@ -1,4 +1,4 @@
-# Hana Paper Reader v2 App — 1.0.35 试用候选
+# Hana Paper Reader v2 App — 1.0.36 试用候选
 
 面向 HanaAgent 的论文阅读与研究工作台，使用 App v2 SDK、App 自有路由和数据目录。
 最低宿主版本为 0.1050.9。当前是有局部实机验证的试用候选，完整发布验收仍待完成。
@@ -9,14 +9,13 @@
 - 笔记、书签、术语、阅读进度与翻译缓存；带版本条件的保存和冲突提示。
 - 动态模型/Agent 目录、单段/批量翻译、证据问答和划选问助手。
 - MinerU 解析适配、Markdown 导出、备份/恢复和离线迁移预检。
-- 独立只读 PDF 预览，支持分页、缩放、旋转、查找与文本选择。
-- Previewer 属于可选试点；不会修改 Windows 的默认 PDF 查看器。
+- 对照阅读模式内置 PDF 预览（带匹配版本的 CMap 与标准字体资源）。
 
 以上为代码实现范围，实际验证覆盖见 [测试状态](../../docs/v2/TEST_STATUS_1.0.34.md)。
 
 ## 安装
 
-已构建的 1.0.35 试用包可从 [V2 发布页](https://github.com/TheEarlyWinter/hana-paper-reader/releases/tag/v1.0.35)下载。通常选 full-feature-candidate.zip；reader-only-candidate.zip 不声明独立 PDF 卡和 Previewer。在 Hana 扩展管理中通过“本地安装”直接选择 App ZIP，无需解压；GitHub 自动提供的 Source code 压缩包不用于安装。
+已构建的 1.0.36 试用包可从 [V2 发布页](https://github.com/TheEarlyWinter/hana-paper-reader/releases/tag/v1.0.36)下载（`app-hana-paper-reader-1.0.36-candidate.zip`）。在 Hana 扩展管理中通过“本地安装”直接选择 App ZIP，无需解压；GitHub 自动提供的 Source code 压缩包不用于安装。
 
 需要自行打包时，按以下步骤准备候选目录。
 
@@ -28,13 +27,7 @@ node tools/stage-release.mjs --out ./dist/v2-staging
 
 该命令创建一个带 manifest.json 的独立目录。将目录内容压缩为 ZIP，manifest.json 应在 ZIP 根目录，然后在 Hana 的扩展管理中通过本地安装审查导入。
 
-仅阅读版不声明 PDF Previewer 或独立 PDF 卡：
-
-~~~sh
-node tools/stage-release.mjs --out ./dist/v2-staging --reader-only
-~~~
-
-Windows 也可一次生成两种候选 ZIP：
+Windows 也可直接生成候选 ZIP：
 
 ~~~powershell
 ./tools/package-candidate.ps1 -OutputDirectory ./dist/v2-packages -StagingDirectory ./dist/v2-staging

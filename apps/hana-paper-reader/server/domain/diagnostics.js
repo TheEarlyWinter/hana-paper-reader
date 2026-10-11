@@ -1,4 +1,4 @@
-import { UI_VERSION, API_PROTOCOL_VERSION, BUILD_CHANNEL, PDF_PREVIEWER_ENABLED } from "../../ui/assets/build-info.js";
+import { UI_VERSION, API_PROTOCOL_VERSION, BUILD_CHANNEL } from "../../ui/assets/build-info.js";
 
 const count = value => Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 1000000000) : null;
 const bool = value => typeof value === "boolean" ? value : null;
@@ -12,7 +12,6 @@ export function buildDiagnostics(runtime, client = {}) {
     format: "hana-paper-reader-diagnostics-v1", generatedAt: new Date().toISOString(),
     app: { id: "hana-paper-reader", version: UI_VERSION, apiVersion: API_PROTOCOL_VERSION, channel: BUILD_CHANNEL },
     features: {
-      pdfPreviewerDeclared: PDF_PREVIEWER_ENABLED, pdfPreviewReadOnly: true,
       crossSessionDelivery: true, migrationImport: true, mineruSettings: "app-private-dpapi",
       pdfMaxBytes: 50 * 1024 * 1024, pdfPageCanvasPixels: 10000000,
       pdfCropCanvasPixels: 7000000, pdfOffscreenCacheTargetBytes: 64 * 1024 * 1024,
