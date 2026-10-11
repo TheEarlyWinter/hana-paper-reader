@@ -1,6 +1,6 @@
 {
   "name": "hana-paper-reader-v2-development",
-  "version": "1.0.34",
+  "version": "1.0.35",
   "private": true,
   "type": "module",
   "description": "Development commands for the Hana Paper Reader v2 App candidate",

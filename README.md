@@ -2,7 +2,7 @@
 
 面向 HanaAgent 的论文精读与研究工作台，基于 App v2 SDK、独立路由和 App 自有数据目录。
 
-- 当前版本：**1.0.34 试用候选**
+- 当前版本：**1.0.35 试用候选**
 - 最低 Hana 版本：**0.1050.9**
 - App ID：hana-paper-reader；manifestVersion：2
 - 自有代码许可证：MIT；随包组件分别保留许可证

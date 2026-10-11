@@ -1,4 +1,4 @@
-# Hana Paper Reader v2 App — 1.0.34 试用候选
+# Hana Paper Reader v2 App — 1.0.35 试用候选
 
 面向 HanaAgent 的论文阅读与研究工作台，使用 App v2 SDK、App 自有路由和数据目录。
 最低宿主版本为 0.1050.9。当前是有局部实机验证的试用候选，完整发布验收仍待完成。

@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "hana-paper-reader",
   "name": "Hana Paper Reader",
-  "version": "1.0.34",
+  "version": "1.0.35",
   "description": "证据驱动的学术论文精读工作台，支持论文结构、证据锚点与研究工作区。",
   "entry": "index.js",
   "icon": "assets/icon.svg",
